@@ -649,124 +649,161 @@ DEFN_INTEL_SG16_FDPAS(e4m3_e5m2_matrix_mad_k32, short8, short8, short8, int8, fd
 #ifdef cl_intel_subgroup_split_matrix_multiply_accumulate
 
 ////  XeHP_SDV : simd8, split matrix mad (dpasw) ////
+//
+// gaema-engine fork (2026-05-27): emulate dpasw via dpas + cross-lane
+// shuffle on Xe-HPG OpenCL. Background: native dpasw reads A's second
+// half from the fused-EU pair partner's GRF at issue time. OpenCL
+// cannot guarantee that the partner EU runs the same dpasw with
+// matching A in the same register, so the partner-EU read returns
+// stale-thread garbage and c.s1 silently corrupts on DG2 / A370M.
+//
+// This BiF rewrite expresses each split form as:
+//   1. shuffle own A from lane^1 (intel_sub_group_shuffle, lane-pair XOR)
+//   2. concat own A + shuffled A into the full-width A vector
+//   3. call the non-w dpas builtin (drop 'w' from the intrinsic name)
+//
+// Trades 1 cross-lane shuffle per dpasw for correctness regardless of
+// fused-EU pair geometry. Caller convention: lane L holds the half-A
+// such that the lane-pair (L & ~1, L | 1) together carry the full
+// M-row pair; emulation reconstructs the full A operand from those
+// two halves. See ai/intel/xe-hpg/a370m/audit/2026-05-26-split-dpas-wave3-swizzles.md
+// for the dark-silicon root cause + GEN ISA disasm.
+
+#define DEFN_INTEL_SG_IDPASW_EMU(FNAME, RETTY, ATY, BTY, INTERNAL_FNAME_NONW, AT, AT_FULL, BT) \
+INLINE RETTY OVERLOADABLE intel_sub_group_##FNAME( ATY a,  BTY b, RETTY acc)                   \
+{                                                                                              \
+    AT      _a_own  = as_##AT (a);                                                             \
+    AT      _a_par  = intel_sub_group_shuffle(_a_own, get_sub_group_local_id() ^ 1u);          \
+    AT_FULL _a_full = (AT_FULL)(_a_own, _a_par);                                               \
+    return __builtin_IB_sub_group_##INTERNAL_FNAME_NONW (acc, _a_full, as_##BT (b));           \
+}
+
+#define DEFN_INTEL_SG_FDPASW_EMU(FNAME, RETTY, ATY, BTY, INTERNAL_FNAME_NONW, AT_FULL)         \
+INLINE RETTY OVERLOADABLE intel_sub_group_##FNAME( ATY a,  BTY b, RETTY acc)                   \
+{                                                                                              \
+    ATY     _a_own  = a;                                                                       \
+    ATY     _a_par  = intel_sub_group_shuffle(_a_own, get_sub_group_local_id() ^ 1u);          \
+    AT_FULL _a_full = (AT_FULL)(_a_own, _a_par);                                               \
+    return __builtin_IB_sub_group_##INTERNAL_FNAME_NONW (acc, _a_full, b);                     \
+}
 
 // a: 8 bit, b: 8 bit, repcount: 2,4,8
-DEFN_INTEL_SG_IDPAS( i8_i8_split_matrix_mad_k32, int2, int,   int8,  idpasw_s8_s8_8_2, int,  int8 )
-DEFN_INTEL_SG_IDPAS( i8_i8_split_matrix_mad_k32, int4, int2,  int8,  idpasw_s8_s8_8_4, int2, int8 )
-DEFN_INTEL_SG_IDPAS( i8_i8_split_matrix_mad_k32, int8, int4,  int8,  idpasw_s8_s8_8_8, int4, int8 )
-DEFN_INTEL_SG_IDPAS( i8_u8_split_matrix_mad_k32, int2, int,   uint8, idpasw_s8_u8_8_2, int,  int8 )
-DEFN_INTEL_SG_IDPAS( i8_u8_split_matrix_mad_k32, int4, int2,  uint8, idpasw_s8_u8_8_4, int2, int8 )
-DEFN_INTEL_SG_IDPAS( i8_u8_split_matrix_mad_k32, int8, int4,  uint8, idpasw_s8_u8_8_8, int4, int8 )
-DEFN_INTEL_SG_IDPAS( u8_i8_split_matrix_mad_k32, int2, uint,  int8,  idpasw_u8_s8_8_2, int,  int8 )
-DEFN_INTEL_SG_IDPAS( u8_i8_split_matrix_mad_k32, int4, uint2, int8,  idpasw_u8_s8_8_4, int2, int8 )
-DEFN_INTEL_SG_IDPAS( u8_i8_split_matrix_mad_k32, int8, uint4, int8,  idpasw_u8_s8_8_8, int4, int8 )
-DEFN_INTEL_SG_IDPAS( u8_u8_split_matrix_mad_k32, int2, uint,  uint8, idpasw_u8_u8_8_2, int,  int8 )
-DEFN_INTEL_SG_IDPAS( u8_u8_split_matrix_mad_k32, int4, uint2, uint8, idpasw_u8_u8_8_4, int2, int8 )
-DEFN_INTEL_SG_IDPAS( u8_u8_split_matrix_mad_k32, int8, uint4, uint8, idpasw_u8_u8_8_8, int4, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( i8_i8_split_matrix_mad_k32, int2, int,   int8,  idpas_s8_s8_8_2, int,   int2, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( i8_i8_split_matrix_mad_k32, int4, int2,  int8,  idpas_s8_s8_8_4, int2,  int4, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( i8_i8_split_matrix_mad_k32, int8, int4,  int8,  idpas_s8_s8_8_8, int4,  int8, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( i8_u8_split_matrix_mad_k32, int2, int,   uint8, idpas_s8_u8_8_2, int,   int2, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( i8_u8_split_matrix_mad_k32, int4, int2,  uint8, idpas_s8_u8_8_4, int2,  int4, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( i8_u8_split_matrix_mad_k32, int8, int4,  uint8, idpas_s8_u8_8_8, int4,  int8, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( u8_i8_split_matrix_mad_k32, int2, uint,  int8,  idpas_u8_s8_8_2, int,   int2, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( u8_i8_split_matrix_mad_k32, int4, uint2, int8,  idpas_u8_s8_8_4, int2,  int4, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( u8_i8_split_matrix_mad_k32, int8, uint4, int8,  idpas_u8_s8_8_8, int4,  int8, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( u8_u8_split_matrix_mad_k32, int2, uint,  uint8, idpas_u8_u8_8_2, int,   int2, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( u8_u8_split_matrix_mad_k32, int4, uint2, uint8, idpas_u8_u8_8_4, int2,  int4, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( u8_u8_split_matrix_mad_k32, int8, uint4, uint8, idpas_u8_u8_8_8, int4,  int8, int8 )
 
 // a: 8 bit, b: 4 bit, repcount: 2,4,8
-DEFN_INTEL_SG_IDPAS( i8_i4_split_matrix_mad_k32, int2, int,   int4,  idpasw_s8_s4_8_2, int,  int4 )
-DEFN_INTEL_SG_IDPAS( i8_i4_split_matrix_mad_k32, int4, int2,  int4,  idpasw_s8_s4_8_4, int2, int4 )
-DEFN_INTEL_SG_IDPAS( i8_i4_split_matrix_mad_k32, int8, int4,  int4,  idpasw_s8_s4_8_8, int4, int4 )
-DEFN_INTEL_SG_IDPAS( i8_u4_split_matrix_mad_k32, int2, int,   uint4, idpasw_s8_u4_8_2, int,  int4 )
-DEFN_INTEL_SG_IDPAS( i8_u4_split_matrix_mad_k32, int4, int2,  uint4, idpasw_s8_u4_8_4, int2, int4 )
-DEFN_INTEL_SG_IDPAS( i8_u4_split_matrix_mad_k32, int8, int4,  uint4, idpasw_s8_u4_8_8, int4, int4 )
-DEFN_INTEL_SG_IDPAS( u8_i4_split_matrix_mad_k32, int2, uint,  int4,  idpasw_u8_s4_8_2, int,  int4 )
-DEFN_INTEL_SG_IDPAS( u8_i4_split_matrix_mad_k32, int4, uint2, int4,  idpasw_u8_s4_8_4, int2, int4 )
-DEFN_INTEL_SG_IDPAS( u8_i4_split_matrix_mad_k32, int8, uint4, int4,  idpasw_u8_s4_8_8, int4, int4 )
-DEFN_INTEL_SG_IDPAS( u8_u4_split_matrix_mad_k32, int2, uint,  uint4, idpasw_u8_u4_8_2, int,  int4 )
-DEFN_INTEL_SG_IDPAS( u8_u4_split_matrix_mad_k32, int4, uint2, uint4, idpasw_u8_u4_8_4, int2, int4 )
-DEFN_INTEL_SG_IDPAS( u8_u4_split_matrix_mad_k32, int8, uint4, uint4, idpasw_u8_u4_8_8, int4, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( i8_i4_split_matrix_mad_k32, int2, int,   int4,  idpas_s8_s4_8_2, int,   int2, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( i8_i4_split_matrix_mad_k32, int4, int2,  int4,  idpas_s8_s4_8_4, int2,  int4, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( i8_i4_split_matrix_mad_k32, int8, int4,  int4,  idpas_s8_s4_8_8, int4,  int8, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( i8_u4_split_matrix_mad_k32, int2, int,   uint4, idpas_s8_u4_8_2, int,   int2, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( i8_u4_split_matrix_mad_k32, int4, int2,  uint4, idpas_s8_u4_8_4, int2,  int4, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( i8_u4_split_matrix_mad_k32, int8, int4,  uint4, idpas_s8_u4_8_8, int4,  int8, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( u8_i4_split_matrix_mad_k32, int2, uint,  int4,  idpas_u8_s4_8_2, int,   int2, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( u8_i4_split_matrix_mad_k32, int4, uint2, int4,  idpas_u8_s4_8_4, int2,  int4, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( u8_i4_split_matrix_mad_k32, int8, uint4, int4,  idpas_u8_s4_8_8, int4,  int8, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( u8_u4_split_matrix_mad_k32, int2, uint,  uint4, idpas_u8_u4_8_2, int,   int2, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( u8_u4_split_matrix_mad_k32, int4, uint2, uint4, idpas_u8_u4_8_4, int2,  int4, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( u8_u4_split_matrix_mad_k32, int8, uint4, uint4, idpas_u8_u4_8_8, int4,  int8, int4 )
 
 // a: 8 bit, b: 2 bit, repcount: 2,4,8
-DEFN_INTEL_SG_IDPAS( i8_i2_split_matrix_mad_k32, int2, int,   int2,  idpasw_s8_s2_8_2, int,  int2 )
-DEFN_INTEL_SG_IDPAS( i8_i2_split_matrix_mad_k32, int4, int2,  int2,  idpasw_s8_s2_8_4, int2, int2 )
-DEFN_INTEL_SG_IDPAS( i8_i2_split_matrix_mad_k32, int8, int4,  int2,  idpasw_s8_s2_8_8, int4, int2 )
-DEFN_INTEL_SG_IDPAS( i8_u2_split_matrix_mad_k32, int2, int,   uint2, idpasw_s8_u2_8_2, int,  int2 )
-DEFN_INTEL_SG_IDPAS( i8_u2_split_matrix_mad_k32, int4, int2,  uint2, idpasw_s8_u2_8_4, int2, int2 )
-DEFN_INTEL_SG_IDPAS( i8_u2_split_matrix_mad_k32, int8, int4,  uint2, idpasw_s8_u2_8_8, int4, int2 )
-DEFN_INTEL_SG_IDPAS( u8_i2_split_matrix_mad_k32, int2, uint,  int2,  idpasw_u8_s2_8_2, int,  int2 )
-DEFN_INTEL_SG_IDPAS( u8_i2_split_matrix_mad_k32, int4, uint2, int2,  idpasw_u8_s2_8_4, int2, int2 )
-DEFN_INTEL_SG_IDPAS( u8_i2_split_matrix_mad_k32, int8, uint4, int2,  idpasw_u8_s2_8_8, int4, int2 )
-DEFN_INTEL_SG_IDPAS( u8_u2_split_matrix_mad_k32, int2, uint,  uint2, idpasw_u8_u2_8_2, int,  int2 )
-DEFN_INTEL_SG_IDPAS( u8_u2_split_matrix_mad_k32, int4, uint2, uint2, idpasw_u8_u2_8_4, int2, int2 )
-DEFN_INTEL_SG_IDPAS( u8_u2_split_matrix_mad_k32, int8, uint4, uint2, idpasw_u8_u2_8_8, int4, int2 )
+DEFN_INTEL_SG_IDPASW_EMU( i8_i2_split_matrix_mad_k32, int2, int,   int2,  idpas_s8_s2_8_2, int,   int2, int2 )
+DEFN_INTEL_SG_IDPASW_EMU( i8_i2_split_matrix_mad_k32, int4, int2,  int2,  idpas_s8_s2_8_4, int2,  int4, int2 )
+DEFN_INTEL_SG_IDPASW_EMU( i8_i2_split_matrix_mad_k32, int8, int4,  int2,  idpas_s8_s2_8_8, int4,  int8, int2 )
+DEFN_INTEL_SG_IDPASW_EMU( i8_u2_split_matrix_mad_k32, int2, int,   uint2, idpas_s8_u2_8_2, int,   int2, int2 )
+DEFN_INTEL_SG_IDPASW_EMU( i8_u2_split_matrix_mad_k32, int4, int2,  uint2, idpas_s8_u2_8_4, int2,  int4, int2 )
+DEFN_INTEL_SG_IDPASW_EMU( i8_u2_split_matrix_mad_k32, int8, int4,  uint2, idpas_s8_u2_8_8, int4,  int8, int2 )
+DEFN_INTEL_SG_IDPASW_EMU( u8_i2_split_matrix_mad_k32, int2, uint,  int2,  idpas_u8_s2_8_2, int,   int2, int2 )
+DEFN_INTEL_SG_IDPASW_EMU( u8_i2_split_matrix_mad_k32, int4, uint2, int2,  idpas_u8_s2_8_4, int2,  int4, int2 )
+DEFN_INTEL_SG_IDPASW_EMU( u8_i2_split_matrix_mad_k32, int8, uint4, int2,  idpas_u8_s2_8_8, int4,  int8, int2 )
+DEFN_INTEL_SG_IDPASW_EMU( u8_u2_split_matrix_mad_k32, int2, uint,  uint2, idpas_u8_u2_8_2, int,   int2, int2 )
+DEFN_INTEL_SG_IDPASW_EMU( u8_u2_split_matrix_mad_k32, int4, uint2, uint2, idpas_u8_u2_8_4, int2,  int4, int2 )
+DEFN_INTEL_SG_IDPASW_EMU( u8_u2_split_matrix_mad_k32, int8, uint4, uint2, idpas_u8_u2_8_8, int4,  int8, int2 )
 
 // a: 4 bit, b: 8 bit, repcount: 4,8
-DEFN_INTEL_SG_IDPAS( i4_i8_split_matrix_mad_k32, int4, short2,  int8,  idpasw_s4_s8_8_4, short2, int8 )
-DEFN_INTEL_SG_IDPAS( i4_i8_split_matrix_mad_k32, int8, short4,  int8,  idpasw_s4_s8_8_8, short4, int8 )
-DEFN_INTEL_SG_IDPAS( i4_u8_split_matrix_mad_k32, int4, short2,  uint8, idpasw_s4_u8_8_4, short2, int8 )
-DEFN_INTEL_SG_IDPAS( i4_u8_split_matrix_mad_k32, int8, short4,  uint8, idpasw_s4_u8_8_8, short4, int8 )
-DEFN_INTEL_SG_IDPAS( u4_i8_split_matrix_mad_k32, int4, ushort2, int8,  idpasw_u4_s8_8_4, short2, int8 )
-DEFN_INTEL_SG_IDPAS( u4_i8_split_matrix_mad_k32, int8, ushort4, int8,  idpasw_u4_s8_8_8, short4, int8 )
-DEFN_INTEL_SG_IDPAS( u4_u8_split_matrix_mad_k32, int4, ushort2, uint8, idpasw_u4_u8_8_4, short2, int8 )
-DEFN_INTEL_SG_IDPAS( u4_u8_split_matrix_mad_k32, int8, ushort4, uint8, idpasw_u4_u8_8_8, short4, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( i4_i8_split_matrix_mad_k32, int4, short2,  int8,  idpas_s4_s8_8_4, short2, short4, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( i4_i8_split_matrix_mad_k32, int8, short4,  int8,  idpas_s4_s8_8_8, short4, short8, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( i4_u8_split_matrix_mad_k32, int4, short2,  uint8, idpas_s4_u8_8_4, short2, short4, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( i4_u8_split_matrix_mad_k32, int8, short4,  uint8, idpas_s4_u8_8_8, short4, short8, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( u4_i8_split_matrix_mad_k32, int4, ushort2, int8,  idpas_u4_s8_8_4, short2, short4, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( u4_i8_split_matrix_mad_k32, int8, ushort4, int8,  idpas_u4_s8_8_8, short4, short8, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( u4_u8_split_matrix_mad_k32, int4, ushort2, uint8, idpas_u4_u8_8_4, short2, short4, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( u4_u8_split_matrix_mad_k32, int8, ushort4, uint8, idpas_u4_u8_8_8, short4, short8, int8 )
 
 // a: 2 bit, b: 8 bit, repcount: 8
-DEFN_INTEL_SG_IDPAS( i2_i8_split_matrix_mad_k32, int8, char4,  int8,  idpasw_s2_s8_8_8, char4, int8 )
-DEFN_INTEL_SG_IDPAS( i2_u8_split_matrix_mad_k32, int8, char4,  uint8, idpasw_s2_u8_8_8, char4, int8 )
-DEFN_INTEL_SG_IDPAS( u2_i8_split_matrix_mad_k32, int8, uchar4, int8,  idpasw_u2_s8_8_8, char4, int8 )
-DEFN_INTEL_SG_IDPAS( u2_u8_split_matrix_mad_k32, int8, uchar4, uint8, idpasw_u2_u8_8_8, char4, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( i2_i8_split_matrix_mad_k32, int8, char4,  int8,  idpas_s2_s8_8_8, char4, char8, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( i2_u8_split_matrix_mad_k32, int8, char4,  uint8, idpas_s2_u8_8_8, char4, char8, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( u2_i8_split_matrix_mad_k32, int8, uchar4, int8,  idpas_u2_s8_8_8, char4, char8, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( u2_u8_split_matrix_mad_k32, int8, uchar4, uint8, idpas_u2_u8_8_8, char4, char8, int8 )
 
 // Double througput (k64)
 // a: 4 bit, b: 4 bit, repcount: 2,4,8
-DEFN_INTEL_SG_IDPAS( i4_i4_split_matrix_mad_k64, int2, int,    int8,  idpasw_s4_s4_8_2, int,   int8 )
-DEFN_INTEL_SG_IDPAS( i4_i4_split_matrix_mad_k64, int4, int2,   int8,  idpasw_s4_s4_8_4, int2,  int8 )
-DEFN_INTEL_SG_IDPAS( i4_i4_split_matrix_mad_k64, int8, int4,   int8,  idpasw_s4_s4_8_8, int4,  int8 )
-DEFN_INTEL_SG_IDPAS( i4_u4_split_matrix_mad_k64, int2, int,    uint8, idpasw_s4_u4_8_2, int,   int8 )
-DEFN_INTEL_SG_IDPAS( i4_u4_split_matrix_mad_k64, int4, int2,   uint8, idpasw_s4_u4_8_4, int2,  int8 )
-DEFN_INTEL_SG_IDPAS( i4_u4_split_matrix_mad_k64, int8, int4,   uint8, idpasw_s4_u4_8_8, int4,  int8 )
-DEFN_INTEL_SG_IDPAS( u4_i4_split_matrix_mad_k64, int2, uint,   int8,  idpasw_u4_s4_8_2, int,   int8 )
-DEFN_INTEL_SG_IDPAS( u4_i4_split_matrix_mad_k64, int4, uint2,  int8,  idpasw_u4_s4_8_4, int2,  int8 )
-DEFN_INTEL_SG_IDPAS( u4_i4_split_matrix_mad_k64, int8, uint4,  int8,  idpasw_u4_s4_8_8, int4,  int8 )
-DEFN_INTEL_SG_IDPAS( u4_u4_split_matrix_mad_k64, int2, uint,   uint8, idpasw_u4_u4_8_2, int,   int8 )
-DEFN_INTEL_SG_IDPAS( u4_u4_split_matrix_mad_k64, int4, uint2,  uint8, idpasw_u4_u4_8_4, int2,  int8 )
-DEFN_INTEL_SG_IDPAS( u4_u4_split_matrix_mad_k64, int8, uint4,  uint8, idpasw_u4_u4_8_8, int4,  int8 )
+DEFN_INTEL_SG_IDPASW_EMU( i4_i4_split_matrix_mad_k64, int2, int,    int8,  idpas_s4_s4_8_2, int,   int2, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( i4_i4_split_matrix_mad_k64, int4, int2,   int8,  idpas_s4_s4_8_4, int2,  int4, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( i4_i4_split_matrix_mad_k64, int8, int4,   int8,  idpas_s4_s4_8_8, int4,  int8, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( i4_u4_split_matrix_mad_k64, int2, int,    uint8, idpas_s4_u4_8_2, int,   int2, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( i4_u4_split_matrix_mad_k64, int4, int2,   uint8, idpas_s4_u4_8_4, int2,  int4, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( i4_u4_split_matrix_mad_k64, int8, int4,   uint8, idpas_s4_u4_8_8, int4,  int8, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( u4_i4_split_matrix_mad_k64, int2, uint,   int8,  idpas_u4_s4_8_2, int,   int2, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( u4_i4_split_matrix_mad_k64, int4, uint2,  int8,  idpas_u4_s4_8_4, int2,  int4, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( u4_i4_split_matrix_mad_k64, int8, uint4,  int8,  idpas_u4_s4_8_8, int4,  int8, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( u4_u4_split_matrix_mad_k64, int2, uint,   uint8, idpas_u4_u4_8_2, int,   int2, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( u4_u4_split_matrix_mad_k64, int4, uint2,  uint8, idpas_u4_u4_8_4, int2,  int4, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( u4_u4_split_matrix_mad_k64, int8, uint4,  uint8, idpas_u4_u4_8_8, int4,  int8, int8 )
 
 // a: 4 bit, b: 2 bit, repcount: 2,4,8
-DEFN_INTEL_SG_IDPAS( i4_i2_split_matrix_mad_k64, int2, int,    int4,  idpasw_s4_s2_8_2, int,   int4 )
-DEFN_INTEL_SG_IDPAS( i4_i2_split_matrix_mad_k64, int4, int2,   int4,  idpasw_s4_s2_8_4, int2,  int4 )
-DEFN_INTEL_SG_IDPAS( i4_i2_split_matrix_mad_k64, int8, int4,   int4,  idpasw_s4_s2_8_8, int4,  int4 )
-DEFN_INTEL_SG_IDPAS( i4_u2_split_matrix_mad_k64, int2, int,    uint4, idpasw_s4_u2_8_2, int,   int4 )
-DEFN_INTEL_SG_IDPAS( i4_u2_split_matrix_mad_k64, int4, int2,   uint4, idpasw_s4_u2_8_4, int2,  int4 )
-DEFN_INTEL_SG_IDPAS( i4_u2_split_matrix_mad_k64, int8, int4,   uint4, idpasw_s4_u2_8_8, int4,  int4 )
-DEFN_INTEL_SG_IDPAS( u4_i2_split_matrix_mad_k64, int2, uint,   int4,  idpasw_u4_s2_8_2, int,   int4 )
-DEFN_INTEL_SG_IDPAS( u4_i2_split_matrix_mad_k64, int4, uint2,  int4,  idpasw_u4_s2_8_4, int2,  int4 )
-DEFN_INTEL_SG_IDPAS( u4_i2_split_matrix_mad_k64, int8, uint4,  int4,  idpasw_u4_s2_8_8, int4,  int4 )
-DEFN_INTEL_SG_IDPAS( u4_u2_split_matrix_mad_k64, int2, uint,   uint4, idpasw_u4_u2_8_2, int,   int4 )
-DEFN_INTEL_SG_IDPAS( u4_u2_split_matrix_mad_k64, int4, uint2,  uint4, idpasw_u4_u2_8_4, int2,  int4 )
-DEFN_INTEL_SG_IDPAS( u4_u2_split_matrix_mad_k64, int8, uint4,  uint4, idpasw_u4_u2_8_8, int4,  int4 )
+DEFN_INTEL_SG_IDPASW_EMU( i4_i2_split_matrix_mad_k64, int2, int,    int4,  idpas_s4_s2_8_2, int,   int2, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( i4_i2_split_matrix_mad_k64, int4, int2,   int4,  idpas_s4_s2_8_4, int2,  int4, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( i4_i2_split_matrix_mad_k64, int8, int4,   int4,  idpas_s4_s2_8_8, int4,  int8, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( i4_u2_split_matrix_mad_k64, int2, int,    uint4, idpas_s4_u2_8_2, int,   int2, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( i4_u2_split_matrix_mad_k64, int4, int2,   uint4, idpas_s4_u2_8_4, int2,  int4, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( i4_u2_split_matrix_mad_k64, int8, int4,   uint4, idpas_s4_u2_8_8, int4,  int8, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( u4_i2_split_matrix_mad_k64, int2, uint,   int4,  idpas_u4_s2_8_2, int,   int2, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( u4_i2_split_matrix_mad_k64, int4, uint2,  int4,  idpas_u4_s2_8_4, int2,  int4, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( u4_i2_split_matrix_mad_k64, int8, uint4,  int4,  idpas_u4_s2_8_8, int4,  int8, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( u4_u2_split_matrix_mad_k64, int2, uint,   uint4, idpas_u4_u2_8_2, int,   int2, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( u4_u2_split_matrix_mad_k64, int4, uint2,  uint4, idpas_u4_u2_8_4, int2,  int4, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( u4_u2_split_matrix_mad_k64, int8, uint4,  uint4, idpas_u4_u2_8_8, int4,  int8, int4 )
 
 // a: 2 bit, b: 4 bit, repcount: 4,8
-DEFN_INTEL_SG_IDPAS( i2_i4_split_matrix_mad_k64, int4, short2,  int8,  idpasw_s2_s4_8_4, short2, int8 )
-DEFN_INTEL_SG_IDPAS( i2_i4_split_matrix_mad_k64, int8, short4,  int8,  idpasw_s2_s4_8_8, short4, int8 )
-DEFN_INTEL_SG_IDPAS( i2_u4_split_matrix_mad_k64, int4, short2,  uint8, idpasw_s2_u4_8_4, short2, int8 )
-DEFN_INTEL_SG_IDPAS( i2_u4_split_matrix_mad_k64, int8, short4,  uint8, idpasw_s2_u4_8_8, short4, int8 )
-DEFN_INTEL_SG_IDPAS( u2_i4_split_matrix_mad_k64, int4, ushort2, int8,  idpasw_u2_s4_8_4, short2, int8 )
-DEFN_INTEL_SG_IDPAS( u2_i4_split_matrix_mad_k64, int8, ushort4, int8,  idpasw_u2_s4_8_8, short4, int8 )
-DEFN_INTEL_SG_IDPAS( u2_u4_split_matrix_mad_k64, int4, ushort2, uint8, idpasw_u2_u4_8_4, short2, int8 )
-DEFN_INTEL_SG_IDPAS( u2_u4_split_matrix_mad_k64, int8, ushort4, uint8, idpasw_u2_u4_8_8, short4, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( i2_i4_split_matrix_mad_k64, int4, short2,  int8,  idpas_s2_s4_8_4, short2, short4, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( i2_i4_split_matrix_mad_k64, int8, short4,  int8,  idpas_s2_s4_8_8, short4, short8, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( i2_u4_split_matrix_mad_k64, int4, short2,  uint8, idpas_s2_u4_8_4, short2, short4, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( i2_u4_split_matrix_mad_k64, int8, short4,  uint8, idpas_s2_u4_8_8, short4, short8, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( u2_i4_split_matrix_mad_k64, int4, ushort2, int8,  idpas_u2_s4_8_4, short2, short4, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( u2_i4_split_matrix_mad_k64, int8, ushort4, int8,  idpas_u2_s4_8_8, short4, short8, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( u2_u4_split_matrix_mad_k64, int4, ushort2, uint8, idpas_u2_u4_8_4, short2, short4, int8 )
+DEFN_INTEL_SG_IDPASW_EMU( u2_u4_split_matrix_mad_k64, int8, ushort4, uint8, idpas_u2_u4_8_8, short4, short8, int8 )
 
 // a: 2 bit, b: 2 bit, repcount: 4,8
-DEFN_INTEL_SG_IDPAS( i2_i2_split_matrix_mad_k64, int4, short2,  int4,  idpasw_s2_s2_8_4, short2, int4 )
-DEFN_INTEL_SG_IDPAS( i2_i2_split_matrix_mad_k64, int8, short4,  int4,  idpasw_s2_s2_8_8, short4, int4 )
-DEFN_INTEL_SG_IDPAS( i2_u2_split_matrix_mad_k64, int4, short2,  uint4, idpasw_s2_u2_8_4, short2, int4 )
-DEFN_INTEL_SG_IDPAS( i2_u2_split_matrix_mad_k64, int8, short4,  uint4, idpasw_s2_u2_8_8, short4, int4 )
-DEFN_INTEL_SG_IDPAS( u2_i2_split_matrix_mad_k64, int4, ushort2, int4,  idpasw_u2_s2_8_4, short2, int4 )
-DEFN_INTEL_SG_IDPAS( u2_i2_split_matrix_mad_k64, int8, ushort4, int4,  idpasw_u2_s2_8_8, short4, int4 )
-DEFN_INTEL_SG_IDPAS( u2_u2_split_matrix_mad_k64, int4, ushort2, uint4, idpasw_u2_u2_8_4, short2, int4 )
-DEFN_INTEL_SG_IDPAS( u2_u2_split_matrix_mad_k64, int8, ushort4, uint4, idpasw_u2_u2_8_8, short4, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( i2_i2_split_matrix_mad_k64, int4, short2,  int4,  idpas_s2_s2_8_4, short2, short4, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( i2_i2_split_matrix_mad_k64, int8, short4,  int4,  idpas_s2_s2_8_8, short4, short8, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( i2_u2_split_matrix_mad_k64, int4, short2,  uint4, idpas_s2_u2_8_4, short2, short4, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( i2_u2_split_matrix_mad_k64, int8, short4,  uint4, idpas_s2_u2_8_8, short4, short8, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( u2_i2_split_matrix_mad_k64, int4, ushort2, int4,  idpas_u2_s2_8_4, short2, short4, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( u2_i2_split_matrix_mad_k64, int8, ushort4, int4,  idpas_u2_s2_8_8, short4, short8, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( u2_u2_split_matrix_mad_k64, int4, ushort2, uint4, idpas_u2_u2_8_4, short2, short4, int4 )
+DEFN_INTEL_SG_IDPASW_EMU( u2_u2_split_matrix_mad_k64, int8, ushort4, uint4, idpas_u2_u2_8_8, short4, short8, int4 )
 
 
 // bfloat16: both a and b are 2 bfloat16.
-DEFN_INTEL_SG_FDPAS( bf16_bf16_split_matrix_mad_k16, float2, int,   int8,  fdpasw_bf_bf_8_2 )
-DEFN_INTEL_SG_FDPAS( bf16_bf16_split_matrix_mad_k16, float4, int2,  int8,  fdpasw_bf_bf_8_4 )
-DEFN_INTEL_SG_FDPAS( bf16_bf16_split_matrix_mad_k16, float8, int4,  int8,  fdpasw_bf_bf_8_8 )
+DEFN_INTEL_SG_FDPASW_EMU( bf16_bf16_split_matrix_mad_k16, float2, int,   int8,  fdpas_bf_bf_8_2, int2 )
+DEFN_INTEL_SG_FDPASW_EMU( bf16_bf16_split_matrix_mad_k16, float4, int2,  int8,  fdpas_bf_bf_8_4, int4 )
+DEFN_INTEL_SG_FDPASW_EMU( bf16_bf16_split_matrix_mad_k16, float8, int4,  int8,  fdpas_bf_bf_8_8, int8 )
 
 // half: both a and b are 2 half.
-DEFN_INTEL_SG_FDPAS( f16_f16_split_matrix_mad_k16, float2, int,   int8,  fdpasw_hf_hf_8_2 )
-DEFN_INTEL_SG_FDPAS( f16_f16_split_matrix_mad_k16, float4, int2,  int8,  fdpasw_hf_hf_8_4 )
-DEFN_INTEL_SG_FDPAS( f16_f16_split_matrix_mad_k16, float8, int4,  int8,  fdpasw_hf_hf_8_8 )
+DEFN_INTEL_SG_FDPASW_EMU( f16_f16_split_matrix_mad_k16, float2, int,   int8,  fdpas_hf_hf_8_2, int2 )
+DEFN_INTEL_SG_FDPASW_EMU( f16_f16_split_matrix_mad_k16, float4, int2,  int8,  fdpas_hf_hf_8_4, int4 )
+DEFN_INTEL_SG_FDPASW_EMU( f16_f16_split_matrix_mad_k16, float8, int4,  int8,  fdpas_hf_hf_8_8, int8 )
 
 #endif // cl_intel_subgroup_split_matrix_multiply_accumulate
 
