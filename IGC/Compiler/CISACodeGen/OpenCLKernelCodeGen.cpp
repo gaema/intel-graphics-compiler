@@ -84,6 +84,21 @@ uint32_t OpenCLProgramContext::getNumGRFPerThread(bool returnDefault) {
     } else if (m_InternalOptions.Intel512GRFPerThread || m_Options.Intel512GRFPerThread) {
       return 512;
     }
+    // WA (DG2/Xe-HPG spill miscompile): DG2 does not honor the auto-large-GRF
+    // retry the way PVC/Xe-HP do (the vISA HWThreadNumberPerEU large-GRF path
+    // in CISABuilder is reached, but the spill-driven retry never forces
+    // TotalGRFNum=256). The 128-GRF GRAPH_COLORING_SPILL_*_RA codegen for some
+    // high-pressure kernels miscompiles on DG2: output stores fail to land
+    // (root cause: ai/intel/xe-hpg/audit/2026-06-21-igc-dg2-spill-store-miscompile).
+    // The 256-GRF (no-spill) compile of the same kernel is bit-exact correct.
+    // So when the RetryManager has advanced into the large-GRF retry state
+    // (i.e. the first 128-GRF compile spilled), force the retry to 256 GRF on
+    // DG2, routing the spilling kernel into the proven-correct no-spill path.
+    if (platform.getPlatformInfo().eProductFamily == IGFX_DG2 &&
+        IGC_IS_FLAG_ENABLED(EnableDG2SpillLargeGRFWA) && m_retryManager &&
+        m_retryManager->AllowLargeGRF(nullptr)) {
+      return 256;
+    }
   }
   return CodeGenContext::getNumGRFPerThread(returnDefault);
 }
