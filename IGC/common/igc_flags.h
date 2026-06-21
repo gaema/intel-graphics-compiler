@@ -58,6 +58,13 @@ DECLARE_IGC_REGKEY(DWORD, VISASpillAllowed256GRF, 0, "Spill size allowed specifi
 DECLARE_IGC_REGKEY(DWORD, VISAGRFBumpUpNumber, 1,
                    "Sets the number of steps/configs which the RA will try to use (during retry) to compile the kernel",
                    true)
+DECLARE_IGC_REGKEY(bool, EnableDG2SpillLargeGRFWA, true,
+                   "WA for DG2/Xe-HPG: when a high-pressure OpenCL kernel spills at 128 GRF and "
+                   "the RetryManager advances into the large-GRF retry, force TotalGRFNum=256. The "
+                   "128-GRF spilling codegen miscompiles on DG2 (output stores fail to land); the "
+                   "256-GRF no-spill compile is bit-exact correct. See "
+                   "ai/intel/xe-hpg/audit/2026-06-21-igc-dg2-spill-store-miscompile.",
+                   true)
 DECLARE_IGC_REGKEY(DWORD, ForceAllowSmallSpill, 0,
                    "Allow small spills regardless of SIMD, API, or platform. The spill amount is set below", false)
 DECLARE_IGC_REGKEY(DWORD, SIMD8_SpillThreshold, 2, "Percentage of instructions allowed for spilling on SIMD8", false)
