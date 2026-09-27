@@ -2348,7 +2348,17 @@ G4_INST *SpillManagerGRF::createFillSendInstr(
   auto oldExecSize = execSize;
 
   if (useScratchMsg_) {
-    execSize = g4::SIMD16;
+    // A 1-GRF scratch spill is emitted at SIMD8 (8 dwords = one GRF). Forcing
+    // the fill to SIMD16 reads a different shape than that write, so a spilled
+    // induction variable is never observed and the loop does not exit.
+    unsigned segmentByteSize = getSegmentByteSize(filledRangeRegion, oldExecSize);
+    unsigned numGRFs =
+        cdiv(segmentByteSize, builder_->numEltPerGRF<Type_UB>());
+    if (filledRangeRegion->crossGRF(*builder_) || numGRFs > 1 ||
+        oldExecSize > g4::SIMD8)
+      execSize = g4::SIMD16;
+    else
+      execSize = g4::SIMD8;
   }
 
   G4_DstRegRegion *postDst =
