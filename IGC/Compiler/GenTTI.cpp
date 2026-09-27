@@ -33,6 +33,37 @@ using namespace IGC;
 
 #define DEBUG_TYPE "GENtti"
 
+// True when this call is a subgroup DPAS, either still an OpenCL matrix_mad
+// builtin or already lowered to GenISA_sub_group_dpas.
+static bool isDPASCall(const Instruction &I) {
+  const auto *CI = dyn_cast<CallInst>(&I);
+  if (!CI)
+    return false;
+  if (const auto *GII = dyn_cast<GenIntrinsicInst>(CI))
+    return GII->getIntrinsicID() == GenISAIntrinsic::GenISA_sub_group_dpas;
+  const Function *Callee = CI->getCalledFunction();
+  if (!Callee)
+    return false;
+  StringRef N = Callee->getName();
+  return N.contains("matrix_mad") || N.contains("sub_group_dpas") || N.contains("sub_group_bfdpas") ||
+         N.contains("sub_group_hfdpas");
+}
+
+static bool loopContainsDPAS(const Loop *L) {
+  for (const auto *BB : L->blocks())
+    for (const auto &I : *BB)
+      if (isDPASCall(I))
+        return true;
+  return false;
+}
+
+static unsigned loopInstCount(const Loop *L) {
+  unsigned N = 0;
+  for (const auto *BB : L->blocks())
+    N += (unsigned)std::distance(BB->instructionsWithoutDebug().begin(), BB->instructionsWithoutDebug().end());
+  return N;
+}
+
 namespace llvm {
 
 bool GenIntrinsicsTTIImpl::isLoweredToCall(const Function *F) const {
@@ -223,6 +254,37 @@ void GenIntrinsicsTTIImpl::getUnrollingPreferences(Loop *L, ScalarEvolution &SE,
       // If you increase this limit, please test that printing with sycl::stream still works.
       LoopUnrollThreshold = 20000;
     }
+  }
+
+  // DG2 / Xe-HPG only. Partial unroll of a sub_group_dpas loop does not retire
+  // on the A370M (kernel r_3_8_8_4_2_2_2_5_4_24_7_2, trips 24 and 7: the launch
+  // retired in 0.031s with unrolling disabled and did not retire with the
+  // default unroll). A small constant-trip loop is the other measured case --
+  // the M=1 GEMV is correct only when that loop is fully unrolled -- so those
+  // are fully unrolled here. Anything larger keeps the loop. Xe2 is not DG2.
+  if (ctx->platform.getPlatformInfo().eProductFamily == IGFX_DG2 &&
+      IGC_IS_FLAG_ENABLED(EnableDG2DPASLoopUnrollWA) && loopContainsDPAS(L)) {
+    const unsigned FullUnrollTripLimit = 64;
+    const unsigned FullUnrollBodyLimit = 256;
+    unsigned Trip = SE.getSmallConstantTripCount(L);
+    unsigned Body = loopInstCount(L);
+    if (Trip >= 2 && Trip <= FullUnrollTripLimit && Body > 0 && Body <= FullUnrollBodyLimit) {
+      UP.Count = Trip;
+      UP.MaxCount = Trip;
+      UP.Partial = false;
+      UP.Runtime = false;
+      UP.Force = true;
+      UP.Threshold = LoopUnrollThreshold > Body * Trip ? LoopUnrollThreshold : Body * Trip;
+      return;
+    }
+    UP.Threshold = 0;
+    UP.OptSizeThreshold = 0;
+    UP.PartialThreshold = 0;
+    UP.Count = 1;
+    UP.MaxCount = 1;
+    UP.Partial = false;
+    UP.Runtime = false;
+    return;
   }
 
   // Special case when DP emulation is needed.
