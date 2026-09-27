@@ -2191,6 +2191,10 @@ G4_Imm *SpillManagerGRF::createFillSendMsgDesc(unsigned regOff, unsigned height,
 
     message |= (1 << SCRATCH_MSG_DESC_CATEORY);
     message |= (0 << SCRATCH_MSG_INVALIDATE_AFTER_READ);
+    // Spill descriptors set dword channel mode. A fill that leaves the bit
+    // clear is an oword read of a dword write, so a spilled loop counter
+    // reloads the value from before the increment and the loop never exits.
+    message |= (1 << SCRATCH_MSG_DESC_CHANNEL_MODE);
     unsigned blocksize_encoding =
         getScratchBlocksizeEncoding(height, *builder_);
 
@@ -2249,6 +2253,8 @@ G4_Imm *SpillManagerGRF::createFillSendMsgDesc(REGION_TYPE *filledRangeRegion,
         (SCRATCH_PAYLOAD_HEADER_MAX_HEIGHT << getSendMsgLengthBitOffset());
     message |= (1 << SCRATCH_MSG_DESC_CATEORY);
     message |= (0 << SCRATCH_MSG_INVALIDATE_AFTER_READ);
+    // Match the spill descriptor's dword channel mode. See createFillSendMsgDesc.
+    message |= (1 << SCRATCH_MSG_DESC_CHANNEL_MODE);
     unsigned blocksize_encoding =
         getScratchBlocksizeEncoding(responseLength, *builder_);
 
@@ -4699,6 +4705,8 @@ static uint32_t computeFillMsgDesc(unsigned int payloadSize,
   message |= (msgLength << getSendMsgLengthBitOffset());
   message |= (1 << SCRATCH_MSG_DESC_CATEORY);
   message |= (0 << SCRATCH_MSG_INVALIDATE_AFTER_READ);
+  // Match computeSpillMsgDesc's dword channel mode so the fill sees the spill.
+  message |= (1 << SCRATCH_MSG_DESC_CHANNEL_MODE);
   unsigned blocksize_encoding = getScratchBlocksizeEncoding(payloadSize, irb);
   message |= (blocksize_encoding << SCRATCH_MSG_DESC_BLOCK_SIZE);
   message |= offsetInGrfUnits;

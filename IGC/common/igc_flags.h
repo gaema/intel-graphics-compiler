@@ -48,12 +48,6 @@ DECLARE_IGC_REGKEY(bool, EnableDG2SpillLargeGRFWA, true,
                    "256-GRF no-spill compile is bit-exact correct. See "
                    "ai/intel/xe-hpg/audit/2026-06-21-igc-dg2-spill-store-miscompile.",
                    true)
-DECLARE_IGC_REGKEY(bool, EnableDG2DPASLoopUnrollWA, true,
-                   "WA for DG2/Xe-HPG: do not partially unroll a loop that contains sub_group_dpas. "
-                   "Partial unroll of that loop does not retire on the A370M; leaving it intact does. "
-                   "A small constant-trip loop is fully unrolled instead (the M=1 GEMV case is correct "
-                   "only when fully unrolled). Xe2 is not DG2.",
-                   true)
 DECLARE_IGC_REGKEY(DWORD, ForceAllowSmallSpill, 0,
                    "Allow small spills regardless of SIMD, API, or platform. The spill amount is set below", false)
 DECLARE_IGC_REGKEY(DWORD, SIMD8_SpillThreshold, 2, "Percentage of instructions allowed for spilling on SIMD8", false)
