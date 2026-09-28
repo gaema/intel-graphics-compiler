@@ -6677,6 +6677,25 @@ void GraphColor::computeDegreeForARF() {
 }
 
 void GraphColor::computeSpillCosts(bool useSplitLLRHeuristic, const RPE *rpe) {
+  // A scalar self-increment is a loop counter. Spilling it to DG2 scratch
+  // does not round-trip: the reloaded value stays below the trip count and
+  // the kernel never retires. Keep that declare in a GRF.
+  for (auto *bb : kernel.fg.getBBList()) {
+    for (auto *inst : *bb) {
+      if (inst->opcode() != G4_add || inst->getExecSize() != g4::SIMD1)
+        continue;
+      G4_DstRegRegion *dst = inst->getDst();
+      G4_Operand *src0 = inst->getSrc(0);
+      if (!dst || !src0 || !src0->isSrcRegRegion())
+        continue;
+      G4_Declare *dstDcl = dst->getTopDcl();
+      G4_Declare *srcDcl = src0->asSrcRegRegion()->getTopDcl();
+      if (!dstDcl || dstDcl != srcDcl || dstDcl->getNumRows() > 1)
+        continue;
+      dstDcl->setDoNotSpill();
+    }
+  }
+
   LiveRangeVec addressSensitiveVars;
   float maxNormalCost = 0.0f;
   VarReferences directRefs(kernel, true, false);

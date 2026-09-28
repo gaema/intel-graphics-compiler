@@ -5630,17 +5630,22 @@ void GlobalRA::expandFillNonStackcall(uint32_t numRows, uint32_t offset,
       G4_SrcRegRegion *headerOpnd =
           builder->createSrcRegRegion(builder->getBuiltinR0(), region);
 
+      unsigned payloadGRF = getPayloadSizeGRF(numRows);
       uint32_t fillMsgDesc =
-          computeFillMsgDesc(getPayloadSizeGRF(numRows), offset, *builder);
+          computeFillMsgDesc(payloadGRF, offset, *builder);
 
       G4_SendDescRaw *msgDesc = kernel.fg.builder->createSendMsgDesc(
-          fillMsgDesc, getPayloadSizeGRF(numRows), 1, SFID::DP_DC0, 0, 0,
+          fillMsgDesc, payloadGRF, 1, SFID::DP_DC0, 0, 0,
           SendAccess::READ_ONLY);
 
       G4_Imm *msgDescImm = builder->createImm(msgDesc->getDesc(), Type_UD);
 
+      // A 1-GRF scratch spill is SIMD8 (8 dwords = one GRF). A SIMD16 fill of
+      // that slot does not return the stored dword, so a spilled loop counter
+      // never advances.
+      G4_ExecSize fillExec = payloadGRF > 1 ? g4::SIMD16 : g4::SIMD8;
       auto sendInst = builder->createInternalSendInst(
-          nullptr, G4_send, g4::SIMD16, fillDst, headerOpnd, msgDescImm,
+          nullptr, G4_send, fillExec, fillDst, headerOpnd, msgDescImm,
           inst->getOption(), msgDesc);
 
       std::stringstream comments;
