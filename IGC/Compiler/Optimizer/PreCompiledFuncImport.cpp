@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2024 Intel Corporation
+Copyright (C) 2017-2026 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -21,6 +21,7 @@ SPDX-License-Identifier: MIT
 #include "llvmWrapper/IR/DerivedTypes.h"
 #include "llvmWrapper/IR/IRBuilder.h"
 #include "llvmWrapper/IR/Function.h"
+#include "llvmWrapper/IR/Constants.h"
 #include "AdaptorCommon/ImplicitArgs.hpp"
 #include "AdaptorCommon/AddImplicitArgs.hpp"
 #include "Compiler/Optimizer/PreCompiledFuncImport.hpp"
@@ -601,6 +602,12 @@ bool PreCompiledFuncImport::runOnModule(Module &M) {
                 createIntrinsicCall(CI, GenISAIntrinsic::GenISA_mul_rtz);
               } else if (IGCLLVM::starts_with(calledFunc->getName(), "GenISA_uitof_rtz")) {
                 createIntrinsicCall(CI, GenISAIntrinsic::GenISA_uitof_rtz);
+              } else if (IGCLLVM::starts_with(calledFunc->getName(), "GenISA_getSR0")) {
+                createIntrinsicCall(CI, GenISAIntrinsic::GenISA_getSR0);
+              } else if (IGCLLVM::starts_with(calledFunc->getName(), "GenISA_setSR0")) {
+                createIntrinsicCall(CI, GenISAIntrinsic::GenISA_setSR0);
+              } else if (IGCLLVM::starts_with(calledFunc->getName(), "GenISA_movcr")) {
+                createIntrinsicCall(CI, GenISAIntrinsic::GenISA_movcr);
               }
             }
           }
@@ -1293,7 +1300,7 @@ void PreCompiledFuncImport::processFPBinaryOperator(Instruction &I, FunctionIDs 
     constDouble = cast<ConstantFP>(I.getOperand(0));
   }
 
-  if (constDouble && constDouble->isZeroValue()) // turn the fsub into an and/xor/and/or operation
+  if (constDouble && IGCLLVM::Constant::isNullValue(constDouble)) // turn the fsub into an and/xor/and/or operation
   {
     Type *intTy = Type::getInt32Ty(m_pModule->getContext());
     Type *DoubleTy = Type::getDoubleTy(m_pModule->getContext());
@@ -2178,7 +2185,9 @@ void PreCompiledFuncImport::createFuncWithIA() {
 
 void PreCompiledFuncImport::replaceFunc(Function *old_func, Function *new_func) {
   ModuleMetaData *modMD = m_pCtx->getModuleMetaData();
-  auto &newImplicitArgInfoList = modMD->FuncMD[new_func].implicitArgInfoList;
+  // Copy, not a reference: the loop below can grow the FuncMD MapVector and dangle a reference into it
+  // (HSD-13015825703).
+  auto newImplicitArgInfoList = modMD->FuncMD[new_func].implicitArgInfoList;
   std::vector<Instruction *> list_delete;
   for (auto U = old_func->user_begin(), UE = old_func->user_end(); U != UE; ++U) {
     std::vector<Value *> new_args;
@@ -2209,7 +2218,27 @@ void PreCompiledFuncImport::replaceFunc(Function *old_func, Function *new_func) 
       ImplicitArg::ArgType argId = (ImplicitArg::ArgType)newImplicitArgInfoList[cImpCount].argId;
       Argument *iArgVal = parentIA->getImplicitArg(*parent_func, argId);
 
-      new_args.push_back(iArgVal);
+      // After the ArgInfoList/ImplicitArgInfoList migration to FuncMD,
+      // parentIA is a by-value snapshot of FuncMD[parent].implicitArgInfoList. When that
+      // snapshot does not list this implicit arg (e.g. a non-entry parent under
+      // EnableImplicitArgAsIntrinsic, where R0/PRIVATE_BASE are materialized as intrinsics
+      // rather than added to the signature), getImplicitArg() returns null. The
+      // pre-migration code read the list live and resolved a real argument; here we resolve
+      // the same value through the canonical getImplicitArgValue(), which returns the
+      // existing argument when present and otherwise materializes the intrinsic for a
+      // non-entry function. This keeps the non-null path byte-identical and never pushes a
+      // null operand (which would produce a malformed call and abort vISA emission).
+      llvm::Value *iArgValOrIntrinsic =
+          iArgVal ? llvm::cast<llvm::Value>(iArgVal) : parentIA->getImplicitArgValue(*parent_func, argId, m_pMdUtils);
+      IGC_ASSERT_MESSAGE(iArgValOrIntrinsic, "replaceFunc: could not resolve implicit argument for emulation call");
+      if (!iArgValOrIntrinsic) {
+        m_pCtx->EmitError("Internal error: missing implicit argument while linking an emulation function; "
+                          "compilation cannot continue.",
+                          cInst);
+        return;
+      }
+
+      new_args.push_back(iArgValOrIntrinsic);
       ++new_arg_iter;
       ++cImpCount;
     }

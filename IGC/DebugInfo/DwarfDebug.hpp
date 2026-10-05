@@ -27,7 +27,6 @@ See LICENSE.TXT for details.
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/Config/llvm-config.h"
-#include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/Support/Allocator.h"
@@ -45,7 +44,6 @@ See LICENSE.TXT for details.
 #include "EmitterOpts.hpp"
 
 #include "Probe/Assertion.h"
-#include <set>
 #include <variant>
 
 namespace llvm {
@@ -119,9 +117,6 @@ public:
   uint64_t end = 0;
 
   DotDebugLocEntry() : m_DbgEntry(nullptr), Variable(nullptr) {}
-  DotDebugLocEntry(const llvm::MCSymbol *B, const llvm::MCSymbol *E, const DbgVarInstEntry *dbgEntry,
-                   const llvm::MDNode *V)
-      : m_DbgEntry(dbgEntry), Variable(V) {}
   DotDebugLocEntry(const uint64_t s, const uint64_t e, const DbgVarInstEntry *dbgEntry, const llvm::MDNode *V)
       : start(s), end(e), m_DbgEntry(dbgEntry), Variable(V) {}
 
@@ -211,8 +206,7 @@ public:
   /// storage required
   unsigned getRegisterValueSizeInBits(const DwarfDebug *DD) const;
 
-  // Location is implicit when it's DIExpression ends with
-  // !DIExpression(DW_OP_stack_value)
+  // Location is implicit when its DIExpression contains DW_OP_stack_value.
   bool currentLocationIsImplicit() const;
 
   // Location is memory address when it is described with llvm.dbg.declare
@@ -235,7 +229,6 @@ public:
   bool currentLocationIsInlined() const { return isLocationInlined; }
   void setLocationInlined(bool isInlined = true) { isLocationInlined = isInlined; }
 
-  DbgRegisterType getLocationRegisterType() const { return RegType; }
   void setLocationRegisterType(DbgRegisterType RegType) { this->RegType = RegType; }
 
   /// Record a fragment piece for this variable. Maintains sorted order
@@ -279,8 +272,6 @@ public:
     return false;
   }
 
-  bool isBlockByrefVariable() const;
-
   llvm::DIType *getType() const;
 
   static bool IsSupportedDebugInst(const DbgVarInstEntry *Inst);
@@ -290,9 +281,6 @@ public:
 #endif
 #ifndef NDEBUG
   void dump() const;
-#if LLVM_VERSION_MAJOR < 22
-  static void dumpDbgInst(const llvm::Instruction *Inst);
-#endif // LLVM_VERSION_MAJOR < 22
 #endif // NDEBUG
 };
 
@@ -417,12 +405,6 @@ private:
   // create DIEs.
   llvm::SmallPtrSet<const llvm::MDNode *, 16> ProcessedSPNodes;
 
-  // Maps instruction with label emitted before instruction.
-  llvm::DenseMap<const llvm::Instruction *, llvm::MCSymbol *> LabelsBeforeInsn;
-
-  // Maps instruction with label emitted after instruction.
-  llvm::DenseMap<const llvm::Instruction *, llvm::MCSymbol *> LabelsAfterInsn;
-
   // Every user variable mentioned by a debug variable entry in order of
   // appearance.
   llvm::SmallVector<const llvm::MDNode *, 8> UserVariables;
@@ -434,16 +416,9 @@ private:
   typedef llvm::DenseMap<const llvm::MDNode *, DbgVarEntryList> DbgValueHistoryMap;
   DbgValueHistoryMap DbgValues;
 
-  llvm::SmallVector<const llvm::MCSymbol *, 8> DebugRangeSymbols;
-
   // Store vector of MCSymbol->Raw .debug_ranges data.
   // MCSymbol* is nullptr when not using relocatable elf.
   std::vector<std::pair<llvm::MCSymbol *, llvm::SmallVector<unsigned int, 8>>> GenISADebugRangeSymbols;
-
-  // Previous instruction's location information. This is used to determine
-  // label location to indicate scope boundries in llvm::dwarf debug info.
-  llvm::DebugLoc PrevInstLoc;
-  llvm::MCSymbol *PrevLabel = nullptr;
 
   // Relocation for CIE start
   llvm::MCSymbol *CIESubroutineLabel = nullptr;
@@ -461,12 +436,7 @@ private:
   // form section offsets and are created by EmitSectionLabels.
   llvm::MCSymbol *DwarfInfoSectionSym = nullptr;
   llvm::MCSymbol *DwarfAbbrevSectionSym = nullptr;
-  llvm::MCSymbol *DwarfStrSectionSym = nullptr;
-  llvm::MCSymbol *TextSectionSym = nullptr;
-  llvm::MCSymbol *DwarfDebugRangeSectionSym = nullptr;
-  llvm::MCSymbol *DwarfDebugLocSectionSym = nullptr;
   llvm::MCSymbol *DwarfLineSectionSym = nullptr;
-  llvm::MCSymbol *DwarfFrameSectionSym = nullptr;
   llvm::MCSymbol *FunctionBeginSym = nullptr;
   llvm::MCSymbol *FunctionEndSym = nullptr;
   llvm::MCSymbol *ModuleBeginSym = nullptr;
@@ -510,22 +480,11 @@ private:
   // Holders for the various debug information flags that we might need to
   // have exposed. See accessor functions below for description.
 
-  // Holder for types that are going to be extracted out into a type unit.
-  std::vector<DIE *> TypeUnits;
-
   // Version of llvm::dwarf we're emitting.
   unsigned DwarfVersion;
 
   // A pointer to all units in the section.
   llvm::SmallVector<CompileUnit *, 1> CUs;
-
-  // Collection of strings for this unit and assorted symbols.
-  // A String->Symbol mapping of strings used by indirect
-  // references.
-  typedef llvm::StringMap<std::pair<llvm::MCSymbol *, unsigned>, llvm::BumpPtrAllocator &> StrPool;
-  StrPool StringPool;
-  unsigned NextStringPoolNumber;
-  std::string StringPref;
 
   std::vector<llvm::Function *> RegisteredFunctions;
   llvm::DenseMap<VISAModule *, llvm::Function *> VISAModToFunc;
@@ -592,9 +551,6 @@ private:
   /// \brief Emit the abbreviation section.
   void emitAbbreviations();
 
-  /// \brief Emit visible names into a debug str section.
-  void emitDebugStr();
-
   /// \brief Emit location entries for variables in DWARF v4.
   void emitLocEntries();
 
@@ -628,10 +584,6 @@ private:
   /// source line list.
   void recordSourceLine(unsigned Line, unsigned Col, const llvm::MDNode *Scope, unsigned Flags);
 
-  /// \brief Indentify instructions that are marking the beginning of or
-  /// ending of a scope.
-  void identifyScopeMarkers();
-
   /// \brief If Var is an current function argument that add it in
   /// CurrentFnArguments list.
   bool addCurrentFnArgument(const llvm::Function *MF, DbgVariable *Var, ::IGC::LexicalScope *Scope);
@@ -645,7 +597,7 @@ private:
   /// \brief Represents a pending location entry for .debug_loc encoding.
   /// Used to merge consecutive identical locations before emitting.
   struct VarLocation {
-    enum class Type { Empty = 0, Imm = 1, Reg = 2, FpBased = 3 };
+    enum class Type { Empty = 0, Imm = 1, Reg = 2, Mem = 3 };
     Type type = Type::Empty;
     uint64_t start = 0;
     uint64_t end = 0;
@@ -662,13 +614,7 @@ private:
     bool isEmpty() const { return type == Type::Empty; }
     bool isImm() const { return type == Type::Imm; }
     bool isReg() const { return type == Type::Reg; }
-    bool isFpBased() const { return type == Type::FpBased; }
-    bool isFragmented() { return FragmentInfo.has_value(); }
-
-    void setEmpty() {
-      type = Type::Empty;
-      FragmentInfo = {};
-    }
+    bool isMem() const { return type == Type::Mem; }
 
     void setImm(uint64_t s, uint64_t e, DbgVariable *var, const DbgVarInstEntry *entry, const llvm::Constant *val,
                 std::optional<llvm::DIExpression::FragmentInfo> fragInfo = {}) {
@@ -681,9 +627,9 @@ private:
       FragmentInfo = fragInfo;
     }
 
-    void setFpBased(uint64_t s, uint64_t e, DbgVariable *var, const DbgVarInstEntry *entry,
-                    const VISAVariableLocation &loc, std::optional<llvm::DIExpression::FragmentInfo> fragInfo = {}) {
-      type = Type::FpBased;
+    void setMem(uint64_t s, uint64_t e, DbgVariable *var, const DbgVarInstEntry *entry, const VISAVariableLocation &loc,
+                std::optional<llvm::DIExpression::FragmentInfo> fragInfo = {}) {
+      type = Type::Mem;
       start = s;
       end = e;
       dbgVar = var;
@@ -744,9 +690,9 @@ private:
   /// location in a GRF register. Handles caller-save.
   void encodeReg(IGC::DotDebugLocEntry &dotLoc, const VarLocation &vl, uint32_t &offset);
 
-  /// \brief Encode an FE_FP-based (StorageOffset) location into .debug_loc.
+  /// \brief Encode a Memory location (private-base or FP relative) into .debug_loc.
   /// Uses buildGeneral with IR-derived ranges (no VISA register liveness).
-  void encodeFpBased(IGC::DotDebugLocEntry &dotLoc, const VarLocation &vl, uint32_t &offset);
+  void encodeMem(IGC::DotDebugLocEntry &dotLoc, const VarLocation &vl, uint32_t &offset);
 
   /// \brief Build composite DWARF location expressions for fragmented variables.
   /// For each IP sub-interval, assembles a single .debug_loc entry describing
@@ -781,6 +727,14 @@ private:
   ::IGC::LexicalScope *resolveVariableScope(llvm::DIVariable *DV, const DbgVarInstEntry *dbgEntry,
                                             const llvm::Function *MF);
 
+#if LLVM_VERSION_MAJOR >= 22
+  /// \brief True if DV's enclosing subprogram is the current function's, matched
+  /// by name to cover the clang 22 wrapper/impl kernel split (both DISubprograms
+  /// share the kernel name). Such variables belong to the current function's
+  /// non-inlined scope tree, not the impl's abstract inline scope.
+  bool isCurrentFunctionVariable(const llvm::DIVariable *DV) const;
+#endif
+
   /// \brief Process the history of debug values for a single variable.
   /// Analyzes all debug variable entries associated with a variable and builds
   /// a mapping of DbgVariable instances to their GenISA IP.
@@ -792,26 +746,6 @@ private:
   /// \brief Collect info for variables that were optimized out.
   void collectOptimizedOut(llvm::SmallPtrSet<const llvm::MDNode *, 16> &Processed);
   //===----------------------------------------------------------------------===//
-
-  /// \brief Ensure that a label will be emitted before MI.
-  void requestLabelBeforeInsn(const llvm::Instruction *MI) {
-    LabelsBeforeInsn.insert(std::make_pair(MI, (llvm::MCSymbol *)0));
-  }
-
-  /// \brief Return Label preceding the instruction.
-  llvm::MCSymbol *getLabelBeforeInsn(const llvm::Instruction *MI) {
-    llvm::MCSymbol *Label = LabelsBeforeInsn.lookup(MI);
-    IGC_ASSERT_MESSAGE(Label, "Didn't insert label before instruction");
-    return Label;
-  }
-
-  /// \brief Ensure that a label will be emitted after MI.
-  void requestLabelAfterInsn(const llvm::Instruction *MI) {
-    LabelsAfterInsn.insert(std::make_pair(MI, (llvm::MCSymbol *)0));
-  }
-
-  /// \brief Return Label immediately following the instruction.
-  llvm::MCSymbol *getLabelAfterInsn(const llvm::Instruction *MI) { return LabelsAfterInsn.lookup(MI); }
 
   /// isSubprogramContext - Return true if Context is either a subprogram
   /// or another context nested inside a subprogram.
@@ -849,16 +783,6 @@ public:
   /// \brief Gather and emit post-function debug information.
   void endFunction(const llvm::Function *MF);
 
-  /// \brief Process beginning of an instruction.
-  void beginInstruction(const llvm::Instruction *MI, bool recordSrcLine);
-
-  /// \brief Process end of an instruction.
-  void endInstruction(const llvm::Instruction *MI);
-
-  /// \brief Add a DIE to the set of types that we're going to pull into
-  /// type units.
-  void addTypeUnitType(DIE *Die) { TypeUnits.push_back(Die); }
-
   /// \brief Add a label so that arange data can be generated for it.
   void addArangeLabel(SymbolCU SCU) { ArangeLabels.push_back(SCU); }
 
@@ -883,17 +807,10 @@ public:
 
   /// Find the MDNode for the given reference.
   template <typename T> inline T *resolve(T *Ref) const { return Ref; }
-  /// \brief Returns the entry into the start of the pool.
-  llvm::MCSymbol *getStringPoolSym();
-
-  /// \brief Returns an entry into the string pool with the given
-  /// string text.
-  llvm::MCSymbol *getStringPoolEntry(llvm::StringRef Str);
 
   void registerVISA(IGC::VISAModule *M);
 
   const llvm::Function *GetPrimaryEntry() const;
-  llvm::Function *GetFunction(const VISAModule *M) const;
   VISAModule *GetVISAModule(const llvm::Function *F) const;
 
   using DataVector = std::vector<unsigned char>;
@@ -917,6 +834,13 @@ private:
 
   // store all instructions corresponding to same InlinedAt MDNode
   llvm::DenseMap<llvm::MDNode *, std::vector<const llvm::Instruction *>> SameIATInsts;
+
+#if LLVM_VERSION_MAJOR >= 22
+  // Instructions carrying a VISA offset, grouped by InlinedAt, in program order.
+  // Used to extend a single-entry variable's range to the next live point
+  // without rescanning the whole function.
+  llvm::DenseMap<llvm::MDNode *, std::vector<const llvm::Instruction *>> VisaOffInstsByIAT;
+#endif
 
   // Store label for each %ip
   llvm::DenseMap<unsigned int, llvm::MCSymbol *> LabelsBeforeIp;
@@ -1008,13 +932,6 @@ public:
     if (ver < 3)
       return RetIpSubReg_1_2;
     return RetIpSubReg_3;
-  }
-
-  uint32_t RetIpByteSize() {
-    auto ver = GetABIVersion();
-    if (ver < 3)
-      return 4;
-    return 8;
   }
 
 private:

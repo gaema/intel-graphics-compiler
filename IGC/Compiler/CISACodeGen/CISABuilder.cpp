@@ -9,6 +9,7 @@ SPDX-License-Identifier: MIT
 #include "Compiler/CISACodeGen/CISABuilder.hpp"
 #include "Compiler/CISACodeGen/ShaderCodeGen.hpp"
 #include "Compiler/CISACodeGen/OpenCLKernelCodeGen.hpp"
+#include "Compiler/CISACodeGen/helper.h"
 #include "Compiler/Optimizer/OpenCLPasses/NamedBarriers/NamedBarriersResolution.hpp"
 #include "common/allocator.h"
 #include "common/Types.hpp"
@@ -2010,18 +2011,10 @@ void CEncoder::TraceRay(CVariable *destination, TRACE_RAY_OPCODE opcode, CVariab
   if (payload != nullptr) {
     payloadOpnd = GetRawSource(payload);
   }
+  V(vKernel->AppendVISATraceRay(predOpnd, emask, executionSize, opcode, globalBufferPointerOpnd,
+                                (uint8_t)stackAddressMode, payloadOpnd, dstOpnd));
 }
 
-void CEncoder::BTD(BTD_OPCODE opcode, CVariable *globalBufferPointer, CVariable *stackId,
-                   CVariable *shaderRecordIdentifier
-) {
-  [[maybe_unused]] VISA_PredOpnd *predOpnd = GetFlagOperand(m_encoderState.m_flag);
-  [[maybe_unused]] VISA_EMask_Ctrl emask = ConvertMaskToVisaType(m_encoderState.m_mask, false);
-  [[maybe_unused]] VISA_Exec_Size executionSize = visaExecSize(m_encoderState.m_simdSize);
-  [[maybe_unused]] VISA_RawOpnd *stackIdOpnd = GetRawSource(stackId);
-  [[maybe_unused]] VISA_RawOpnd *shaderRecordIdentifierOpnd = GetRawSource(shaderRecordIdentifier);
-  [[maybe_unused]] VISA_VectorOpnd *globalBufferPointerOpnd = GetSourceOperandNoModifier(globalBufferPointer);
-}
 
 void CEncoder::ExtendedCacheControl(LSC_CACHE_OPTS cacheControlPolicy, LSC_CACHE_CTRL_OPERATION cacheControlOperation,
                                     LSC_CACHE_CTRL_SIZE cacheControlSize, CVariable *cacheLineAddresses,
@@ -2148,7 +2141,8 @@ void CEncoder::RenderTargetWrite(CVariable *var[], bool isUndefined[], bool last
 }
 
 bool CEncoder::isSamplerIdxLT16(const SamplerDescriptor &sampler) {
-  if (sampler.m_samplerType == ESAMPLER_NORMAL) {
+  if (sampler.m_samplerType == ESAMPLER_NORMAL
+  ) {
     if (sampler.m_sampler->IsImmediate()) {
       uint immediate = int_cast<uint>(sampler.m_sampler->GetImmediateValue());
       if (immediate < 16)
@@ -2198,6 +2192,7 @@ VISA_StateOpndHandle *CEncoder::GetSamplerOperand(CVariable *samplerIndex) {
   return GetSamplerOperand(sampler);
 }
 
+
 void CEncoder::Sample(EOPCODE subOpcode, uint writeMask, CVariable *offset, const ResourceDescriptor &resource,
                       const ResourceDescriptor &pairedResource, const SamplerDescriptor &sampler, uint numSources,
                       CVariable *dst, SmallVector<CVariable *, 4> &payload, bool zeroLOD, bool cpsEnable,
@@ -2234,13 +2229,13 @@ void CEncoder::Sample(EOPCODE subOpcode, uint writeMask, CVariable *offset, cons
     if (m_program->m_Platform->hasEfficient64bEnabled()) {
       VISA_VectorOpnd *samplerBaseAddrOpnd = GetSourceOperandNoModifier(sampler.m_sampler);
       VISA_VectorOpnd *surfaceBaseAddrOpnd = GetSourceOperandNoModifier(resource.m_resource);
-      status = vKernel->AppendVISA3dSampler(ConvertSubOpcode(subOpcode, zeroLOD),
-                                            /* pixel null mask */ feedbackEnable, cpsEnable, !nonUniformState,
-                                            predOpnd, GetAluEMask(dst), visaExecSize(m_encoderState.m_simdSize),
-                                            ConvertChannelMaskToVisaType(writeMask), aoffimmi,
-                                            (VISA_StateOpndHandle *)samplerBaseAddrOpnd, sampler.m_SamplerStateIndex,
-                                            (VISA_StateOpndHandle *)surfaceBaseAddrOpnd, resource.m_SurfaceStateIndex,
-                                            pairedResourceBSSOOpnd, dstVar, numSources, opndArray);
+      status = vKernel->AppendVISA3dSampler(
+          ConvertSubOpcode(subOpcode, zeroLOD),
+          /* pixel null mask */ feedbackEnable, cpsEnable, !nonUniformState,
+          predOpnd, GetAluEMask(dst), visaExecSize(m_encoderState.m_simdSize), ConvertChannelMaskToVisaType(writeMask),
+          aoffimmi, (VISA_StateOpndHandle *)samplerBaseAddrOpnd, sampler.m_SamplerStateIndex,
+          (VISA_StateOpndHandle *)surfaceBaseAddrOpnd, resource.m_SurfaceStateIndex, pairedResourceBSSOOpnd, dstVar,
+          numSources, opndArray);
     } else {
       VISA_StateOpndHandle *samplerOpnd = GetSamplerOperand(sampler);
       VISA_StateOpndHandle *btiOpnd = GetVISASurfaceOpnd(resource);
@@ -2380,12 +2375,12 @@ void CEncoder::Gather4Inst(EOPCODE subOpcode, CVariable *offset, const ResourceD
   }
 
   {
-    int status =
-        vKernel->AppendVISA3dGather4(ConvertSubOpcode(subOpcode, false),
-                                     /* pixel null mask */ feedbackEnable,
-                                     predOpnd, GetAluEMask(dst), visaExecSize(m_encoderState.m_simdSize),
-                                     ConvertSingleSourceChannel(channel), aoffimmi, samplerOpnd, samplerImmIndex,
-                                     surfOpnd, surfaceImmIndex, pairedResourceBSSOOpnd, dstVar, numSources, opndArray);
+    int status = vKernel->AppendVISA3dGather4(
+        ConvertSubOpcode(subOpcode, false),
+        /* pixel null mask */ feedbackEnable,
+        predOpnd, GetAluEMask(dst), visaExecSize(m_encoderState.m_simdSize), ConvertSingleSourceChannel(channel),
+        aoffimmi, samplerOpnd, samplerImmIndex, surfOpnd, surfaceImmIndex, pairedResourceBSSOOpnd, dstVar, numSources,
+        opndArray);
 
     V(status);
   }
@@ -3482,6 +3477,7 @@ unsigned int CEncoder::GetSpillThreshold(SIMDMode simdmode) {
   CodeGenContext *context = m_program->GetContext();
   ShaderType shaderType = context->type;
   unsigned int value = 0;
+  unsigned dynspill = IGC_GET_FLAG_VALUE(VISADynamicSpillThresholdPercent);
 
   if (shaderType == ShaderType::COMPUTE_SHADER) {
     switch (simdmode) {
@@ -3494,6 +3490,11 @@ unsigned int CEncoder::GetSpillThreshold(SIMDMode simdmode) {
     default:
       break;
     }
+    if (m_program->m_Platform->isCoreChildOf(IGFX_XE3_CORE) && IGC_IS_FLAG_ENABLED(VISADynamicSpillAllowed)) {
+      if (dynspill > value)
+        value = dynspill;
+    }
+
     return value;
   }
 
@@ -3525,6 +3526,11 @@ unsigned int CEncoder::GetSpillThreshold(SIMDMode simdmode) {
     break;
   default:
     break;
+  }
+
+  if (m_program->m_Platform->isCoreChildOf(IGFX_XE3_CORE) && IGC_IS_FLAG_ENABLED(VISADynamicSpillAllowed)) {
+    if (dynspill > value)
+      value = dynspill;
   }
 
   if (AILvalue)
@@ -3602,6 +3608,61 @@ void CEncoder::SetAbortOnSpillThreshold(bool canAbortOnSpill, bool AllowSpill) {
   }
 }
 
+// Fraction of instructions that are ALU ops reading at least two register
+// operands (add/mul/and/or/xor/mad/dpas/cmp/select/...) - the ops that can incur
+// GRF bank conflicts.
+static float getBankConflictALUDensity(const llvm::Function *F) {
+  if (!F)
+    return 0.0f;
+  unsigned Total = 0, Candidates = 0;
+  for (const llvm::BasicBlock &BB : *F) {
+    for (const llvm::Instruction &I : BB) {
+      if (llvm::isa<llvm::DbgInfoIntrinsic>(&I))
+        continue;
+      ++Total;
+      bool IsALU =
+          llvm::isa<llvm::BinaryOperator>(&I) || llvm::isa<llvm::CmpInst>(&I) || llvm::isa<llvm::SelectInst>(&I);
+      if (const auto *II = llvm::dyn_cast<llvm::IntrinsicInst>(&I)) {
+        auto Id = II->getIntrinsicID();
+        IsALU |= (Id == llvm::Intrinsic::fma || Id == llvm::Intrinsic::fmuladd);
+      }
+      IsALU |= isDPAS(&I);
+      if (!IsALU)
+        continue;
+      unsigned RegOperands = 0;
+      for (unsigned i = 0, e = I.getNumOperands(); i < e; ++i)
+        if (!llvm::isa<llvm::Constant>(I.getOperand(i)))
+          ++RegOperands;
+      if (RegOperands >= 2)
+        ++Candidates;
+    }
+  }
+  return Total ? (float)Candidates / (float)Total : 0.0f;
+}
+
+static bool hasIEEEArithmeticMacro(const llvm::Module &M) {
+  for (const llvm::Function &F : M) {
+    for (const llvm::BasicBlock &BB : F) {
+      for (const llvm::Instruction &I : BB) {
+        const auto *GII = llvm::dyn_cast<llvm::GenIntrinsicInst>(&I);
+        if (!GII)
+          continue;
+
+        switch (GII->getIntrinsicID()) {
+        case llvm::GenISAIntrinsic::GenISA_IEEE_Divide:
+        case llvm::GenISAIntrinsic::GenISA_IEEE_Divide_rm:
+        case llvm::GenISAIntrinsic::GenISA_IEEE_Sqrt:
+        case llvm::GenISAIntrinsic::GenISA_IEEE_Sqrt_rm:
+          return true;
+        default:
+          break;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 void CEncoder::InitVISABuilderOptions(TARGET_PLATFORM VISAPlatform, bool canAbortOnSpill, bool hasStackCall,
                                       bool enableVISA_IR) {
   CodeGenContext *context = m_program->GetContext();
@@ -3658,7 +3719,8 @@ void CEncoder::InitVISABuilderOptions(TARGET_PLATFORM VISAPlatform, bool canAbor
 
   if (IGC_IS_FLAG_ENABLED(ShaderDataBaseStats)) {
     SaveOption(vISA_ShaderDataBaseStats, true);
-    if (auto *filePath = IGC_GET_REGKEYSTRING(ShaderDataBaseStatsFilePath)) {
+    auto *filePath = IGC_GET_REGKEYSTRING(ShaderDataBaseStatsFilePath);
+    if (filePath[0] != '\0') {
       SaveOption(vISA_ShaderDataBaseStatsFilePath, filePath);
     }
   }
@@ -3724,8 +3786,12 @@ void CEncoder::InitVISABuilderOptions(TARGET_PLATFORM VISAPlatform, bool canAbor
       (context->getModuleMetaData()->compOpt.FloatDenormMode64 == FLOAT_DENORM_FLUSH_TO_ZERO) ||
       (m_program->m_Platform->hasBFTFDenormMode() &&
        context->getModuleMetaData()->compOpt.FloatDenormModeBFTF == FLOAT_DENORM_FLUSH_TO_ZERO);
+  bool needsCRSetupForIEEEArithmetic = hasIEEEArithmeticMacro(*context->getModule());
 
-  if (m_program->m_Platform->hasCorrectlyRoundedMacros() && needsDenormRetainForMathInstructions) {
+  // IEEE arithmetic macros require RNE for their intermediate MADM operations.
+  // Let vISA save and configure CR0 even when the shader otherwise retains denorms.
+  if (m_program->m_Platform->hasCorrectlyRoundedMacros() &&
+      (needsCRSetupForIEEEArithmetic || needsDenormRetainForMathInstructions)) {
     SaveOption(vISA_hasRNEandDenorm, false);
   } else {
     SaveOption(vISA_hasRNEandDenorm, true);
@@ -3927,7 +3993,10 @@ void CEncoder::InitVISABuilderOptions(TARGET_PLATFORM VISAPlatform, bool canAbor
   if (IGC_IS_FLAG_SET(VISAGRFBumpUpNumber))
     SaveOption(vISA_GRFBumpUpNumber, IGC_GET_FLAG_VALUE(VISAGRFBumpUpNumber));
 
-  if (m_program->m_Platform->isCoreChildOf(IGFX_XE3_CORE)) {
+  // vISA supports the GRF-selection spill threshold on PVC and newer. Forward
+  // the spill-allowed budget so a small spill keeps the kernel at the lower GRF
+  // (full occupancy) instead of bumping the GRF number (halving occupancy).
+  if (m_program->m_Platform->isCoreChildOf(IGFX_XE_HPC_CORE)) {
     uint Val = IGC_GET_FLAG_VALUE(VISASpillAllowed);
     if (!IGC_IS_FLAG_SET(VISASpillAllowed) && pCtx->getModuleMetaData()->compOpt.VISASpillAllowed) {
       // Use the driver value if reg key is not set
@@ -3941,6 +4010,15 @@ void CEncoder::InitVISABuilderOptions(TARGET_PLATFORM VISAPlatform, bool canAbor
       context->m_spillAllowedFor256GRF = Val;
       SaveOption(vISA_SpillAllowed256GRF, Val);
     }
+  }
+
+  if (m_program->m_Platform->isCoreChildOf(IGFX_XE3_CORE)) {
+    if (IGC_IS_FLAG_ENABLED(VISADynamicSpillAllowed)) {
+      SaveOption(vISA_DynamicSpillThreshold, true);
+      SaveOption(vISA_DynamicSpillThresholdPercent, (uint32_t)IGC_GET_FLAG_VALUE(VISADynamicSpillThresholdPercent));
+      SaveOption(vISA_DynamicSpillSamplerWeight, (uint32_t)IGC_GET_FLAG_VALUE(VISADynamicSpillSamplerWeight));
+    }
+
     if (uint Val = IGC_GET_FLAG_VALUE(ForceGRFModeUp)) {
       SaveOption(vISA_ForceGRFModeUp, Val);
     }
@@ -4135,18 +4213,19 @@ void CEncoder::InitVISABuilderOptions(TARGET_PLATFORM VISAPlatform, bool canAbor
     SaveOption(vISA_Compaction, false);
   }
 
-  if (auto *regex = IGC_GET_REGKEYSTRING(ShaderDumpRegexFilter)) {
+  auto *regex = IGC_GET_REGKEYSTRING(ShaderDumpRegexFilter);
+  if (regex[0] != '\0') {
     SaveOption(vISA_ShaderDumpRegexFilter, regex);
   }
 
   auto *forceSpillVaraibles = IGC_GET_REGKEYSTRING(ForceSpillVariables);
-  std::string fSVStr(forceSpillVaraibles);
-  if (!fSVStr.empty()) {
+  if (forceSpillVaraibles[0] != '\0') {
     SaveOption(vISA_ForceSpillVariables, forceSpillVaraibles);
     SaveOption(vISA_LocalRA, false);
   }
 
-  if (auto *str = IGC_GET_REGKEYSTRING(ForceAssignRhysicalReg)) {
+  auto *str = IGC_GET_REGKEYSTRING(ForceAssignRhysicalReg);
+  if (str[0] != '\0') {
     SaveOption(vISA_ForceAssignRhysicalReg, str);
   }
 
@@ -4169,7 +4248,7 @@ void CEncoder::InitVISABuilderOptions(TARGET_PLATFORM VISAPlatform, bool canAbor
   }
 
   uint32_t NumGRFSetting =
-          context->getNumGRFPerThread(/*returnDefault*/ false);
+          context->getNumGRFPerThread(/*returnDefault*/ false, m_program->entry);
   if (IGC_GET_FLAG_VALUE(ReservedRegisterNum) != 0) {
     IGC_ASSERT_MESSAGE(NumGRFSetting == 0, "ReservedRegisterNum and TotalGRFNum registry keys "
                                            "cannot be used at the same time");
@@ -4182,8 +4261,10 @@ void CEncoder::InitVISABuilderOptions(TARGET_PLATFORM VISAPlatform, bool canAbor
     SaveOption(vISA_ALTMode, true);
   }
 
-  if (IGC_GET_FLAG_VALUE(EnableEmitMoreMoviCases))
-  {
+  // Set the vISA option only when EmitPass enabled movi promotion for this
+  // shader (m_emitMoreMoviCases, decided in EmitPass::runOnFunction before the
+  // encoder is initialized).
+  if (m_program->GetEmitMoreMoviCases()) {
     SaveOption(vISA_emitMoreMoviCases, true);
   }
 
@@ -4199,7 +4280,17 @@ void CEncoder::InitVISABuilderOptions(TARGET_PLATFORM VISAPlatform, bool canAbor
   if (context->type == ShaderType::OPENCL_SHADER) {
     auto ClContext = static_cast<OpenCLProgramContext *>(context);
     if (m_program->m_Platform->supportsStaticRegSharing()) {
-      if (m_program->IsRegularGRFRequested()) {
+
+      const int32_t requestedNumGRF = ClContext->getRequestedNumGRF(m_program->entry);
+
+      if (requestedNumGRF > 0) {
+
+        // Explicit per-kernel register budget from SPV_INTEL_maximum_registers.
+        // It has already been applied through NumGRFSetting/vISA_TotalGRFNum
+        // above
+      } else if (requestedNumGRF == 0) {
+        SaveOption(vISA_AutoGRFSelection, true);
+      } else if (m_program->IsRegularGRFRequested()) {
        // Number of threads per EU is set per kernel function (by compiler
        // option)
         SaveOption(vISA_HWThreadNumberPerEU, unsigned(8));
@@ -4221,7 +4312,7 @@ void CEncoder::InitVISABuilderOptions(TARGET_PLATFORM VISAPlatform, bool canAbor
       } else if (ClContext->getNumThreadsPerEU() > 0) {
         // Number of threads per EU is set per module (by compiler option)
         SaveOption(vISA_HWThreadNumberPerEU, unsigned(ClContext->getNumThreadsPerEU()));
-      } else if (ClContext->isAutoGRFSelectionEnabled()) {
+      } else if (ClContext->isAutoGRFSelectionEnabled(m_program->GetParent()->getLLVMFunction())) {
         // "Auto" mode per module (by compiler option) - use compiler heuristics
         // to determine number of threads per EU
         SaveOption(vISA_AutoGRFSelection, true);
@@ -4350,24 +4441,43 @@ void CEncoder::InitVISABuilderOptions(TARGET_PLATFORM VISAPlatform, bool canAbor
 
   const auto *modMD = context->getModuleMetaData();
   auto funcMDIter = modMD->FuncMD.find(m_program->entry);
-  uint32_t MaxRegPressure = (funcMDIter != modMD->FuncMD.end()) ? funcMDIter->second.maxRegPressure : 0;
-  uint32_t RegPressureThreshold = (uint32_t)(context->getNumGRFPerThread(true) * 0.6);
+
+  // #TODO: this is a failsafe, we must propagate actual tried SIMD value
+  // from EmitVISAPass through dispatch size that is known
+  // the heuristic will likely need an update as well
+  unsigned int SIMD = IGC::getSIMDSize(modMD, m_program->entry);
+  bool MDPresent = funcMDIter != modMD->FuncMD.end();
+  unsigned int bestGuessSimd = MDPresent ? funcMDIter->second.bestGuessSimd : 0;
+  SIMD = SIMD ? SIMD : bestGuessSimd;
+  unsigned int RegPressure =
+      (MDPresent) ? (funcMDIter->second.maxRegUniformPressure + funcMDIter->second.maxRegNonUniformPressure * SIMD) : 0;
+
+  unsigned RegSize = context->platform.getGRFSize();
+  unsigned MaxRegPressure = llvm::divideCeil(RegPressure, RegSize);
+
+  uint32_t RegPressureThreshold = (uint32_t)(context->getNumGRFPerThread(true, m_program->entry) * 0.6);
 
   if (context->type == ShaderType::OPENCL_SHADER &&
       m_program->m_Platform->getPlatformInfo().eProductFamily != IGFX_DG2 &&
-      m_program->m_Platform->getPlatformInfo().eProductFamily != IGFX_CRI &&
       (m_program->m_Platform->limitedBCR() || (MaxRegPressure > 0 && MaxRegPressure < RegPressureThreshold))) {
     SaveOption(vISA_enableBCR, true);
-    if (m_program->GetParent()->getLLVMFunction()->size() == 1 &&
+    // Force BCR only when there are enough bank-conflict-prone ALU ops, else it
+    // just perturbs the schedule. Decided here (pre-emission) because the
+    // GRF-mode bump is baked when the G4 kernel is built during emission.
+    bool ForceBCRWorthwhile = getBankConflictALUDensity(m_program->GetParent()->getLLVMFunction()) * 100.0f >=
+                              IGC_GET_FLAG_VALUE(BCRAluDensityThreshold);
+    bool BumpGRFForForceBCR =
+        context->supportsVRT() && m_program->m_Platform->getPlatformInfo().eProductFamily != IGFX_NVL;
+    if (ForceBCRWorthwhile && m_program->GetParent()->getLLVMFunction()->size() == 1 &&
         m_program->m_Platform->getMinDispatchMode() != SIMDMode::SIMD8) {
       SaveOption(vISA_forceBCR, true);
-      if (context->supportsVRT() && m_program->m_Platform->GetPlatformFamily() == IGFX_XE3_CORE)
+      if (BumpGRFForForceBCR)
         SaveOption(vISA_bumpGRFForForceBCR, true);
     }
     // For OCL shader with very low register pressure, it is safe to enable vISA_bumpGRFForForceBCR on platform with VRT
     // support.
-    if (MaxRegPressure > 0 && MaxRegPressure < 32 && context->supportsVRT() &&
-        m_program->m_Platform->GetPlatformFamily() == IGFX_XE3_CORE) {
+    if (ForceBCRWorthwhile && MaxRegPressure > 0 && MaxRegPressure < IGC_GET_FLAG_VALUE(BCRBumpGRFMaxRegPressure) &&
+        BumpGRFForForceBCR) {
       SaveOption(vISA_forceBCR, true);
       SaveOption(vISA_bumpGRFForForceBCR, true);
       // For shader with very low register pressure, we want to restrict the RP
@@ -4796,9 +4906,9 @@ void CEncoder::InitVISABuilderOptions(TARGET_PLATFORM VISAPlatform, bool canAbor
   }
   if (m_program->m_Platform->isCoreChildOf(IGFX_XE3P_CORE)) {
     auto ShaderTypeBit = (1 << static_cast<unsigned int>(context->type));
-    if ((IGC_GET_FLAG_VALUE(DisableSamplerBackingByLSC) & ShaderTypeBit) ||
-        (context->getModuleMetaData()->compOpt.DisableSamplerBackingByLSC & ShaderTypeBit)) {
-      SaveOption(vISA_enableSamplerLSCCaching, false);
+    if ((IGC_GET_FLAG_VALUE(EnableSamplerBackingByLSC) & ShaderTypeBit) ||
+        (context->getModuleMetaData()->compOpt.EnableSamplerBackingByLSC & ShaderTypeBit)) {
+      SaveOption(vISA_enableSamplerLSCCaching, true);
     }
   }
 } // InitVISABuilderOptions
@@ -4841,7 +4951,7 @@ CName CEncoder::CreateVisaLabelName(const llvm::StringRef &L) {
 #else  // IGC_MAP_LLVM_NAMES_TO_VISA
   static const size_t MAX_LLVM_NAME = 250;
 
-  auto sanitizeChar = [](char c) { return isalnum(c) || c == '_' ? c : '_'; };
+  auto sanitizeChar = [](unsigned char c) -> char { return isalnum(c) || c == '_' ? c : '_'; };
 
   // The vISA backend constrains this to around 256 characters.
   // (1) Function names can be extremely long (currFunctionName).
@@ -4966,6 +5076,15 @@ void CEncoder::InitEncoder(bool canAbortOnSpill, bool hasStackCall, bool hasInli
     if (context->m_DriverInfo.allowDefault256GrfSize()) {
       userVRTGRFCeiling = 256;
     }
+  }
+
+  // On OCL recompilation, raise the ceiling to 512 for an eligible kernel from its final SIMD
+  // width and DPAS state; VRT still picks the count.
+  if (context->type == ShaderType::OPENCL_SHADER) {
+    auto *clCtx = static_cast<OpenCLProgramContext *>(context);
+    if (clCtx->kernelQualifiesFor512(m_program->m_State.GetHasDPAS(), m_program->m_State.m_dispatchSize,
+                                     m_program->entry))
+      userVRTGRFCeiling = 512;
   }
 
   // For UMD AIL config specific, such as GRF 512, override the default
@@ -5820,6 +5939,7 @@ void CEncoder::Compile(bool hasSymbolTable, GenXFunctionGroupAnalysis *&pFGA) {
   if (jitInfo->stats.numGRFSpillFillWeighted) {
     context->m_retryManager->SetSpillSize(jitInfo->stats.numGRFSpillFillWeighted);
     m_program->m_spillSize = jitInfo->stats.numGRFSpillFillWeighted;
+    m_program->m_spillThreshold = jitInfo->stats.dynamicSpillThreshold / getGRFSize();
     m_program->m_spillCost = float(jitInfo->stats.numGRFSpillFillWeighted) / jitInfo->stats.numAsmCountUnweighted;
 
     context->m_retryManager->numInstructions = jitInfo->stats.numAsmCountUnweighted;
@@ -6281,12 +6401,14 @@ void CEncoder::SetKernelRetryState(CodeGenContext *context, vISA::FINALIZER_INFO
       ss << "  numGRFSpill = " << jitInfo->stats.numGRFSpillFillWeighted << std::endl;
       ss << "  TotalInsts = " << jitInfo->stats.numAsmCountUnweighted << std::endl;
     }
+    float thresholdFn = float(IGC_GET_FLAG_VALUE(RetryStackCallSpillCostThreshold)) / 100.0f;
     for (auto &func : stackFuncMap) {
       vISA::FINALIZER_INFO *f_jitInfo = nullptr;
       func.second->GetJitInfo(f_jitInfo);
-      // float spillCost = float(f_jitInfo->stats.numGRFSpillFillWeighted) /
-      // f_jitInfo->stats.numAsmCountUnweighted;
-      if (f_jitInfo->stats.numGRFSpillFillWeighted > 0) {
+      float spillCost = (f_jitInfo->stats.numAsmCountUnweighted > 0)
+                            ? float(f_jitInfo->stats.numGRFSpillFillWeighted) / f_jitInfo->stats.numAsmCountUnweighted
+                            : 0.0f;
+      if (spillCost > thresholdFn) {
         // Check each stackcall function
         noRetryForStack = false;
         string FName = StripCloneName(func.first->getName().str());
@@ -7001,6 +7123,7 @@ void CEncoder::bdpas(CVariable *Dst, CVariable *Acc, CVariable *B, PrecisionType
     IGC_ASSERT(DataSize <= OriginalStride);
     IGC_ASSERT(OriginalStride * 2 <= Src->GetNumberElement());
     VISA_Exec_Size moveExecSize = visaExecSize(lanesToSIMDMode((DataSize)));
+    const VISA_EMask_Ctrl moveEMask = ConvertMaskToVisaType(m_encoderState.m_mask, true /*noMask*/);
 
     const uint16_t stride = 32;
     Dst = this->m_program->GetNewVariable(DataSize + stride, Src->GetType(), Src->GetAlign(), Src->IsUniform(),
@@ -7016,14 +7139,14 @@ void CEncoder::bdpas(CVariable *Dst, CVariable *Acc, CVariable *B, PrecisionType
     V(vKernel->CreateVISADstOperand(dstOpnd, dstVisa, 1, 0, 0));
     V(vKernel->CreateVISASrcOperand(srcOpnd, srcVisa, MODIFIER_NONE, 1, 1, 0, 0, 0));
 
-    V(vKernel->AppendVISADataMovementInst(ISA_MOV, nullptr, false, GetAluEMask(Src), moveExecSize, dstOpnd, srcOpnd));
+    V(vKernel->AppendVISADataMovementInst(ISA_MOV, nullptr, false, moveEMask, moveExecSize, dstOpnd, srcOpnd));
 
     // second part (after stride)
     V(vKernel->CreateVISADstOperand(dstOpnd, dstVisa, 1, 0, stride));
     V(vKernel->CreateVISASrcOperand(srcOpnd, srcVisa, MODIFIER_NONE, 1, 1, 0, OriginalStride / getGRFSize(),
                                     OriginalStride % getGRFSize()));
 
-    V(vKernel->AppendVISADataMovementInst(ISA_MOV, nullptr, false, GetAluEMask(Src), moveExecSize, dstOpnd, srcOpnd));
+    V(vKernel->AppendVISADataMovementInst(ISA_MOV, nullptr, false, moveEMask, moveExecSize, dstOpnd, srcOpnd));
   };
 
   if (aluExecSize == EXEC_SIZE_32) {
@@ -7291,7 +7414,6 @@ void CEncoder::srnd(CVariable *D, CVariable *S0, CVariable *R) {
 
 void CEncoder::emitDnscl(CVariable *dst, CVariable *src0, CVariable *src1, CVariable *bias, DNSCL_CONVERT_TYPE convType,
                          DNSCL_MODE packMode, DNSCL_RND_MODE roundMode) {
-  IGC_ASSERT((unsigned)convType <= (unsigned)DNSCL_CONVERT_TYPE::HFTOINT4);
   IGC_ASSERT((unsigned)packMode <= (unsigned)DNSCL_MODE::MODE3);
   IGC_ASSERT((unsigned)roundMode <= (unsigned)DNSCL_RND_MODE::RNE);
 

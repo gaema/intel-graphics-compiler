@@ -31,6 +31,30 @@ else()
 endif()
 
 
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/igc_find_igc_clang.cmake)
+function(_igc_get_ocloc_binary_name binary_dir output_name)
+  set(_igc_ocloc_names ocloc)
+
+  foreach(_igc_ocloc_name IN LISTS _igc_ocloc_names)
+    if(EXISTS "${binary_dir}/${_igc_ocloc_name}${CMAKE_EXECUTABLE_SUFFIX}")
+      set(${output_name} "${_igc_ocloc_name}${CMAKE_EXECUTABLE_SUFFIX}" PARENT_SCOPE)
+      return()
+    endif()
+  endforeach()
+
+  file(GLOB _igc_ocloc_versioned LIST_DIRECTORIES false "${binary_dir}/ocloc-[0-9][0-9].[0-9][0-9].[0-9]*${CMAKE_EXECUTABLE_SUFFIX}")
+  if(_igc_ocloc_versioned)
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.18")
+      list(SORT _igc_ocloc_versioned COMPARE NATURAL ORDER DESCENDING)
+    else()
+      list(SORT _igc_ocloc_versioned ORDER DESCENDING)
+    endif()
+    list(GET _igc_ocloc_versioned 0 _igc_ocloc_path)
+    get_filename_component(_igc_ocloc_name "${_igc_ocloc_path}" NAME)
+    set(${output_name} "${_igc_ocloc_name}" PARENT_SCOPE)
+  endif()
+endfunction()
+
   # Variables set here are used by `configure_file` call and by
   # `add_lit_testsuite` later on.
   set(IGC_LIBRARY_DIR "$<TARGET_FILE_DIR:${IGC_BUILD__PROJ__igc_dll}>")
@@ -61,6 +85,45 @@ endif()
     "${COMMON_CLANG}"
     )
 
+# Path overrides
+set(IGC_OPTION__OCLOC_TEST_BIN_DIR "" CACHE PATH
+ "Directory containing the ocloc binary used by the offline compilation tests")
+set(IGC_OPTION__OCLOC_TEST_OCLOC_LIB_DIR "" CACHE PATH
+ "Directory containing the ocloc_lib library used by the offline compilation tests")
+set(IGC_OPTION__OCLOC_TEST_IGC_LIB_DIR "" CACHE PATH
+ "Directory containing the igc library used by the offline compilation tests")
+set(IGC_OPTION__OCLOC_TEST_CCLANG_LIB_DIR "" CACHE PATH
+ "Directory containing the opencl-clang library used by the offline compilation tests")
+
+if(IGC_OPTION__OCLOC_TEST_BIN_DIR)
+  file(TO_CMAKE_PATH "${IGC_OPTION__OCLOC_TEST_BIN_DIR}" IGC_OCLOC_BINARY_DIR)
+  _igc_get_ocloc_binary_name("${IGC_OCLOC_BINARY_DIR}" _igc_ocloc_override_name)
+  if(_igc_ocloc_override_name)
+    set(IGC_OCLOC_BINARY_NAME "${_igc_ocloc_override_name}")
+    list(REMOVE_ITEM IGC_OCLOC_TEST_DEPENDS "${IGC_BUILD__PROJ__ocloc}")
+  endif()
+endif()
+if(IGC_OPTION__OCLOC_TEST_OCLOC_LIB_DIR)
+  file(TO_CMAKE_PATH "${IGC_OPTION__OCLOC_TEST_OCLOC_LIB_DIR}" IGC_OCLOC_LIBRARY_DIR)
+  list(REMOVE_ITEM IGC_OCLOC_TEST_DEPENDS "${IGC_BUILD__PROJ__ocloc_lib}")
+endif()
+if(IGC_OPTION__OCLOC_TEST_IGC_LIB_DIR)
+  file(TO_CMAKE_PATH "${IGC_OPTION__OCLOC_TEST_IGC_LIB_DIR}" IGC_LIBRARY_DIR)
+  list(REMOVE_ITEM IGC_OCLOC_TEST_DEPENDS "${IGC_BUILD__PROJ__igc_dll}" "${IGC_BUILD__PROJ__fcl_dll}")
+endif()
+if(IGC_OPTION__OCLOC_TEST_CCLANG_LIB_DIR)
+  file(TO_CMAKE_PATH "${IGC_OPTION__OCLOC_TEST_CCLANG_LIB_DIR}" OPENCL_CLANG_LIB_DIR)
+  list(REMOVE_ITEM IGC_OCLOC_TEST_DEPENDS "${COMMON_CLANG}")
+endif()
+
+# Expose the optional igc-clang prebuild directory to the lit loader search path
+# so the IGC_LibClangOverride tests can load it by name.
+if(TARGET igc-clang-lib)
+  set(IGC_CLANG_LIB_DIR "${IGC_CLANG_PREBUILD_DIR}")
+else()
+  set(IGC_CLANG_LIB_DIR "")
+endif()
+
 igc_find_external_lit()
 
 igc_configure_lit_site_cfg(
@@ -70,7 +133,7 @@ igc_configure_lit_site_cfg(
   ${IGC_OCLOC_TEST_SOURCE_DIR}/lit.cfg.py
   )
 
-file(GLOB_RECURSE _tests "${IGC_OCLOC_TEST_SOURCE_DIR}/*.cl" "${IGC_OCLOC_TEST_SOURCE_DIR}/*.ll")
+file(GLOB_RECURSE _tests "${IGC_OCLOC_TEST_SOURCE_DIR}/*.cl" "${IGC_OCLOC_TEST_SOURCE_DIR}/*.cpp" "${IGC_OCLOC_TEST_SOURCE_DIR}/*.ll" "${IGC_OCLOC_TEST_SOURCE_DIR}/*.spv-test")
 
 if(${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.17")
   igc_add_lit_target(check-ocloc "${IGC_OCLOC_TEST_BINARY_DIR}" "Running the offline compilation tests"
@@ -84,3 +147,27 @@ else()
     )
 endif()
 
+
+# Re-run the check-ocloc tests with FCL forced to load the igc-clang
+# prebuild via IGC_LibClangOverride.
+if(TARGET igc-clang-lib AND ${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.17")
+  igc_add_lit_target(check-ocloc-igc-clang "${IGC_OCLOC_TEST_BINARY_DIR}"
+    "Running the offline compilation tests with IGC_LibClangOverride=igc-clang"
+    EXTRA --param igc_libclang_override=igc-clang
+          --param test_output_subdir=test_output_igc_clang
+    DEPENDS ${IGC_OCLOC_TEST_DEPENDS} ${_tests}
+    SOURCES ${_tests} ${IGC_OCLOC_TEST_SOURCE_DIR}/lit.cfg.py
+    )
+
+  set_target_properties(check-ocloc-igc-clang
+    PROPERTIES
+      EXCLUDE_FROM_DEFAULT_BUILD OFF
+      EXCLUDE_FROM_ALL OFF
+      EXCLUDE_FROM_DEFAULT_BUILD_RELEASE TRUE
+      FOLDER "Tests/LIT Tests"
+    )
+
+  if(WIN32)
+    add_dependencies(check-ocloc-igc-clang check-ocloc)
+  endif()
+endif()

@@ -69,21 +69,6 @@ static bool is2dBlockPrefetch(Instruction *I) {
   return false;
 }
 
-static bool isDPAS(Value *V) {
-  GenIntrinsicInst *Intr = dyn_cast<GenIntrinsicInst>(V);
-  if (!Intr)
-    return false;
-  switch (Intr->getIntrinsicID()) {
-  case GenISAIntrinsic::GenISA_dpas:
-  case GenISAIntrinsic::GenISA_sub_group_dpas:
-  case GenISAIntrinsic::GenISA_sub_group_bdpas:
-    return true;
-  default:
-    break;
-  }
-  return false;
-};
-
 // Get Value name as string for debug purposes
 // Can have side effect of assigning a name to the value if it has no name
 // Under a debug flag CodeSchedulingRenameAll
@@ -230,7 +215,7 @@ public:
       : BB(BB), RPE(RPE), FRPE(FRPE), VSA(VSA), RCA(RCA), WI(WI), CTX(CTX), C(Config), LogStream(LogStream), FGA(FGA) {
     F = BB->getParent();
     SIMD = C->get(SchedulingConfig::Option::ForceSIMDSize) > 0 ? C->get(SchedulingConfig::Option::ForceSIMDSize)
-                                                               : numLanes(RPE->bestGuessSIMDSize(F));
+                                                               : numLanes(IGC::bestGuessSIMDSize(CTX, F));
     PrintDump("SIMD: " << SIMD << "\n");
     DL = &(F->getParent()->getDataLayout());
 
@@ -251,7 +236,7 @@ public:
 
     F = BB->getParent();
     SIMD = C->get(SchedulingConfig::Option::ForceSIMDSize) > 0 ? C->get(SchedulingConfig::Option::ForceSIMDSize)
-                                                               : numLanes(RPE->bestGuessSIMDSize(F, FGA));
+                                                               : numLanes(IGC::bestGuessSIMDSize(CTX, F, FGA));
     DL = &(F->getParent()->getDataLayout());
 
     // copy the state
@@ -285,9 +270,9 @@ public:
   ~RegisterPressureTracker() = default;
 
   int getNumGRF() {
-    int NGRF = static_cast<int>(CTX->getNumGRFPerThread(false));
+    int NGRF = static_cast<int>(CTX->getNumGRFPerThread(false, F));
     if (NGRF == 0) { // GRF info is not set, using the default value
-      if (CTX->isAutoGRFSelectionEnabled()) {
+      if (CTX->isAutoGRFSelectionEnabled(F)) {
         NGRF = C->get(SchedulingConfig::Option::DefaultNumGRFAuto);
       } else {
         NGRF = C->get(SchedulingConfig::Option::DefaultNumGRF);
@@ -2077,7 +2062,6 @@ private:
         }
       }
 
-
       return Checkpoint;
     }
 
@@ -3287,10 +3271,10 @@ bool CodeScheduling::runOnFunction(Function &F) {
   // CodeScheduling preserves CFG and only reorders within BBs, so the cached
   // In/Out sets in RPE remain valid; we just need to re-walk per-BB pressure.
   if (Changed) {
-    unsigned int SIMD = numLanes(RPE->bestGuessSIMDSize(&F, FGA));
-    unsigned int MaxPressure = RPE->getMaxRegCountForFunction(F, SIMD, WI);
-    unsigned int ExternalPressure = FRPE->getExternalPressureForFunction(&F);
-    RPE->publishRegPressureMetadata(F, MaxPressure + ExternalPressure);
+    unsigned int SIMD = numLanes(IGC::bestGuessSIMDSize(CTX, &F, FGA));
+    PressurePair MaxPressurePair = RPE->getMaxPressurePairForFunction(F, SIMD, WI);
+    PressurePair ExternalPressure = FRPE->getExternalPressurePairForFunction(&F);
+    RPE->publishNormalizedPressurePair(F, MaxPressurePair + ExternalPressure, SIMD);
   }
 
   return Changed;

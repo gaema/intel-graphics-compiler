@@ -33,6 +33,7 @@ SPDX-License-Identifier: MIT
 #include <charconv>
 #include <chrono>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <list>
 #include <mutex>
@@ -543,6 +544,7 @@ static void setRegkeyFromOption(const std::string &optionValue, const char *data
 }
 
 static const std::string GetOptionFilePath() {
+
 #if defined(_WIN64) || defined(_WIN32)
   char path[256] = "c:\\Intel\\IGC\\debugFlags\\";
   std::string testFilename = std::string(path) + "testfile";
@@ -575,9 +577,10 @@ static std::optional<std::pair<HashRange::Type, llvm::StringRef>> parseHashType(
     return {};
 
   auto Ty = StringSwitch<std::optional<HashRange::Type>>(line.substr(0, Loc))
-                .Case("hash", HashRange::Type::Asm)
                 .Case("asmhash", HashRange::Type::Asm)
+                .Case("hash", HashRange::Type::Asm)
                 .Case("psohash", HashRange::Type::Pso)
+                .Case("pipelinehash", HashRange::Type::Pipeline)
                 .Default({});
   if (!Ty)
     return {};
@@ -602,9 +605,10 @@ static std::optional<std::pair<bool, llvm::StringRef>> detectEntryPoints(llvm::S
 
 // parses this syntax:
 // Each hash may be optionally prefixed with "0x" (e.g., 0xaaaaaaaaaaaaaaaa)
-// hash:abcdabcdabcdabcd-ffffffffffffffff,aaaaaaaaaaaaaaaa
 // asmhash:abcdabcdabcdabcd-ffffffffffffffff,aaaaaaaaaaaaaaaa
 // psohash:abcdabcdabcdabcd-ffffffffffffffff,aaaaaaaaaaaaaaaa
+// pipelinehash:abcdabcdabcdabcd-ffffffffffffffff,aaaaaaaaaaaaaaaa
+// hash:  (deprecated alias for asmhash:)
 static void ParseHashRange(llvm::StringRef line, std::vector<HashRange> &ranges) {
   using namespace llvm;
   auto Result = parseHashType(line);
@@ -657,8 +661,10 @@ static void ParseEntryPoint(llvm::StringRef line, std::vector<EntryPoint> &entry
 
 static void setIGCKeyOnHash(std::vector<HashRange> &hashes, const unsigned value, IGCFlag *var) {
   // hashes can be empty if the var is not set via Options.txt
-  for (size_t i = 0; i < hashes.size(); i++)
+  for (size_t i = 0; i < hashes.size(); i++) {
     var->hashes.push_back(hashes[i]);
+    var->hashes.back().implied = true;
+  }
   var->isSet = true;
   var->m_Value = value;
 }
@@ -747,6 +753,12 @@ static void setImpliedIGCKeys() {
   IGC_SET_IMPLIED_REGKEY(ForceOCLSIMDWidth, 16, EnableOCLSIMD16, true);
   IGC_SET_IMPLIED_REGKEY(ForceOCLSIMDWidth, 8, EnableOCLSIMD32, false);
   IGC_SET_IMPLIED_REGKEY(ForceOCLSIMDWidth, 8, EnableOCLSIMD16, false);
+
+  // Legacy alias for SupportEmitMoreMoviCases (IGC::TriboolFlag::Enabled).
+  // EnableEmitMoreMoviCases used to be the only lever for movi promotion on every frontend.
+  // After the more-movi refactor, it is no longer working on some API and AIL ability.
+  // Map it onto the new key
+  IGC_SET_IMPLIED_REGKEY(EnableEmitMoreMoviCases, 1, SupportEmitMoreMoviCases, 1);
 }
 
 void setImpliedRegkey(IGCFlag &name, const bool set, IGCFlag &subname, const unsigned subvalue) {
@@ -762,6 +774,7 @@ static void declareIGCKey(const std::string &line, const char *dataType, const c
   debugString value = {0};
   setRegkeyFromOption(line, dataType, regkeyName, &value, isSet);
   if (isSet && !hashes.empty()) {
+    const std::ios_base::fmtflags coutFlags = std::cout.flags();
     std::cout << std::endl << "** hashes ";
     for (size_t i = 0; i < hashes.size(); i++) {
       memcpy_s(hashes[i].m_string, sizeof(value), value, sizeof(value));
@@ -771,6 +784,7 @@ static void declareIGCKey(const std::string &line, const char *dataType, const c
       else
         std::cout << std::hex << std::showbase << hashes[i].start << "-" << hashes[i].end << ", ";
     }
+    std::cout.flags(coutFlags);
     std::cout << std::endl;
 
     std::cout << "** regkey " << line << std::endl;
@@ -890,12 +904,18 @@ bool CheckHashRange(IGCFlag &varname) {
   for (auto &it : varname.hashes) {
     unsigned long long CurrHash = it.getHashVal(g_CurrentShaderHash);
     if (CurrHash >= it.start && CurrHash <= it.end) {
-      varname.m_Value = it.m_Value;
-      constexpr uint32_t Len = 100;
-      char msg[Len];
-      int size = snprintf(msg, Len, "Shader %#0llx: %s=%d", CurrHash, varname.name, it.m_Value);
-      if (size >= 0 && size < Len) {
-        appendToOptionsLogFile(msg);
+      memcpy_s(varname.m_string, sizeof(debugString), it.m_string, sizeof(debugString));
+      if (!it.implied) {
+        std::ostringstream oss;
+        oss << "[apply] pHash=0x" << std::hex << std::setfill('0') << std::setw(16)
+            << g_CurrentShaderHash.getPipelineHash() << ", aHash=0x" << std::setw(16)
+            << g_CurrentShaderHash.getAsmHash() << std::dec << ": " << varname.name << "=";
+        if (varname.IsString()) {
+          oss << it.m_string;
+        } else {
+          oss << it.m_Value;
+        }
+        appendToOptionsLogFile(oss.str());
       }
 
       return true;
@@ -928,7 +948,7 @@ bool CheckEntryPoint(IGCFlag &varname) {
       for (std::string &CurrEntryPoint : g_CurrentEntryPointNames)
       {
         if (CurrEntryPoint == it.entry_point_name) {
-          varname.m_Value = it.m_Value;
+          memcpy_s(varname.m_string, sizeof(debugString), it.m_string, sizeof(debugString));
           return true;
         }
       }
@@ -949,13 +969,27 @@ IGCFlag *FindIGCFlagByName(const char *name) {
   return nullptr;
 }
 
+namespace {
+// Shared by LoadRegistryKeys() and LoadIGCFlagsFromRegistryAndGetString(); both write
+// g_IGCFlagsArray, so they must serialize on this single lock.
+std::mutex g_loadFlagsMutex;
+} // namespace
+
+// Reads registry/env values into g_IGCFlagsArray exactly once per process.
+// Caller must hold g_loadFlagsMutex.
 static void LoadIGCFlagsFromRegistry(const std::string &options = "", bool *RegFlagNameError = nullptr) {
-  for (IGCFlag &igcFlag : g_IGCFlagsArray) {
-    debugString value = {0};
-    bool registryValueFound = ReadIGCRegistry(igcFlag.name, &value, sizeof(value), igcFlag.type);
-    if (registryValueFound) {
-      memcpy_s(igcFlag.m_string, sizeof(value), value, sizeof(value));
-      igcFlag.isSet = true;
+  // Guards LoadIGCFlagsFromRegistry() so the registry/env values are read into
+  // g_IGCFlagsArray at most once per process.
+  static bool registryLoaded = false;
+  if (!registryLoaded) {
+    registryLoaded = true;
+    for (IGCFlag &igcFlag : g_IGCFlagsArray) {
+      debugString value = {0};
+      bool registryValueFound = ReadIGCRegistry(igcFlag.name, &value, sizeof(value), igcFlag.type);
+      if (registryValueFound) {
+        memcpy_s(igcFlag.m_string, sizeof(value), value, sizeof(value));
+        igcFlag.isSet = true;
+      }
     }
   }
 }
@@ -1098,11 +1132,20 @@ static std::string ExtractIGCOptsFromOptions(const std::string &options, std::st
   return result;
 }
 
+// Get all keys that have been set explicitly with a non-default value
+// This is used only to read  and use via IGC-NEO interfaces
+void LoadIGCFlagsFromRegistryAndGetString(std::string &outToken) {
+  std::lock_guard<std::mutex> lock(g_loadFlagsMutex);
+  LoadIGCFlagsFromRegistry();
+  GetKeysSetExplicitly(nullptr, &outToken);
+}
+
 void LoadRegistryKeys(const std::string &options, std::string *optionsParseError) {
   // only load the debug flags once before compiling to avoid any multi-threading issue
-  static std::mutex loadFlags;
+  // g_loadFlagsMutex is shared with LoadIGCFlagsFromRegistryAndGetString() on purpose:
+  // both write g_IGCFlagsArray, so they must serialize on the same lock.
   static volatile bool flagsSet = false;
-  std::lock_guard<std::mutex> lock(loadFlags);
+  std::lock_guard<std::mutex> lock(g_loadFlagsMutex);
 
   if (!flagsSet) {
     flagsSet = true;

@@ -14,6 +14,7 @@ SPDX-License-Identifier: MIT
 #include <llvm/Support/Debug.h>
 #include "common/LLVMWarningsPop.hpp"
 #include "llvmWrapper/IR/DerivedTypes.h"
+#include "llvmWrapper/IR/BasicBlock.h"
 #include <algorithm>
 #include "Probe/Assertion.h"
 
@@ -938,6 +939,13 @@ bool VariableReuseAnalysis::getAllInsEltsIfAvailable(InsertElementInst *FirstIEI
       continue;
     }
     Value *FromVec = AllIEIs[i].FromVec;
+
+    if (GenIntrinsicInst *GII = dyn_cast_or_null<GenIntrinsicInst>(FromVec)) {
+      auto GIIid = GII->getIntrinsicID();
+      if (GIIid == GenISAIntrinsic::GenISA_SubgroupBitcastShuffle)
+        return false;
+    }
+
     if (FromVec) {
       Value *FromVec_nv = m_DeSSA->getNodeValue(FromVec);
       // check if FromVec has been coalesced with IEI already by DeSSA.
@@ -1600,6 +1608,6 @@ bool VariableReuseAnalysis::checkSubAlign(e_alignment &BaseAlign, Value *SubVec,
 bool VariableReuseAnalysis::skipScalarAliaser(BasicBlock *BB, Value *ScalarVal) const {
   Instruction *I = dyn_cast<Instruction>(ScalarVal);
   // Don't count dbg instructions in BB
-  unsigned InstCountInBB = BB->sizeWithoutDebug();
+  unsigned InstCountInBB = IGCLLVM::sizeWithoutDebug(BB);
   return ((InstCountInBB > m_BBSizeThreshold) || !I || I->getParent() != BB);
 }

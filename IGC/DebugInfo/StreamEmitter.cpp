@@ -28,16 +28,18 @@ See LICENSE.TXT for details.
 #include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/MC/MCSection.h"
 #include "llvm/MC/MCStreamer.h"
+#include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/MC/MCSymbol.h"
+#include "llvm/MC/MCTargetOptions.h"
 #include "llvm/MC/MCValue.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/MD5.h"
 #include "common/LLVMWarningsPop.hpp"
 #include "llvmWrapper/ADT/STLExtras.h"
+#include "llvmWrapper/MC/MCAsmInfo.h"
 #include "llvmWrapper/MC/MCStreamer.h"
 #include "llvmWrapper/ADT/Optional.h"
 #include "llvmWrapper/Support/Endian.h"
-#include "llvmWrapper/Support/TargetRegistry.h"
 // clang-format on
 
 #include "StreamEmitter.hpp"
@@ -59,7 +61,12 @@ namespace IGC {
 
 class VISAMCAsmInfo : public MCAsmInfoELF {
 public:
-  VISAMCAsmInfo(unsigned int pointerSize) : MCAsmInfoELF() {
+  VISAMCAsmInfo(unsigned int pointerSize, const MCTargetOptions *Options = nullptr)
+#if LLVM_VERSION_MAJOR >= 23
+      : MCAsmInfoELF(*Options){
+#else
+      : MCAsmInfoELF() {
+#endif
     DwarfUsesRelocationsAcrossSections = true;
     CodePointerSize = pointerSize;
   }
@@ -133,6 +140,8 @@ public:
 #if LLVM_VERSION_MAJOR >= 22
   void applyFixup(const MCFragment &F, const MCFixup &fixup, const MCValue &Target, uint8_t *Data, uint64_t value,
                   bool IsResolved) override {
+    // LLVM 22 moved relocation recording out of the ELF object writer and into the backend's applyFixup.
+    maybeAddReloc(F, fixup, Target, value, IsResolved);
     unsigned size = 1 << getFixupKindLog2Size(fixup.getKind());
 
     IGC_ASSERT_MESSAGE(fixup.getOffset() + size <= F.getSize(), "Invalid fixup offset!");
@@ -223,15 +232,23 @@ StreamEmitter::StreamEmitter(raw_pwrite_stream &outStream, const std::string &da
     : m_targetTriple(targetTriple), m_setCounter(0), StreamOptions(Options) {
   m_pDataLayout = new DataLayout(dataLayout);
   m_pSrcMgr = new SourceMgr();
-  m_pAsmInfo = new VISAMCAsmInfo(GetPointerSize());
   m_pObjFileInfo = new IGCLLVM::MCObjectFileInfo();
 
-  MCRegisterInfo *regInfo = nullptr;
   Triple triple = Triple(GetTargetTriple());
 
+#if LLVM_VERSION_MAJOR >= 23
+  m_pTargetOptions = new MCTargetOptions();
+  m_pRegInfo = new MCRegisterInfo();
+  m_pSubtargetInfo =
+      new MCSubtargetInfo(triple, "", "", "", "", ArrayRef<SubtargetFeatureKV>(), ArrayRef<SubtargetSubTypeKV>(),
+                          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+#endif
+
+  m_pAsmInfo = new VISAMCAsmInfo(GetPointerSize(), m_pTargetOptions);
+
   // Create new MC context
-  m_pContext =
-      IGCLLVM::CreateMCContext(triple, (const llvm::MCAsmInfo *)m_pAsmInfo, regInfo, m_pObjFileInfo, m_pSrcMgr);
+  m_pContext = IGCLLVM::CreateMCContext(triple, (const llvm::MCAsmInfo *)m_pAsmInfo, m_pRegInfo, m_pSubtargetInfo,
+                                        m_pObjFileInfo, m_pSrcMgr);
 
   m_pObjFileInfo->InitMCObjectFileInfo(triple, false, *m_pContext);
 
@@ -256,24 +273,27 @@ StreamEmitter::StreamEmitter(raw_pwrite_stream &outStream, const std::string &da
 #endif
   std::unique_ptr<MCCodeEmitter> pCodeEmitter = IGCLLVM::make_unique<VISAMCCodeEmitter>();
 
-  bool isRelaxAll = false;
-  bool isNoExecStack = false;
 #if LLVM_VERSION_MAJOR >= 22
   m_pMCStreamer =
       createELFStreamer(*m_pContext, std::move(pAsmBackend), std::move(pObjectWriter), std::move(pCodeEmitter));
 #else
+  bool isRelaxAll = false;
   m_pMCStreamer = createELFStreamer(*m_pContext, std::move(pAsmBackend), std::move(pObjectWriter),
                                     std::move(pCodeEmitter), isRelaxAll);
 #endif
 
+  bool isNoExecStack = false;
   IGCLLVM::initSections(m_pMCStreamer, isNoExecStack, m_pContext);
 }
 
 StreamEmitter::~StreamEmitter() {
   delete m_pMCStreamer;
   delete m_pContext;
+  delete m_pRegInfo;
+  delete m_pSubtargetInfo;
   delete m_pSrcMgr;
   delete m_pAsmInfo;
+  delete m_pTargetOptions;
   delete m_pObjFileInfo;
   delete m_pDataLayout;
 }
@@ -320,22 +340,16 @@ void StreamEmitter::SwitchSection(const MCSection *pSection, const MCExpr *pSubs
 }
 
 MCSymbol *StreamEmitter::GetSymbol(const GlobalValue *pGV) const {
-  /*
-  //Original code (as reference)
-  SmallString<60> NameStr;
-  M.getNameWithPrefix(NameStr, pGV, false);
-  return m_pContext->GetOrCreateSymbol(NameStr.str());
-  */
   IGC_ASSERT_MESSAGE(pGV->hasName(), "TODO: fix this case");
-  return m_pContext->getOrCreateSymbol(Twine(m_pAsmInfo->getPrivateGlobalPrefix()) + pGV->getName());
+  return m_pContext->getOrCreateSymbol(Twine(IGCLLVM::getInternalSymbolPrefix(*m_pAsmInfo)) + pGV->getName());
 }
 
 MCSymbol *StreamEmitter::GetTempSymbol(StringRef name, uint64_t id) const {
-  return m_pContext->getOrCreateSymbol(Twine(m_pAsmInfo->getPrivateGlobalPrefix()) + name + Twine(id));
+  return m_pContext->getOrCreateSymbol(Twine(IGCLLVM::getInternalSymbolPrefix(*m_pAsmInfo)) + name + Twine(id));
 }
 
 MCSymbol *StreamEmitter::GetTempSymbol(StringRef name) const {
-  return m_pContext->getOrCreateSymbol(Twine(m_pAsmInfo->getPrivateGlobalPrefix()) + name);
+  return m_pContext->getOrCreateSymbol(Twine(IGCLLVM::getInternalSymbolPrefix(*m_pAsmInfo)) + name);
 }
 
 MCSymbol *StreamEmitter::CreateTempSymbol() const { return m_pContext->createTempSymbol(); }
@@ -395,31 +409,6 @@ void StreamEmitter::EmitLabelDifference(const MCSymbol *pHi, const MCSymbol *pLo
   m_pMCStreamer->emitSymbolValue(pSetLabel, size);
 }
 
-void StreamEmitter::EmitLabelOffsetDifference(const MCSymbol *pHi, uint64_t Offset, const MCSymbol *pLo,
-                                              unsigned size) const {
-  const MCExpr *pHiExpr = MCSymbolRefExpr::create(pHi, *m_pContext);
-  const MCExpr *pLoExpr = MCSymbolRefExpr::create(pLo, *m_pContext);
-  const MCExpr *pOffsetExpr = MCConstantExpr::create(Offset, *m_pContext);
-
-  // Emit pHi+Offset - pLo
-  // Get the pHi+Offset expression.
-  const MCExpr *pPlus = MCBinaryExpr::createAdd(pHiExpr, pOffsetExpr, *m_pContext);
-
-  // Get the pHi+Offset-pLo expression.
-  const MCExpr *pDiff = MCBinaryExpr::createSub(pPlus, pLoExpr, *m_pContext);
-
-  if (!m_pAsmInfo->doesSetDirectiveSuppressReloc()) {
-    m_pMCStreamer->emitValue(pDiff, size);
-    return;
-  }
-  // Otherwise, emit with .set (aka assignment).
-  MCSymbol *pSetLabel = GetTempSymbol("set", m_setCounter++);
-
-  m_pMCStreamer->emitAssignment(pSetLabel, pDiff);
-
-  m_pMCStreamer->emitSymbolValue(pSetLabel, size);
-}
-
 void StreamEmitter::EmitLabelPlusOffset(const MCSymbol *pLabel, uint64_t Offset, unsigned size,
                                         bool /*isSectionRelative*/) const {
   // Emit pLabel+Offset (or just pLabel if Offset is zero)
@@ -458,44 +447,12 @@ void StreamEmitter::EmitSectionOffset(const MCSymbol *pLabel, const MCSymbol *pS
   IGC_ASSERT_MESSAGE((!pLabel->isInSection() || &pLabel->getSection() == &section),
                      "section offset using wrong section base for label");
 
-  // If the section in question will end up with an address of 0 anyway, we can
-  // just emit an absolute reference to save a relocation.
-#if 0
-    if (section.isBaseAddressKnownZero())
-    {
-        m_pMCStreamer->EmitSymbolValue(pLabel, 4);
-        return;
-    }
-#endif
-
   // Otherwise, emit it as a label difference from the start of the section.
   EmitLabelDifference(pLabel, pSectionLabel, 4);
 }
 
 MCSymbol *StreamEmitter::EmitDwarfUnitLength(const Twine &Prefix, const Twine &Comment) const {
   return m_pMCStreamer->emitDwarfUnitLength(Prefix, Comment);
-}
-
-void StreamEmitter::EmitDwarfRegOp(unsigned reg, unsigned offset, bool indirect) const {
-  auto regEncoded = GetEncodedRegNum<RegisterNumbering::GRFBase>(reg);
-  if (indirect) {
-    if (regEncoded < 32) {
-      EmitInt8(dwarf::DW_OP_breg0 + regEncoded);
-    } else {
-      // Emit ("DW_OP_bregx");
-      EmitInt8(dwarf::DW_OP_bregx);
-      EmitULEB128(regEncoded);
-    }
-    EmitSLEB128(offset);
-  } else {
-    if (regEncoded < 32) {
-      EmitInt8(dwarf::DW_OP_reg0 + regEncoded);
-    } else {
-      // Emit ("DW_OP_regx");
-      EmitInt8(dwarf::DW_OP_regx);
-      EmitULEB128(regEncoded);
-    }
-  }
 }
 
 bool StreamEmitter::EmitDwarfFileDirective(unsigned fileNo, llvm::StringRef directory, llvm::StringRef filename,
@@ -514,10 +471,6 @@ void StreamEmitter::EmitDwarfFile0Directive(unsigned fileNo, StringRef directory
 void StreamEmitter::EmitDwarfLocDirective(unsigned fileNo, unsigned line, unsigned column, unsigned flags, unsigned isa,
                                           unsigned discriminator, StringRef fileName) const {
   m_pMCStreamer->emitDwarfLocDirective(fileNo, line, column, flags, isa, discriminator, fileName);
-}
-
-void StreamEmitter::SetMCLineTableSymbol(MCSymbol *pSym, unsigned id) const {
-  //    m_pContext->setMCLineTableSymbol(pSym, id);
 }
 
 void StreamEmitter::Finalize() const {

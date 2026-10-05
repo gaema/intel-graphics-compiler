@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2020-2021 Intel Corporation
+Copyright (C) 2020-2026 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -25,6 +25,7 @@ SPDX-License-Identifier: MIT
 #include "common/LLVMWarningsPop.hpp"
 #include "llvmWrapper/IR/DerivedTypes.h"
 #include "llvmWrapper/IR/Instructions.h"
+#include "llvmWrapper/IR/InstVisitor.h"
 #include "llvmWrapper/Support/Alignment.h"
 #include "common/LLVMUtils.h"
 #include "common/IGCIRBuilder.h"
@@ -173,8 +174,9 @@ private:
   bool useMulEmu(Instruction *instr);
 };
 
-class InstExpander : public InstVisitor<InstExpander, bool> {
-  friend class InstVisitor<InstExpander, bool>;
+class InstExpander : public IGCLLVM::InstVisitor<InstExpander, bool> {
+  friend class IGCLLVM::InstVisitor<InstExpander, bool>;
+  friend class llvm::InstVisitor<InstExpander, bool>;
 
   PartialEmuI64Ops *Emu;
   BuilderType *IRB;
@@ -201,7 +203,8 @@ private:
   bool visitSelect(SelectInst &);
 
   bool visitRet(ReturnInst &) { return false; }
-  bool visitBr(BranchInst &) { return false; }
+  bool visitCondBrInst(IGCLLVM::CondBrInst &) { return false; }
+  bool visitUncondBrInst(IGCLLVM::UncondBrInst &) { return false; }
   bool visitSwitch(SwitchInst &) { return false; }
   bool visitIndirectBr(IndirectBrInst &) { return false; }
   bool visitInvoke(InvokeInst &) { return false; }
@@ -403,8 +406,8 @@ public:
           case Instruction::IntToPtr: {
             IntToPtrInst *I2P = cast<IntToPtrInst>(BI);
             Value *Src = I2P->getOperand(0);
-            PointerType *PtrTy = cast<PointerType>(I2P->getType());
-            if (!Emu->isPtr64(PtrTy) && !Emu->isInt64(Src))
+            PointerType *PtrTy = dyn_cast<PointerType>(I2P->getType());
+            if (!PtrTy || (!Emu->isPtr64(PtrTy) && !Emu->isInt64(Src)))
               continue;
 
             IRB->SetInsertPoint(I2P);
@@ -419,8 +422,8 @@ public:
           case Instruction::PtrToInt: {
             PtrToIntInst *P2I = cast<PtrToIntInst>(BI);
             Value *Src = P2I->getOperand(0);
-            PointerType *PtrTy = cast<PointerType>(Src->getType());
-            if (!Emu->isPtr64(PtrTy) || Emu->isInt64(Src))
+            PointerType *PtrTy = dyn_cast<PointerType>(Src->getType());
+            if (!PtrTy || !Emu->isPtr64(PtrTy) || Emu->isInt64(Src))
               continue;
 
             IRB->SetInsertPoint(P2I);

@@ -632,8 +632,7 @@ bool SpillManagerGRF::isUnalignedRegion(REGION_TYPE *region,
           (regionByteSize < bytePerGRF || regionDisp % bytePerGRF)) {
         return true;
       }
-      return regionByteSize / OWORD_BYTE_SIZE != 1 &&
-             regionByteSize / OWORD_BYTE_SIZE != 2 &&
+      return regionByteSize / OWORD_BYTE_SIZE != 2 &&
              regionByteSize / OWORD_BYTE_SIZE != 4;
     } else
       return true;
@@ -1158,7 +1157,7 @@ SpillManagerGRF::createTemporaryRangeDeclare(G4_DstRegRegion *spilledRegion,
 
   G4_Declare *temporaryRangeDeclare =
       createRangeDeclare(name, G4_GRF, width, height, type, regVarKind,
-                         spilledRegVar, NULL, G4_ExecSize(0));
+                         spilledRegVar, NULL, g4::SIMD_UNDEFINED);
 
   if (failSafeSpill_) {
     if (!builder_->getOption(vISA_NewFailSafeRA)) {
@@ -1339,7 +1338,7 @@ G4_Declare *SpillManagerGRF::createMRangeDeclare(G4_RegVar *regVar) {
 
   G4_Declare *msgRangeDeclare = createRangeDeclare(
       name, G4_GRF, width, height, Type_UD, DeclareType::Tmp,
-      regVar->getNonTransientBaseRegVar(), NULL, G4_ExecSize(0));
+      regVar->getNonTransientBaseRegVar(), NULL, g4::SIMD_UNDEFINED);
 
   if (failSafeSpill_) {
     if (!builder_->getOption(vISA_NewFailSafeRA)) {
@@ -1386,7 +1385,7 @@ G4_Declare *SpillManagerGRF::createMRangeDeclare(G4_DstRegRegion *region,
   unsigned short width = builder_->numEltPerGRF<Type_UD>();
   G4_Declare *msgRangeDeclare =
       createRangeDeclare(name, G4_GRF, width, height, Type_UD, DeclareType::Tmp,
-                         region->getBase()->asRegVar(), NULL, G4_ExecSize(0));
+                         region->getBase()->asRegVar(), NULL, g4::SIMD_UNDEFINED);
 
   if (failSafeSpill_) {
     if (!builder_->getOption(vISA_NewFailSafeRA)) {
@@ -1434,7 +1433,7 @@ G4_Declare *SpillManagerGRF::createMRangeDeclare(G4_SrcRegRegion *region,
   unsigned width = builder_->numEltPerGRF<Type_UD>();
   G4_Declare *msgRangeDeclare = createRangeDeclare(
       name, G4_GRF, (unsigned short)width, (unsigned short)height, Type_UD,
-      DeclareType::Tmp, region->getBase()->asRegVar(), NULL, G4_ExecSize(0));
+      DeclareType::Tmp, region->getBase()->asRegVar(), NULL, g4::SIMD_UNDEFINED);
 
   if (failSafeSpill_) {
     if (!builder_->getOption(vISA_NewFailSafeRA)) {
@@ -3664,7 +3663,7 @@ void SpillManagerGRF::insertAddrTakenSpillAndFillCode(
             type = Type_UB;
           } else {
             vISA_ASSERT(false, "Cannot emit SIMD1 for byte");
-            curExSize = G4_ExecSize(0);
+            curExSize = g4::SIMD_UNDEFINED;
           }
 
           // If ExecSize = Width = 1, both VertStride and HorzStride must be 0.
@@ -3864,7 +3863,7 @@ void SpillManagerGRF::insertAddrTakenLSSpillAndFillCode(
             type = Type_UB;
           } else {
             vISA_ASSERT(false, "Cannot emit SIMD1 for byte");
-            curExSize = G4_ExecSize(0);
+            curExSize = g4::SIMD_UNDEFINED;
           }
 
           // If ExecSize = Width = 1, both VertStride and HorzStride must be 0.
@@ -5964,13 +5963,10 @@ void GlobalRA::initAddrRegForImmOffUseNonStackCall() {
 void GlobalRA::expandSpillFillIntrinsicsXE3P(unsigned int spillSizeInBytes) {
   bool hasStackCall =
       kernel.fg.getHasStackCalls() || kernel.fg.getIsStackCallFunc();
-  // Effficient64b uses a simplified path.
-  //  Xe3p.v1: we allocate a zero register with DW aligned 0
-  //           for the spill header; this suffices all spill locations
-  //           within [0..256k]; addresses outside of this range will insert
-  //           extra emulation
-  //  Xe3p.v2: we can use the null register with :1 to generate 0's
-  //           "src0 null means zero"
+  // Efficient64b uses a simplified path: we allocate a zero register with
+  // DW aligned 0 for the spill header; this suffices all spill locations
+  // within [0..256k]; addresses outside of this range will insert extra
+  // emulation.
   vASSERT(builder.isEfficient64bEnabled());
 
   auto globalScratchOffset =
@@ -5995,12 +5991,13 @@ void GlobalRA::expandSpillFillIntrinsicsXE3P(unsigned int spillSizeInBytes) {
   }
 }
 
-void GlobalRA::spillFillPropagation() {
+unsigned GlobalRA::spillFillPropagation() {
   if (useLscForScatterSpill)
-    return;
+    return 0;
 
   SpillFillPropagation sfp(kernel, builder, *this);
   sfp.run();
+  return sfp.getMaxSpillAreaOffset();
 }
 
 void GlobalRA::expandSpillFillIntrinsics(unsigned int spillSizeInBytes) {
@@ -6116,7 +6113,7 @@ void vISA::BoundedRA::markBusyGRFs() {
               phyReg->asGreg()->getRegNum() * kernel.numEltPerGRF<Type_UB>();
           auto regRB =
               regLB +
-              pointee.var->getDeclare()->getRootDeclare()->getByteSize();
+              pointee.var->getDeclare()->getRootDeclare()->getByteSize() - 1;
           auto startGRF = regLB / kernel.numEltPerGRF<Type_UB>();
           auto endGRF = regRB / kernel.numEltPerGRF<Type_UB>();
           for (unsigned int reg = startGRF; reg != (endGRF + 1); ++reg)
@@ -6166,7 +6163,7 @@ void vISA::BoundedRA::markBusyGRFs() {
                 phyReg->asGreg()->getRegNum() * kernel.numEltPerGRF<Type_UB>();
             auto regRB =
                 regLB +
-                pointee.var->getDeclare()->getRootDeclare()->getByteSize();
+                pointee.var->getDeclare()->getRootDeclare()->getByteSize() - 1;
             auto startGRF = regLB / kernel.numEltPerGRF<Type_UB>();
             auto endGRF = regRB / kernel.numEltPerGRF<Type_UB>();
             for (unsigned int reg = startGRF; reg != (endGRF + 1); ++reg)

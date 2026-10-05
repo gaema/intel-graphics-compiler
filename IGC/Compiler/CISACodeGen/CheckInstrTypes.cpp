@@ -20,6 +20,7 @@ SPDX-License-Identifier: MIT
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/Support/CommandLine.h>
 #include "common/LLVMWarningsPop.hpp"
+#include "llvmWrapper/IR/Instructions.h"
 #include "GenISAIntrinsics/GenIntrinsicInst.h"
 
 using namespace llvm;
@@ -157,6 +158,7 @@ void CheckInstrTypes::print(llvm::raw_ostream &OS) const {
   OS << "\nhasDynamicGenericLoadStore: " << g_InstrTypes.hasDynamicGenericLoadStore;
   OS << "\nhasUnmaskedRegion: " << g_InstrTypes.hasUnmaskedRegion;
   OS << "\nhasSLM: " << g_InstrTypes.hasSLM;
+  OS << "\nhasDPAS: " << g_InstrTypes.hasDPAS;
   OS << "\nnumCall: " << g_InstrTypes.numCall;
   OS << "\nnumBarrier: " << g_InstrTypes.numBarrier;
   OS << "\nnumLoadStore: " << g_InstrTypes.numLoadStore;
@@ -199,7 +201,7 @@ void CheckInstrTypes::checkGlobalLocal(llvm::Instruction &I) {
 }
 
 void CheckInstrTypes::visitInstruction(llvm::Instruction &I) {
-  if (!llvm::isa<llvm::DbgInfoIntrinsic>(&I)) {
+  if (!isDebugInst(&I)) {
     g_InstrTypes.numInsts++;
     checkGlobalLocal(I);
   }
@@ -305,6 +307,11 @@ void CheckInstrTypes::visitCallInst(CallInst &C) {
       break;
     case GenISAIntrinsic::GenISA_is_uniform:
       g_InstrTypes.hasUniformAssumptions = true;
+      break;
+    case GenISAIntrinsic::GenISA_dpas:
+    case GenISAIntrinsic::GenISA_sub_group_dpas:
+    case GenISAIntrinsic::GenISA_sub_group_bdpas:
+      g_InstrTypes.hasDPAS = true;
       break;
     case GenISAIntrinsic::GenISA_typedread:
     case GenISAIntrinsic::GenISA_typedreadMS:
@@ -432,7 +439,12 @@ void CheckInstrTypes::visitCallInst(CallInst &C) {
   }
 }
 
-void CheckInstrTypes::visitBranchInst(BranchInst &I) {
+void CheckInstrTypes::visitCondBrInst(IGCLLVM::CondBrInst &I) {
+  g_InstrTypes.numInsts++;
+  checkGlobalLocal(I);
+}
+
+void CheckInstrTypes::visitUncondBrInst(IGCLLVM::UncondBrInst &I) {
   g_InstrTypes.numInsts++;
   checkGlobalLocal(I);
 }

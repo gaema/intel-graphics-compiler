@@ -22,6 +22,7 @@ See LICENSE.TXT for details.
 #include "Compiler/CodeGenContextWrapper.hpp"
 #include "Compiler/MetaDataUtilsWrapper.h"
 #include "Compiler/MetaDataApi/MetaDataApi.h"
+#include "common/igc_regkeys.hpp"
 
 #include "common/LLVMWarningsPush.hpp"
 #include <llvm/Analysis/PostDominators.h>
@@ -51,6 +52,10 @@ public:
     AU.addRequired<llvm::LoopInfoWrapperPass>();
     AU.addRequired<MetaDataUtilsWrapper>();
     AU.addRequired<CodeGenContextWrapper>();
+    if (IGC_IS_FLAG_ENABLED(EnableSampleResultLatencySink)) {
+      AU.addRequired<IGCLivenessAnalysis>();
+      AU.addRequired<IGCFunctionExternalRegPressureAnalysis>();
+    }
 
     AU.addPreserved<llvm::DominatorTreeWrapperPass>();
     AU.addPreserved<llvm::PostDominatorTreeWrapperPass>();
@@ -69,6 +74,7 @@ private:
   void rollbackSinking(BasicBlock *BB);
 
   uint estimateLiveOutPressure(llvm::BasicBlock *blk, const llvm::DataLayout *DL);
+  bool hasRegPressureHeadroomForLatencySink(llvm::BasicBlock *TgtBB);
 
   /// data members for local-sinking
   llvm::SmallPtrSet<llvm::BasicBlock *, 8> LocalBlkSet;
@@ -79,6 +85,19 @@ private:
   /// counting the number of gradient/sample operation sinked into CF
   unsigned totalGradientMoved = 0;
   unsigned numGradientMovedOutBB = 0;
+
+  /// State for the latency-hiding sink (EnableSampleResultLatencySink). Headroom is checked
+  /// per sink-target block: the target absorbs the extended send-result live range.
+  bool latencySinkEnabled = false;
+  IGCLivenessAnalysisRunner *RPE = nullptr;
+  WIAnalysisRunner *WI = nullptr;
+  /// GRF budget, and the SIMD width pressure is scaled to (widest mode this function may compile).
+  unsigned latencySinkBudget = 0;
+  unsigned latencySinkSimd = 0;
+  unsigned latencySinkExternalPressure = 0;
+  /// Memoized per-BB pressure. A pre-sinking snapshot, not a live value: liveness is
+  /// not recomputed as instructions move. Accepted to bound compile time.
+  llvm::DenseMap<llvm::BasicBlock *, unsigned> latencySinkBBPressure;
 };
 
 void initializeCodeSinkingPass(llvm::PassRegistry &);

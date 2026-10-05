@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2024 Intel Corporation
+Copyright (C) 2017-2026 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -171,6 +171,15 @@ public:
     ONLY_LEGAL_REGION =
         GENX_ITR_FLAGENUM(4, 6), // instruction can be baled with only legal
                                  // region that won`t be splitted
+    // Like CONTIGUOUS (operand must be contiguous), but additionally forces
+    // the operand's base decl/live-range to be GRF-aligned (see
+    // GenXCategory), regardless of the operand's declared ALIGNMENT (see
+    // above), which continues to control the legal in-value region offset
+    // granularity for baling purposes (e.g. OWALIGNED/QWALIGNED). Used by
+    // bdpas block-scaling operands (Src3/Src4), whose base decl must be
+    // GRF-aligned even though HW allows a narrower (oword/qword) in-register
+    // sub-offset.
+    FORCE_GRF_BASE = GENX_ITR_FLAGENUM(4, 7),
     // Modifiers for destination only, 2 bits used
     SATURATION = GENX_ITR_FLAGMASK(7, 2),
     SATURATION_DEFAULT =
@@ -195,6 +204,17 @@ public:
     IMM16ONLY =
         GENX_ITR_FLAGVAL(11), // source allowed to be only 16 bit immediate
     NULLALLOWED = GENX_ITR_FLAGVAL(12), // source allowed to be null register
+    // dpas/dpasw/dpas2/dpas_nosrc0/dpasw_nosrc0 Src2: the required base-decl
+    // and offset alignment depends on the actual Src1Precision/
+    // Src2Precision/SystolicDepth immediates at the call site (see
+    // genx::getDpasSrc2AlignmentBytes), and so cannot be expressed as a
+    // single static ALIGNMENT value. This flag lives outside the RESTRICTION
+    // and ALIGNMENT fields so it can be combined with e.g. CONTIGUOUS. All
+    // code that consults this operand's alignment (GenXBaling,
+    // GenXCategory) checks hasDpasSrc2Align() first and always computes the
+    // dynamic value in that case, so a static ALIGNMENT value is neither
+    // needed nor read for these operands.
+    DPAS_SRC2_ALIGN = GENX_ITR_FLAGVAL(13),
 
   };
   struct ArgInfo {
@@ -244,6 +264,10 @@ public:
       return false;
     }
     bool isDirectOnly() const { return Info & DIRECTONLY; }
+    // hasDpasSrc2Align : true if this operand's alignment must be computed
+    // dynamically per call-site; see DPAS_SRC2_ALIGN and
+    // genx::getDpasSrc2AlignmentBytes.
+    bool hasDpasSrc2Align() const { return Info & DPAS_SRC2_ALIGN; }
     bool rawNullAllowed() const {
       IGC_ASSERT(isRaw());
       return Info & RAW_NULLALLOWED;

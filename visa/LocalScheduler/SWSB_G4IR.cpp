@@ -197,7 +197,34 @@ static bool hasSamePredicator(const G4_INST *inst1, const G4_INST *inst2) {
     ;
     unsigned short refOff2 = pred2->getBase()->ExRegNum(flagRegNumValid);
     unsigned short subRefOff2 = pred2->getBase()->asRegVar()->getPhyRegOff();
-    ;
+
+    if (refOff1 == refOff2 && subRefOff1 == subRefOff2) {
+      return true;
+    }
+    return false;
+  }
+
+  if (pred1 || pred2) {
+    return false;
+  }
+
+  if (inst1->isWriteEnableInst() || inst2->isWriteEnableInst()) {
+    return false;
+  }
+
+  return true;
+}
+
+static bool hasSamePredicatorAndWriteEnable(const G4_INST *inst1, const G4_INST *inst2) {
+  G4_Predicate *pred1 = inst1->getPredicate();
+  G4_Predicate *pred2 = inst2->getPredicate();
+
+  if (pred1 && pred2) {
+    bool flagRegNumValid = true;
+    unsigned short refOff1 = pred1->getBase()->ExRegNum(flagRegNumValid);
+    unsigned short subRefOff1 = pred1->getBase()->asRegVar()->getPhyRegOff();
+    unsigned short refOff2 = pred2->getBase()->ExRegNum(flagRegNumValid);
+    unsigned short subRefOff2 = pred2->getBase()->asRegVar()->getPhyRegOff();
 
     if (refOff1 == refOff2 && subRefOff1 == subRefOff2) {
       return true;
@@ -341,12 +368,13 @@ bool SBFootprint::hasOverlap(const SBFootprint *liveFootprint,
             curFootprintPtr->RightB >= curFootprint2Ptr->LeftB) {
           internalOffset = curFootprint2Ptr->offset;
           if (curFType == GRF_T && !isPrecision &&
-              (IS_BTYPE(curType) || isFcvtByteType)) {
+              (IS_BTYPE(curType) || IS_BYTE_FLOAT(curType) || isFcvtByteType)) {
             isRMWOverlap = true;
           }
           return true;
         } else if (curFType == GRF_T && !isPrecision &&
-                   (IS_BTYPE(curType) || isFcvtByteType)) {
+                   (IS_BTYPE(curType) || IS_BYTE_FLOAT(curType) ||
+                    isFcvtByteType)) {
           unsigned short w_LeftB = curFootprintPtr->LeftB / 2;
           unsigned short w_RightB = curFootprintPtr->RightB / 2;
           unsigned short w_curLeftB = curFootprint2Ptr->LeftB / 2;
@@ -1028,6 +1056,9 @@ void SBNode::finalizeDistanceType3(IR_Builder &builder,
 
 // Add a node into bucket
 void LiveGRFBuckets::add(SBBucketNode *bucketNode, int bucket) {
+  if (bucket < 0 || bucket >= numOfBuckets) {
+    return;
+  }
   SBBUCKET_VECTOR &nodeVec = nodeBucketsArray[bucket];
   if (std::find(nodeVec.begin(), nodeVec.end(), bucketNode) == nodeVec.end()) {
     nodeVec.push_back(bucketNode);
@@ -4759,6 +4790,11 @@ void SWSB::insertTokenSync() {
                 inst) || // Don't across any token instruction
             inst->isCFInst() ||
             inst->isLabel() || inst->isOptBarrier()) {
+          if (fg.builder->needFenceAfterReadSync()) {
+            G4_INST *syncARInst = insertSyncInstruction(bb, inst_it);
+            syncARInst->setToken(fenceToken);
+            syncARInst->setTokenType(SWSBTokenType::AFTER_READ);
+          }
           G4_INST *syncInst = insertSyncInstruction(bb, inst_it);
           syncInst->setToken(fenceToken);
           syncInst->setTokenType(SWSBTokenType::AFTER_WRITE);
@@ -4772,7 +4808,15 @@ void SWSB::insertTokenSync() {
         fenceToken = inst->getSBIDSetToken();
         if (iInstNext == bb->end()) { // In case the fence instruction is the
                                       // last instruction of BB
-          G4_INST *syncInst = insertSyncInstructionAfter(bb, inst_it);
+          if (fg.builder->needFenceAfterReadSync()) {
+            G4_INST *syncARInst = insertSyncInstructionAfter(bb, inst_it);
+            syncARInst->setToken(fenceToken);
+            syncARInst->setTokenType(SWSBTokenType::AFTER_READ);
+          }
+          // The fence is the last instruction of the BB, so appending at the
+          // end puts the AFTER_WRITE sync after the fence, and after the
+          // AFTER_READ sync when one was inserted.
+          G4_INST *syncInst = insertSyncInstruction(bb, bb->end());
           syncInst->setToken(fenceToken);
           syncInst->setTokenType(SWSBTokenType::AFTER_WRITE);
         }
@@ -6660,11 +6704,10 @@ bool G4_BB_SB::dpasCanFwd(SBNode &curNode, SBNode &nextNode) const {
   if (!nextSrc0)
     return false;
 
-  if (builder.allowsMixedDstAndSrc0TypesInMacro() &&
-      cur.isDstAndSrc0MixOfBF16AndFP32() &&
-      next.isDstAndSrc0MixOfBF16AndFP32()) {
-    // When next and current DPAS src0 and dst are fp32 or bf16, the register of
-    // the next DPAS’s src0 and dst are both identical to the current DPAS’s dst
+  if (cur.isMixedDstAndSrc0TypesAllowed(next)) {
+    // When next and current DPAS src0 and dst are a permitted mix, the register
+    // of the next DPAS’s src0 and dst are both identical to the current DPAS’s
+    // dst.
     if (curDst->LeftB != nextSrc0->LeftB || curDst->LeftB != nextDst->LeftB)
       return false;
   } else if (curDst->LeftB != nextSrc0->LeftB ||
@@ -6814,7 +6857,7 @@ bool G4_BB_SB::isLastDpas(SBNode *curNode, SBNode *nextNode,
     return true;
   }
 
-  if (!hasSamePredicator(curInst, nextInst)) {
+  if (!hasSamePredicatorAndWriteEnable(curInst, nextInst)) {
     return true;
   }
 
@@ -8395,7 +8438,11 @@ void G4_BB_SB::getLiveBucketsFromFootprint(
 
     int startBucket = footprint->LeftB / builder.numEltPerGRF<Type_UB>();
     int endBucket = footprint->RightB / builder.numEltPerGRF<Type_UB>();
+    const int maxBucket = send_use_kills->getNumOfBuckets();
     for (int j = startBucket; j < endBucket + 1; j++) {
+      if (j < 0 || j >= maxBucket) {
+        continue;
+      }
       send_use_kills->add(sBucketNode, j);
     }
   }
@@ -8487,6 +8534,9 @@ void SWSB::addGlobalDependence(unsigned globalSendNum,
       // For all bucket descriptors of curInst
       for (const SBBucketDesc &BD : BDvec) {
         const int &curBucket = BD.bucket;
+        if (curBucket < 0 || curBucket >= globalRegisterNum) {
+          continue;
+        }
         const Gen4_Operand_Number &curOpnd = BD.opndNum;
         const SBFootprint *curFootprint = BD.footprint;
 
@@ -8876,6 +8926,9 @@ void SWSB::addGlobalDependenceWithReachingDef(
       // For all bucket descriptors of curInst
       for (const SBBucketDesc &BD : BDvec) {
         const int &curBucket = BD.bucket;
+        if (curBucket < 0 || curBucket >= globalRegisterNum) {
+          continue;
+        }
         const Gen4_Operand_Number &curOpnd = BD.opndNum;
         const SBFootprint *curFootprint = BD.footprint;
 

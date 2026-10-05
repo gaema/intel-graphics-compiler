@@ -236,7 +236,7 @@ public:
                             G4_Type ty, DeclareType kind = Regular,
                             G4_RegVar *base = nullptr,
                             G4_Operand *repRegion = nullptr,
-                            G4_ExecSize execSize = G4_ExecSize(0));
+                            G4_ExecSize execSize = g4::SIMD_UNDEFINED);
 
   G4_Declare *createPreVarDeclare(PreDefinedVarsInternal index,
                                   unsigned short n_elems, unsigned short n_rows,
@@ -627,6 +627,8 @@ public:
   bool tryToAlignOperand(G4_Operand *opnd, int alignByte) const;
   bool tryToAlignOperand(G4_Operand *opnd, unsigned short &offset,
                          int alignByte) const;
+  bool tryToAlignOperandRootDcl(G4_Operand *opnd, uint32_t &offset,
+                                int alignBytes);
 
   void setType(enum VISA_BUILD_TYPE _type) { type = _type; }
   bool getIsKernel() const { return type == VISA_BUILD_TYPE::KERNEL; }
@@ -753,7 +755,7 @@ public:
                             G4_Type ty, DeclareType kind = Regular,
                             G4_RegVar *base = NULL,
                             G4_Operand *repRegion = NULL,
-                            G4_ExecSize execSize = G4_ExecSize(0));
+                            G4_ExecSize execSize = g4::SIMD_UNDEFINED);
 
   G4_Declare *createPreVarDeclareNoLookup(PreDefinedVarsInternal index,
                                           unsigned short n_elems,
@@ -1895,6 +1897,7 @@ public:
                                   G4_Operand *src3 = nullptr,
                                   G4_Operand *src4 = nullptr);
 
+
   G4_INST *createBfnInst(uint8_t booleanFuncCtrl, G4_Predicate *prd,
                          G4_CondMod *mod, G4_Sat sat, G4_ExecSize execSize,
                          G4_DstRegRegion *dst, G4_Operand *src0,
@@ -1971,6 +1974,7 @@ public:
                              VISA_EMask_Ctrl emask, G4_DstRegRegion *dst,
                              G4_Operand *src0, G4_Operand *src1,
                              G4_Operand *src2, G4_Operand *src3);
+
 
   int translateVISADataMovementInst(ISA_Opcode opcode,
                                     CISA_MIN_MAX_SUB_OPCODE subOpcode,
@@ -2302,7 +2306,8 @@ public:
       G4_SrcRegRegion **opndArray);
 
   int translateVISALoad3DInstUnified(
-      VISASampler3DSubOpCode actualop, bool pixelNullMask, G4_Predicate *pred,
+      VISASampler3DSubOpCode actualop, bool pixelNullMask,
+      G4_Predicate *pred,
       VISA_Exec_Size exeuctionSize, VISA_EMask_Ctrl em, ChannelMask channelMask,
       G4_Operand *aoffimmi, G4_Operand *samplerBase, unsigned int samplerIdx,
       G4_Operand *surfaceBase, unsigned int surfaceIdx,

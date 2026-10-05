@@ -216,8 +216,8 @@ bool CustomLoopVersioning::detectLoop(Loop *loop, Value *&var_range_x, Value *&v
     return false;
   }
 
-  BranchInst *br = cast<BranchInst>(body->getTerminator());
-  if (!br->isConditional()) {
+  IGCLLVM::CondBrInst *br = dyn_cast<IGCLLVM::CondBrInst>(body->getTerminator());
+  if (!br) {
     return false;
   }
 
@@ -247,7 +247,7 @@ void CustomLoopVersioning::rewriteLoopSeg1(Loop *loop, Value *interval_x, Value 
   BasicBlock *body = loop->getLoopLatch();
   IGC_ASSERT(nullptr != body);
 
-  BranchInst *br = cast<BranchInst>(header->getTerminator());
+  IGCLLVM::CondBrInst *br = cast<IGCLLVM::CondBrInst>(header->getTerminator());
   IGC_ASSERT(nullptr != br);
   FCmpInst *fcmp = dyn_cast<FCmpInst>(br->getCondition());
   IGC_ASSERT(nullptr != fcmp);
@@ -341,7 +341,7 @@ void CustomLoopVersioning::rewriteLoopSeg2(Loop *loop, Value *interval_y, Value 
   BasicBlock *body = loop->getLoopLatch();
   IGC_ASSERT(nullptr != body);
 
-  BranchInst *br = cast<BranchInst>(header->getTerminator());
+  IGCLLVM::CondBrInst *br = cast<IGCLLVM::CondBrInst>(header->getTerminator());
   IGC_ASSERT(nullptr != br);
   FCmpInst *fcmp = dyn_cast<FCmpInst>(br->getCondition());
   IGC_ASSERT(nullptr != fcmp);
@@ -429,7 +429,8 @@ void CustomLoopVersioning::linkLoops(Loop *loopSeg1, Loop *loopSeg2, BasicBlock 
   BasicBlock *seg2PreHdr = loopSeg2->getLoopPreheader();
   BasicBlock *seg2Body = loopSeg2->getLoopLatch();
 
-  BranchInst *br = cast<BranchInst>(seg1Body->getTerminator());
+  llvm::Instruction *br = seg1Body->getTerminator();
+  IGC_ASSERT((isa<IGCLLVM::CondBrInst, IGCLLVM::UncondBrInst>(br)));
   unsigned idx = br->getSuccessor(0) == afterLoop ? 0 : 1;
   br->setSuccessor(idx, loopSeg2->getLoopPreheader());
 
@@ -531,7 +532,7 @@ bool CustomLoopVersioning::processLoop(Loop *loop) {
   linkLoops(loopSeg2, loopSeg3, afterLoop);
 
   bbSeg3->getTerminator()->eraseFromParent();
-  BranchInst::Create(afterLoop, bbSeg3);
+  IGCLLVM::UncondBrInst::Create(afterLoop, bbSeg3);
 
   rewriteLoopSeg3(bbSeg3, var_range_y);
 
@@ -648,7 +649,7 @@ static BasicBlock *insertUniqueBackedgeBlock(Loop *L, BasicBlock *Preheader, Dom
 
   // Create and insert the new backedge block...
   BasicBlock *BEBlock = BasicBlock::Create(Header->getContext(), Header->getName() + ".backedge", F);
-  BranchInst *BETerminator = BranchInst::Create(Header, BEBlock);
+  IGCLLVM::UncondBrInst *BETerminator = IGCLLVM::UncondBrInst::Create(Header, BEBlock);
   BETerminator->setDebugLoc(IGCLLVM::getFirstNonPHI(Header)->getDebugLoc());
 
   // Move the new backedge block to right after the last backedge block.
@@ -893,7 +894,7 @@ bool LoopHoistConstant::runOnLoop(Loop *L, LPPassManager &LPM) {
   PHINode *InductionPreInc = nullptr;         // Induction variable pre-increment
   BinaryOperator *InductionPostInc = nullptr; // // Induction variable post-increment
   FCmpInst *LoopCond = nullptr;               // The loop exit condition
-  BranchInst *LoopBranch = nullptr;           // The pre-hoisted loop branching instruction
+  IGCLLVM::CondBrInst *LoopBranch = nullptr;  // The pre-hoisted loop branching instruction
   Value *LoopSize = nullptr;
   IntrinsicInst *MinInst = nullptr;
 
@@ -911,8 +912,8 @@ bool LoopHoistConstant::runOnLoop(Loop *L, LPPassManager &LPM) {
     return false;
 
   // Match the loop exit condition and branch
-  LoopBranch = dyn_cast<BranchInst>(LoopLatch->getTerminator());
-  if (LoopBranch && LoopBranch->isConditional()) {
+  LoopBranch = dyn_cast<IGCLLVM::CondBrInst>(LoopLatch->getTerminator());
+  if (LoopBranch) {
     LoopCond = dyn_cast<FCmpInst>(LoopBranch->getCondition());
     if (LoopCond && (LoopCond->getPredicate() == CmpInst::FCMP_ULT || LoopCond->getPredicate() == CmpInst::FCMP_OLT)) {
       if (LoopCond->getOperand(0) == InductionPostInc) {
@@ -1099,6 +1100,9 @@ bool SpecialCasesDisableLICM::runOnFunction(llvm::Function &F) {
 }
 
 bool SpecialCasesDisableLICM::LoopHasInvariantSwitchDispatch(const Loop &L) {
+  if (IGC_IS_FLAG_DISABLED(EnableLICMInvariantSwitchDispatchDetection)) {
+    return false;
+  }
   // Switches are lowered to a BST of icmp+br before this pass runs.
   // When the dispatch value is loop-invariant, LICM hoists each arm's
   // independent computations to the preheader.
@@ -1109,8 +1113,8 @@ bool SpecialCasesDisableLICM::LoopHasInvariantSwitchDispatch(const Loop &L) {
     if (BB->size() != 2) {
       continue;
     }
-    auto *BI = dyn_cast<BranchInst>(BB->getTerminator());
-    if (!BI || !BI->isConditional()) {
+    auto *BI = dyn_cast<IGCLLVM::CondBrInst>(BB->getTerminator());
+    if (!BI) {
       continue;
     }
     auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition());
@@ -1847,12 +1851,21 @@ static Value *getArrayIndex(const Instruction *I, unsigned &ArraySize) {
   if (GEPOp->countNonConstantIndices() != 1)
     return nullptr;
 
-  // If alloca type is array then GEP operand corresponding to
-  // array element is number 2
-  Type *AllocaTy = GEPOp->getSourceElementType();
-  if (AllocaTy->isArrayTy() && !isa<ConstantInt>(GEPOp->getOperand(2))) {
-    ArraySize = int_cast<unsigned>(AllocaTy->getArrayNumElements());
+  // Traditional `gep [N x T], ptr %alloca, 0, %idx` form.
+  Type *GEPTy = GEPOp->getSourceElementType();
+  if (GEPTy->isArrayTy() && GEPOp->getNumIndices() > 1 && !isa<ConstantInt>(GEPOp->getOperand(2))) {
+    ArraySize = int_cast<unsigned>(GEPTy->getArrayNumElements());
     return GEPOp->getOperand(2);
+  }
+
+  // `gep T, ptr %alloca, %idx` form
+  // InstCombine may strip the leading zero index. Recover the bound from the
+  // alloca when the single-index GEP still strides by its element type.
+  Type *AllocaTy = Alloca->getAllocatedType();
+  if (AllocaTy->isArrayTy() && AllocaTy->getArrayElementType() == GEPTy && GEPOp->getNumIndices() == 1 &&
+      !isa<ConstantInt>(GEPOp->getOperand(1))) {
+    ArraySize = int_cast<unsigned>(AllocaTy->getArrayNumElements());
+    return GEPOp->getOperand(1);
   }
   return nullptr;
 }
@@ -1879,12 +1892,12 @@ bool LoopAllocaUpperbound::runOnLoop(Loop *L, LPPassManager &LPM) {
   if (InductionInc->getNumUses() != 2)
     return false;
   ICmpInst *LoopCond = nullptr;     // The loop exit condition
-  BranchInst *LoopBranch = nullptr; // The loop branching instruction
+  IGCLLVM::CondBrInst *LoopBranch = nullptr; // The loop branching instruction
   Value *LoopSize = nullptr;        // Loop count
 
   // Match the loop exit condition and branch
-  LoopBranch = dyn_cast<BranchInst>(Header->getTerminator());
-  if (LoopBranch && LoopBranch->isConditional()) {
+  LoopBranch = dyn_cast<IGCLLVM::CondBrInst>(Header->getTerminator());
+  if (LoopBranch) {
     LoopCond = dyn_cast<ICmpInst>(LoopBranch->getCondition());
     if (LoopCond && (LoopCond->getPredicate() == CmpInst::ICMP_SLT)) {
       if (LoopCond->getOperand(0) == InductionInc) {

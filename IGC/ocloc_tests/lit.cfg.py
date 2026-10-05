@@ -10,11 +10,18 @@
 
 import os
 import subprocess
+import sys
 import lit.formats
 import lit.util
 
 from lit.llvm import llvm_config
 from lit.llvm.subst import ToolSubst
+
+if config.igc_lit_common_dir:
+    sys.path.append(config.igc_lit_common_dir)
+    from igc_lit_helpers import VerboseUnsupportedShTest
+else:
+    VerboseUnsupportedShTest = lit.formats.ShTest
 
 # Configuration file for the 'lit' test runner.
 
@@ -22,29 +29,43 @@ from lit.llvm.subst import ToolSubst
 config.name = 'OfflineCompilationTests'
 
 # testFormat: The test format to use to interpret tests.
-config.test_format = lit.formats.ShTest(not llvm_config.use_lit_shell)
+config.test_format = VerboseUnsupportedShTest(False)
 
 # suffixes: A list of file extensions to treat as test files.
-config.suffixes = ['.cl', '.ll', '.spvasm']
+config.suffixes = ['.cl', '.cpp', '.ll', '.spvasm', '.spv-test']
 
 # test_source_root: The root path where tests are located.
 config.test_source_root = os.path.dirname(__file__)
 
-# test_exec_root: The root path where tests should be run.
-config.test_exec_root = os.path.join(config.test_run_dir, 'test_output')
+# test_exec_root: where tests run. Overridable so a re-run pass
+# (e.g. check-ocloc-igc-clang) writes to its own dir.
+test_output_subdir = lit_config.params.get('test_output_subdir', 'test_output')
+config.test_exec_root = os.path.join(config.test_run_dir, test_output_subdir)
 
 shared_library_path_env = 'PATH' if 'system-windows' in config.available_features else 'LD_LIBRARY_PATH'
 
 llvm_config.use_default_substitutions()
 
-llvm_config.with_environment(shared_library_path_env,
-                             [config.ocloc_lib_dir,
-                              config.igc_lib_dir,
-                              config.cclang_lib_dir],
-                             append_path=True)
+lib_dirs = [config.ocloc_lib_dir, config.igc_lib_dir, config.cclang_lib_dir]
+# Optional igc-clang prebuild directory, used by the IGC_LibClangOverride tests.
+igc_clang_lib_dir = getattr(config, 'igc_clang_lib_dir', '')
+if igc_clang_lib_dir:
+    lib_dirs.append(igc_clang_lib_dir)
+
+llvm_config.with_environment(shared_library_path_env, lib_dirs, append_path=True)
+
+# For check-ocloc-igc-clang - force FCL to load igc-clang via
+# IGC_LibClangOverride env variable. Default = clear the flag.
+igc_libclang_override = lit_config.params.get('igc_libclang_override', '')
+if igc_libclang_override:
+    llvm_config.with_environment('IGC_LibClangOverride', igc_libclang_override)
+    config.name += '-igc-clang'
+    # Tests known to fail under the igc-clang library are tagged
+    # with "UNSUPPORTED: lib-igc-clang".
+    config.available_features.add('lib-igc-clang')
 
 
-tool_dirs = [config.ocloc_dir, config.llvm_tools_dir, config.spirv_as_dir, config.llvm_spirv_dir]
+tool_dirs = [config.ocloc_dir, config.llvm_tools_dir]
 
 asan_runtime_lib = getattr(config, 'asan_runtime_lib', '') if 'system-windows' not in config.available_features else ''
 
@@ -105,7 +126,7 @@ llvm_ver = int(config.llvm_version_major)
 
 if config.spirv_as_enabled:
   config.available_features.add('spirv-as')
-  llvm_config.add_tool_substitutions([ToolSubst('spirv-as', unresolved='fatal')], tool_dirs)
+  llvm_config.add_tool_substitutions([ToolSubst('spirv-as', unresolved='fatal')], config.spirv_as_dir)
 
 if llvm_ver <= 15:
   config.available_features.add('llvm-15-or-older')
@@ -122,6 +143,9 @@ if llvm_ver >= 17:
 if llvm_ver >= 22:
   config.available_features.add('llvm-22-plus')
 
+if llvm_ver >= 23:
+  config.available_features.add('llvm-23-plus')
+
 # On LLVM 17 tools like llvm-as do not have "opaque-pointers" flag, so in order to keep tests working on all LLVMs
 # on 17 tools we just provide empty string
 if llvm_ver >= 17:
@@ -135,11 +159,14 @@ config.substitutions.append(('%LLVM_DEPENDENT_CHECK_PREFIX%', f'CHECK-LLVM-{conf
 
 if config.llvm_spirv_enabled:
   config.available_features.add('llvm-spirv')
-  llvm_config.add_tool_substitutions([ToolSubst('llvm-spirv', unresolved='fatal')], tool_dirs)
+  llvm_config.add_tool_substitutions([ToolSubst('llvm-spirv', unresolved='fatal')], config.llvm_spirv_dir)
 
 if config.is32b == "1":
   config.available_features.add('sys32')
 
 if config.debug_build:
   config.available_features.add('debug')
+
+if getattr(config, 'release_build', False):
+  config.available_features.add('release')
 

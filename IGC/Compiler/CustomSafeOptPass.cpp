@@ -91,12 +91,14 @@ cmp+sel to avoid expensive VxH mov.
 #include "llvmWrapper/IR/IntrinsicInst.h"
 #include "llvmWrapper/IR/Intrinsics.h"
 #include "llvmWrapper/IR/Instructions.h"
+#include "llvmWrapper/IR/InstVisitor.h"
 #include "llvmWrapper/IR/DIBuilder.h"
 #include "llvmWrapper/IR/DebugInfo.h"
 #include "llvmWrapper/IR/DerivedTypes.h"
 #include "llvmWrapper/IR/IRBuilder.h"
 #include <llvmWrapper/IR/CmpPredicate.h>
 #include "llvmWrapper/Analysis/TargetLibraryInfo.h"
+#include "llvmWrapper/IR/Constants.h"
 #include "common/secure_mem.h"
 #include "Probe/Assertion.h"
 
@@ -177,7 +179,7 @@ void CustomSafeOptPass::visitXor(Instruction &XorInstr) {
 
   for (const auto &U : ICmpInstr->uses()) {
     auto user = U.getUser();
-    if (isa<BranchInst>(user)) {
+    if (isa<IGCLLVM::CondBrInst>(user)) {
       UsersList.push_back(cast<Instruction>(user));
     } else if (SelectInst *S = dyn_cast<SelectInst>(user)) {
       constexpr uint32_t condIdx = 0;
@@ -204,9 +206,8 @@ void CustomSafeOptPass::visitXor(Instruction &XorInstr) {
       S->setTrueValue(FalseVal);
       S->setFalseValue(TrueVal);
     } else {
-      IGC_ASSERT(isa<BranchInst>(I));
-      BranchInst *B = cast<BranchInst>(I);
-      B->swapSuccessors();
+      IGC_ASSERT(isa<IGCLLVM::CondBrInst>(I));
+      llvm::cast<IGCLLVM::CondBrInst>(I)->swapSuccessors();
     }
   }
 
@@ -255,7 +256,7 @@ void CustomSafeOptPass::visitAnd(BinaryOperator &I) {
     return;
   }
 
-  if (!I.hasOneUse() || !isa<BranchInst>(*I.user_begin()) || !I.getType()->isIntegerTy(1)) {
+  if (!I.hasOneUse() || !isa<IGCLLVM::CondBrInst>(*I.user_begin()) || !I.getType()->isIntegerTy(1)) {
     return;
   }
 
@@ -271,7 +272,7 @@ void CustomSafeOptPass::visitAnd(BinaryOperator &I) {
       builder.CreateICmp(CompareInst->getInversePredicate(), CompareInst->getOperand(0), CompareInst->getOperand(1));
   auto OrInst = builder.CreateOr(XorArgValue, NegatedCompareInst);
 
-  auto BrInst = cast<BranchInst>(*I.user_begin());
+  auto *BrInst = cast<IGCLLVM::CondBrInst>(*I.user_begin());
   BrInst->setCondition(OrInst);
   BrInst->swapSuccessors();
 
@@ -379,6 +380,78 @@ bool CustomSafeOptPass::packVecI32ToVecI64(BinaryOperator &OrInst) {
   return true;
 }
 
+// Fold WaveAll intrinsics with constant operands where the result is
+// statically known regardless of wave size:
+//   WaveAll(C, MIN/MAX/AND/OR) -> C   (idempotent ops)
+//   WaveAll(C, FMIN/FMAX)      -> C
+//   WaveAll(0, SUM/FSUM/XOR)   -> 0   (identity element as input)
+//   WaveAll(0, PROD/FPROD)     -> 0   (absorbing element)
+//   WaveAll(1, PROD/FPROD)     -> 1   (identity element as input)
+void CustomSafeOptPass::visitWaveAllConstant(llvm::CallInst *I) {
+  Value *src = I->getOperand(0);
+
+  // Source must be a constant (int or float).
+  Constant *constSrc = dyn_cast<Constant>(src);
+  if (!constSrc)
+    return;
+
+  // Vectors from joint-reduction are not handled here.
+  if (src->getType()->isVectorTy())
+    return;
+
+  ConstantInt *opVal = dyn_cast<ConstantInt>(I->getOperand(1));
+  if (!opVal)
+    return;
+
+  WaveOps op = static_cast<WaveOps>(opVal->getZExtValue());
+  Value *replacement = nullptr;
+
+  if (ConstantInt *CI = dyn_cast<ConstantInt>(constSrc)) {
+    switch (op) {
+    case WaveOps::UMIN:
+    case WaveOps::UMAX:
+    case WaveOps::IMIN:
+    case WaveOps::IMAX:
+    case WaveOps::AND:
+    case WaveOps::OR:
+      replacement = CI;
+      break;
+    case WaveOps::SUM:
+    case WaveOps::XOR:
+      if (CI->isZero())
+        replacement = CI;
+      break;
+    case WaveOps::PROD:
+      if (CI->isZero() || CI->isOne())
+        replacement = CI;
+      break;
+    default:
+      break;
+    }
+  } else if (ConstantFP *CF = dyn_cast<ConstantFP>(constSrc)) {
+    switch (op) {
+    case WaveOps::FMIN:
+    case WaveOps::FMAX:
+      replacement = CF;
+      break;
+    case WaveOps::FSUM:
+      if (CF->isZero())
+        replacement = CF;
+      break;
+    case WaveOps::FPROD:
+      if (CF->isExactlyValue(0.0) || CF->isExactlyValue(1.0))
+        replacement = CF;
+      break;
+    default:
+      break;
+    }
+  }
+
+  if (replacement) {
+    I->replaceAllUsesWith(replacement);
+    I->eraseFromParent();
+  }
+}
 // Replace sub_group shuffle with index = sub_group_id ^ xor_value,
 // where xor_value is a compile-time constant to intrinsic,
 // which will produce sequence of movs instead of using indirect access
@@ -388,6 +461,16 @@ bool CustomSafeOptPass::packVecI32ToVecI64(BinaryOperator &OrInst) {
 //   r = select_from_group(sg, x, other_id);
 void CustomSafeOptPass::visitShuffleIndex(llvm::CallInst *I) {
   using namespace llvm::PatternMatch;
+
+  // Check if the first operand is a constant, if so, we can replace the intrinsic with the constant value
+  // as this will be the same regardless of index.
+  if (isa<ConstantInt>(I->getOperand(0)) || isa<ConstantFP>(I->getOperand(0))) {
+    Constant *C = cast<Constant>(I->getOperand(0));
+    I->replaceAllUsesWith(C);
+    I->eraseFromParent();
+    return;
+  }
+
   /*
   Pattern match
   %simdLaneId16 = call i16 @llvm.genx.GenISA.simdLaneId()
@@ -760,6 +843,10 @@ void CustomSafeOptPass::visitUDiv(BinaryOperator &I) {
     return;
   }
 
+  // ConstantData don't have users, nothing to do.
+  if (isa<ConstantData>(I.getOperand(0)))
+    return;
+
   // Can try hoisting UDiv to common ancestor to speculatively execute if enabled
   SmallVector<Instruction *> ToReplace;
   for (auto u : I.getOperand(0)->users()) {
@@ -790,6 +877,9 @@ void CustomSafeOptPass::visitUDiv(BinaryOperator &I) {
 }
 
 void CustomSafeOptPass::visitURem(BinaryOperator &I) {
+  if (isa<ConstantData>(I.getOperand(0)))
+    return;
+
   // Can try hoisting URem to common ancestor to speculatively execute if enabled
   DenseSet<BasicBlock *> ExistingUDivAvailable;
   SmallVector<Instruction *> MatchingURems;
@@ -1138,6 +1228,12 @@ void CustomSafeOptPass::visitCallInst(CallInst &C) {
       break;
     }
 
+    case GenISAIntrinsic::GenISA_WaveAll: {
+      visitWaveAllConstant(inst);
+      break;
+    }
+
+
     case GenISAIntrinsic::GenISA_dp4a_ss:
     case GenISAIntrinsic::GenISA_dp4a_uu: {
       mergeDotAddToDp4a(&C);
@@ -1321,7 +1417,7 @@ void CustomSafeOptPass::visitBfi(llvm::CallInst *inst) {
       inst->replaceAllUsesWith(dst);
       inst->eraseFromParent();
     }
-  } else if (widthV && widthV->isZeroValue()) {
+  } else if (widthV && IGCLLVM::Constant::isNullValue(widthV)) {
     inst->replaceAllUsesWith(inst->getOperand(3));
     inst->eraseFromParent();
   }
@@ -2094,11 +2190,10 @@ void CustomSafeOptPass::visitTruncInst(TruncInst &I) {
   To:
   %335 = call i16 @llvm.genx.GenISA.WaveShuffleIndex.i16(i16 %orig, i32 %333, i32 0)
   */
-
-  if (IGC_IS_FLAG_ENABLED(EnableEmitMoreMoviCases))
-  {
+  // Note: temporarily disable this (visitTruncInst) opt if we can capture EmitMovi scenarios.
+  // It will be removed in future and for Int16 types we will just zext them back to int32.
+  if (shouldEmitMoreMoviCases(getAnalysis<CodeGenContextWrapper>().getCodeGenContext()))
     return;
-  }
 
   if (I.getSrcTy()->isIntegerTy(32) && I.getDestTy()->isIntegerTy(16)) {
     // We know all variants of shuffle from zext are safe to demote. (unlike WaveAll which might not be)
@@ -2149,13 +2244,13 @@ void IGC::CustomSafeOptPass::visitLdptr(llvm::SamplerLoadIntrinsic *inst) {
   Constant *src3 = dyn_cast<Constant>(inst->getOperand(3));
 
   // src2 and src3 has to be zero
-  if (!src2 || !src3 || !src2->isZeroValue() || !src3->isZeroValue()) {
+  if (!src2 || !src3 || !IGCLLVM::Constant::isNullValue(src2) || !IGCLLVM::Constant::isNullValue(src3)) {
     return;
   }
 
   // if only doing the opt on buffers, make sure src1 is zero too
   if (!IGC_IS_FLAG_ENABLED(UseHDCTypedReadForAllTextures) && IGC_IS_FLAG_ENABLED(UseHDCTypedReadForAllTypedBuffers)) {
-    if (!src1 || !src1->isZeroValue())
+    if (!src1 || !IGCLLVM::Constant::isNullValue(src1))
       return;
   }
 
@@ -2325,7 +2420,7 @@ std::optional<bool> CustomSafeOptPass::getSignIfIdentityMatrix(ExtractElementIns
         return std::nullopt;
       // we are assuming that the identity matrix does not have mixed values ones
       PositiveSign = !((FpC && FpC->isNegative()) || (IntC && IntC->isNegative()));
-    } else if (!C->getAggregateElement(i)->isZeroValue())
+    } else if (!IGCLLVM::Constant::isNullValue(C->getAggregateElement(i)))
       return std::nullopt;
   }
 
@@ -3681,7 +3776,8 @@ void GenSpecificPattern::visitBitCastInst(BitCastInst &I) {
           InsertElementInst *insertElementInst = cast<InsertElementInst>(bitCastInst->getOperand(0));
 
           if (isa<Constant>(insertElementInst->getOperand(0)) &&
-              cast<Constant>(insertElementInst->getOperand(0))->getAggregateElement((unsigned int)0)->isZeroValue() &&
+              IGCLLVM::Constant::isNullValue(
+                  cast<Constant>(insertElementInst->getOperand(0))->getAggregateElement((unsigned int)0)) &&
               cast<ConstantInt>(insertElementInst->getOperand(2))->getZExtValue() == 1) {
             IRBuilder<> builder(&I);
             Value *vectorValue = UndefValue::get(bitCastInst->getOperand(0)->getType());
@@ -4200,7 +4296,7 @@ Constant *IGCConstProp::ConstantFoldCallInstruction(CallInst *inst) {
     case llvm_ubfe: {
       Constant *C1 = dyn_cast<Constant>(inst->getOperand(1));
       Constant *C2 = dyn_cast<Constant>(inst->getOperand(2));
-      if (C0 && C0->isZeroValue()) {
+      if (C0 && IGCLLVM::Constant::isNullValue(C0)) {
         C = llvm::ConstantInt::get(inst->getType(), 0);
       } else if (C0 && C1 && C2) {
         C = constantFolder.CreateUbfe(C0, C1, C2);
@@ -4209,7 +4305,7 @@ Constant *IGCConstProp::ConstantFoldCallInstruction(CallInst *inst) {
     case llvm_ibfe: {
       Constant *C1 = dyn_cast<Constant>(inst->getOperand(1));
       Constant *C2 = dyn_cast<Constant>(inst->getOperand(2));
-      if (C0 && C0->isZeroValue()) {
+      if (C0 && IGCLLVM::Constant::isNullValue(C0)) {
         C = llvm::ConstantInt::get(inst->getType(), 0);
       } else if (C0 && C1 && C2) {
         C = constantFolder.CreateIbfe(C0, C1, C2);
@@ -4252,7 +4348,7 @@ Constant *IGCConstProp::ConstantFoldCallInstruction(CallInst *inst) {
       Constant *C1 = dyn_cast<Constant>(inst->getOperand(1));
       Constant *C2 = dyn_cast<Constant>(inst->getOperand(2));
       Constant *C3 = dyn_cast<Constant>(inst->getOperand(3));
-      if (C0 && C0->isZeroValue() && C3) {
+      if (C0 && IGCLLVM::Constant::isNullValue(C0) && C3) {
         C = C3;
       } else if (C0 && C1 && C2 && C3) {
         C = constantFolder.CreateBfi(C0, C1, C2, C3);
@@ -5011,7 +5107,7 @@ IGC_INITIALIZE_PASS_BEGIN(IGCIndirectICBPropagaion, "IGCIndirectICBPropagaion", 
 IGC_INITIALIZE_PASS_END(IGCIndirectICBPropagaion, "IGCIndirectICBPropagaion", "IGCIndirectICBPropagaion", false, false)
 
 namespace {
-class NanHandling : public FunctionPass, public llvm::InstVisitor<NanHandling> {
+class NanHandling : public FunctionPass, public IGCLLVM::InstVisitor<NanHandling> {
 public:
   static char ID;
   NanHandling() : FunctionPass(ID) { initializeNanHandlingPass(*PassRegistry::getPassRegistry()); }
@@ -5023,13 +5119,13 @@ public:
 
   virtual llvm::StringRef getPassName() const { return "NAN handling"; }
   virtual bool runOnFunction(llvm::Function &F);
-  void visitBranchInst(llvm::BranchInst &I);
+  void visitCondBrInst(IGCLLVM::CondBrInst &I);
   void loopNanCases(Function &F);
 
 private:
   int longestPathInstCount(llvm::BasicBlock *BB, int &depth);
-  void swapBranch(llvm::Instruction *inst, llvm::BranchInst &BI);
-  SmallVector<llvm::BranchInst *, 10> visitedInst;
+  void swapBranch(llvm::Instruction *inst, IGCLLVM::CondBrInst &BI);
+  SmallVector<IGCLLVM::CondBrInst *, 10> visitedInst;
 };
 } // namespace
 
@@ -5050,9 +5146,9 @@ void NanHandling::loopNanCases(Function &F) {
     FastMathFlags FMF;
     FMF.clear();
     for (Loop *loop : *LI) {
-      BranchInst *br = cast<BranchInst>(loop->getLoopLatch()->getTerminator());
+      IGCLLVM::CondBrInst *br = dyn_cast<IGCLLVM::CondBrInst>(loop->getLoopLatch()->getTerminator());
       BasicBlock *header = loop->getHeader();
-      if (br && br->isConditional() && header) {
+      if (br && header) {
         visitedInst.push_back(br);
         if (FCmpInst *brCmpInst = dyn_cast<FCmpInst>(br->getCondition())) {
           FPMathOperator *FPO = dyn_cast<FPMathOperator>(brCmpInst);
@@ -5095,7 +5191,7 @@ int NanHandling::longestPathInstCount(llvm::BasicBlock *BB, int &depth) {
   return (int)(BB->size()) + sumSuccInstCount;
 }
 
-void NanHandling::swapBranch(llvm::Instruction *inst, llvm::BranchInst &BI) {
+void NanHandling::swapBranch(llvm::Instruction *inst, IGCLLVM::CondBrInst &BI) {
   if (FCmpInst *brCondition = dyn_cast<FCmpInst>(inst)) {
     if (inst->hasOneUse()) {
       brCondition->setPredicate(FCmpInst::getInversePredicate(brCondition->getPredicate()));
@@ -5107,10 +5203,7 @@ void NanHandling::swapBranch(llvm::Instruction *inst, llvm::BranchInst &BI) {
   }
 }
 
-void NanHandling::visitBranchInst(llvm::BranchInst &I) {
-  if (!I.isConditional())
-    return;
-
+void NanHandling::visitCondBrInst(IGCLLVM::CondBrInst &I) {
   // if this branch is part of a loop, it is taken care of already in loopNanCases
   if (std::find(visitedInst.begin(), visitedInst.end(), &I) != visitedInst.end())
     return;
@@ -5531,12 +5624,9 @@ bool FlattenSmallSwitch::processSwitchInst(SwitchInst *SI) {
   BasicBlock *Dest = nullptr;
   {
     const auto *CaseSucc = SI->case_begin()->getCaseSuccessor();
-    auto *BI = dyn_cast<BranchInst>(CaseSucc->getTerminator());
+    auto *BI = dyn_cast<IGCLLVM::UncondBrInst>(CaseSucc->getTerminator());
 
     if (BI == nullptr)
-      return false;
-
-    if (BI->isConditional())
       return false;
 
     // We know the first case jumps to this block.  Now let's
@@ -5546,12 +5636,9 @@ bool FlattenSmallSwitch::processSwitchInst(SwitchInst *SI) {
 
   // Does BB unconditionally branch to MergeBlock?
   auto branchPattern = [](const BasicBlock *BB, const BasicBlock *MergeBlock) {
-    auto *br = dyn_cast<BranchInst>(BB->getTerminator());
+    auto *br = dyn_cast<IGCLLVM::UncondBrInst>(BB->getTerminator());
 
     if (br == nullptr)
-      return false;
-
-    if (br->isConditional())
       return false;
 
     if (br->getSuccessor(0) != MergeBlock)
@@ -5576,7 +5663,7 @@ bool FlattenSmallSwitch::processSwitchInst(SwitchInst *SI) {
     for (auto &I : *BB) {
       auto *inst = &I;
 
-      if (isa<BranchInst>(inst))
+      if (isa<IGCLLVM::UncondBrInst>(inst))
         continue;
 
       // if there is any high-latency instruction in the switch,
@@ -5775,8 +5862,7 @@ void FCmpPaternMatch::visitSelectInst(SelectInst &I) {
 
               SmallVector<Instruction *, 4> matchedBrSelInsts;
               for (auto brOrSelI : iCmpInst->users()) {
-                BranchInst *brInst = dyn_cast<BranchInst>(brOrSelI);
-                if (brInst && brInst->isConditional()) {
+                if (IGCLLVM::CondBrInst *brInst = dyn_cast<IGCLLVM::CondBrInst>(brOrSelI)) {
                   // match
                   matchedBrSelInsts.push_back(brInst);
                   if (swapNodes) {
@@ -5939,10 +6025,16 @@ void SplitIndirectEEtoSel::visitExtractElementInst(llvm::ExtractElementInst &I) 
   auto pat_or = m_Or(m_Value(Val2), m_ConstantInt(ci_add));
   auto pat_shl = m_Shl(m_Value(Val1), m_ConstantInt(ci_mul));
 
+  // false if index is an `or` inst with operands that share active bits.
+  // `or` insts with overlapping active bits are not equivalent to `add` insts
+  // and don't qualify for this optimization.
+  bool opsAreDisjoint = true;
+
   if (match(index, pat_mul) || (match(index, pat_add) && match(Val2, pat_mul))) {
     mul = ci_mul ? ci_mul->getSExtValue() : 1;
   } else if (match(index, pat_shl) || (match(index, pat_or) && match(Val2, pat_shl))) {
     mul = ci_mul ? (1LL << ci_mul->getSExtValue()) : 1LL;
+    opsAreDisjoint = !Val2 || (ci_add && mul > 0 && ci_add->getValue().getActiveBits() <= Log2_64((uint64_t)mul));
   }
   // Instruction::hasPoisonGeneratingFlags() could be used instead
   // after llvm9 support is dropped
@@ -5956,7 +6048,7 @@ void SplitIndirectEEtoSel::visitExtractElementInst(llvm::ExtractElementInst &I) 
   if (Val1) {
     // Transformation could still be profitable,
     // but index and it's multiplier shouldn't be modified
-    if (!hasNoOverflow(index) || (Val2 && !hasNoOverflow(Val2))) {
+    if (!hasNoOverflow(index) || (Val2 && !hasNoOverflow(Val2)) || !opsAreDisjoint) {
       mul = 1;
     } else {
       add = ci_add ? ci_add->getSExtValue() : 0;
@@ -6314,12 +6406,12 @@ void LogicalAndToBranch::convertAndToBranch(Instruction *opAnd, Instruction *con
   bbEnd = bbElse->splitBasicBlock(opAnd, "if.end");
 
   bb->getTerminator()->eraseFromParent();
-  BranchInst *br = BranchInst::Create(bbThen, bbElse, cond0, bb);
-  br->setDebugLoc(splitBefore->getDebugLoc());
+  IGCLLVM::CondBrInst *condBr = IGCLLVM::CondBrInst::Create(cond0, bbThen, bbElse, bb);
+  condBr->setDebugLoc(splitBefore->getDebugLoc());
 
   bbThen->getTerminator()->eraseFromParent();
-  br = BranchInst::Create(bbEnd, bbThen);
-  br->setDebugLoc(opAnd->getDebugLoc());
+  IGCLLVM::UncondBrInst *uncondBr = IGCLLVM::UncondBrInst::Create(bbEnd, bbThen);
+  uncondBr->setDebugLoc(opAnd->getDebugLoc());
 
   PHINode *phi = PHINode::Create(opAnd->getType(), 2, "", IGCLLVM::insertPosition(opAnd));
   phi->addIncoming(cond1, bbThen);
@@ -6651,7 +6743,7 @@ MergeMemFromBranchOpt::MergeMemFromBranchOpt() : FunctionPass(ID), changed(false
 void MergeMemFromBranchOpt::visitTypedWrite(llvm::CallInst *inst) {
   std::vector<CallInst *> callSet;
   // last instruction in the BB
-  if (dyn_cast<BranchInst>(inst->getNextNode())) {
+  if (isa<IGCLLVM::CondBrInst, IGCLLVM::UncondBrInst>(inst->getNextNode())) {
     BasicBlock *BB = inst->getParent();
     // the basicblock with inst has single successor BB
     if (BasicBlock *succBB = BB->getSingleSuccessor()) {
@@ -6689,7 +6781,7 @@ void MergeMemFromBranchOpt::visitTypedWrite(llvm::CallInst *inst) {
       if (!succBB->hasNPredecessors(callSet.size())) {
         mergeBB = BasicBlock::Create(succBB->getContext(), VALUE_NAME(succBB->getName() + ".mergemem"),
                                      succBB->getParent(), succBB);
-        BranchInst::Create(succBB, mergeBB);
+        IGCLLVM::UncondBrInst::Create(succBB, mergeBB);
 
         // Collect the set of blocks being redirected.
         SmallPtrSet<BasicBlock *, 4> redirectedBlocks;
@@ -7162,20 +7254,30 @@ void InsertBranchOpt::ThreeWayLoadSpiltOpt(Function &F) {
 
 void InsertBranchOpt::atomicSplitOpt(Function &F, int mode) {
   enum Mode {
-    Disable = 0x0,           // Disabled IGC\EnableAtomicBranch = 0x0
-    ZeroAdd = BIT(0),        // Enabled IGC\EnableAtomicBranch = 0x1
-    UMax = BIT(1),           // Enabled IGC\EnableAtomicBranch = 0x2
-    UMin = BIT(2),           // Enabled IGC\EnableAtomicBranch = 0x4
-    UntypedUgmLoad = BIT(3), // Enabled IGC\EnableAtomicBranch = 0x8
-    StatelessAtomic = BIT(4) // Enabled IGC\EnableAtomicBranch = 0x10
+    Disable = 0x0,            // Disabled IGC\EnableAtomicBranch = 0x0
+    ZeroAdd = BIT(0),         // Enabled IGC\EnableAtomicBranch = 0x1
+    UMax = BIT(1),            // Enabled IGC\EnableAtomicBranch = 0x2
+    UMin = BIT(2),            // Enabled IGC\EnableAtomicBranch = 0x4
+    UntypedSmplLoad = BIT(3), // Enabled IGC\EnableAtomicBranch = 0x8
+    StatelessAtomic = BIT(4), // Enabled IGC\EnableAtomicBranch = 0x10
+    Atomic64bit = BIT(5),     // Enabled IGC\EnableAtomicBranch = 0x20
+    OrZero = BIT(6),          // Enabled IGC\EnableAtomicBranch = 0x40
+    AndFF = BIT(7),           // Enabled IGC\EnableAtomicBranch = 0x80
+    CheckOr = BIT(8),         // Enabled IGC\EnableAtomicBranch = 0x100
+    CheckAnd = BIT(9)         // Enabled IGC\EnableAtomicBranch = 0x200
   };
 
   // Allow several modes to be applied
   const bool zeroAddMode = ((mode & ZeroAdd) == ZeroAdd);
   const bool umaxMode = ((mode & UMax) == UMax);
   const bool uminMode = ((mode & UMin) == UMin);
-  const bool untypedUgmLoadMode = ((mode & UntypedUgmLoad) == UntypedUgmLoad);
+  const bool untypedSmplLoadMode = ((mode & UntypedSmplLoad) == UntypedSmplLoad);
   const bool statelessMode = ((mode & StatelessAtomic) == StatelessAtomic);
+  const bool atomic64bitMode = ((mode & Atomic64bit) == Atomic64bit);
+  const bool orZeroMode = ((mode & OrZero) == OrZero);
+  const bool andFFMode = ((mode & AndFF) == AndFF);
+  const bool checkOrMode = ((mode & CheckOr) == CheckOr);
+  const bool checkAndMode = ((mode & CheckAnd) == CheckAnd);
 
   auto createReadFromAtomic = [=](IRBuilder<> &builder, Instruction *inst, bool isTyped) {
     Constant *zero = ConstantInt::get(inst->getType(), 0);
@@ -7203,22 +7305,8 @@ void InsertBranchOpt::atomicSplitOpt(Function &F, int mode) {
       Function *pLdIntrinsic;
       Value *resourcePtr = inst->getOperand(0);
 
-      // Generate load.ugm instruction
-      if (untypedUgmLoadMode) {
-        alignment_t alignment = (alignment_t)(inst->getType()->getScalarSizeInBits() / 8);
-
-        types.push_back(IGCLLVM::FixedVectorType::get(builder.getFloatTy(), 4));
-        types.push_back(resourcePtr->getType());
-        pLdIntrinsic =
-            GenISAIntrinsic::getDeclaration(inst->getModule(), GenISAIntrinsic::GenISA_ldrawvector_indexed, types);
-
-        ld_FunctionArgList.push_back(resourcePtr);
-        ld_FunctionArgList.push_back(inst->getOperand(1));
-        ld_FunctionArgList.push_back(builder.getInt32((uint32_t)alignment)); // alignment
-        ld_FunctionArgList.push_back(builder.getInt1(true));                 // volatile
-      }
       // Generate send.smpl ld_lz instruction
-      else {
+      if (untypedSmplLoadMode) {
         types.push_back(IGCLLVM::FixedVectorType::get(builder.getFloatTy(), 4));
         types.push_back(resourcePtr->getType()); // Paired resource
         types.push_back(resourcePtr->getType()); // Resource
@@ -7234,6 +7322,22 @@ void InsertBranchOpt::atomicSplitOpt(Function &F, int mode) {
         ld_FunctionArgList.push_back(zero);        // immediate offset u
         ld_FunctionArgList.push_back(zero);        // immediate offset v
         ld_FunctionArgList.push_back(zero);        // immediate offset w
+      }
+      // Generate load.ugm instruction
+      else {
+        alignment_t alignment = (alignment_t)(inst->getType()->getScalarSizeInBits() / 8);
+
+        Type *eltTy =
+            inst->getType()->isIntegerTy(64) ? cast<Type>(builder.getInt64Ty()) : cast<Type>(builder.getFloatTy());
+        types.push_back(IGCLLVM::FixedVectorType::get(eltTy, 4));
+        types.push_back(resourcePtr->getType());
+        pLdIntrinsic =
+            GenISAIntrinsic::getDeclaration(inst->getModule(), GenISAIntrinsic::GenISA_ldrawvector_indexed, types);
+
+        ld_FunctionArgList.push_back(resourcePtr);
+        ld_FunctionArgList.push_back(inst->getOperand(1));
+        ld_FunctionArgList.push_back(builder.getInt32((uint32_t)alignment)); // alignment
+        ld_FunctionArgList.push_back(builder.getInt1(true));                 // volatile
       }
 
       NewInst = builder.CreateCall(pLdIntrinsic, ld_FunctionArgList);
@@ -7278,11 +7382,39 @@ void InsertBranchOpt::atomicSplitOpt(Function &F, int mode) {
         if (!src || !op)
           continue;
 
-        AtomicOp atomicOp = static_cast<AtomicOp>(op->getZExtValue());
+        // 64-bit atomics are only handled when the dedicated mode is enabled.
+        if (inst->getType()->getScalarSizeInBits() == 64 && !atomic64bitMode)
+          continue;
+
+        // Normalize the 64-bit atomic op-codes to their 32-bit counterparts.
+        // The identity elements and predicates used by this optimization are the
+        // same for the 32- and 64-bit variants, so we can reuse the same logic.
+        auto normalizeAtomicOp = [](AtomicOp atomicOp) {
+          switch (atomicOp) {
+          case AtomicOp::EATOMIC_IADD64:
+            return AtomicOp::EATOMIC_IADD;
+          case AtomicOp::EATOMIC_SUB64:
+            return AtomicOp::EATOMIC_SUB;
+          case AtomicOp::EATOMIC_UMAX64:
+            return AtomicOp::EATOMIC_UMAX;
+          case AtomicOp::EATOMIC_UMIN64:
+            return AtomicOp::EATOMIC_UMIN;
+          case AtomicOp::EATOMIC_OR64:
+            return AtomicOp::EATOMIC_OR;
+          case AtomicOp::EATOMIC_AND64:
+            return AtomicOp::EATOMIC_AND;
+          default:
+            return atomicOp;
+          }
+        };
+
+        AtomicOp atomicOp = normalizeAtomicOp(static_cast<AtomicOp>(op->getZExtValue()));
 
         if ((zeroAddMode && (atomicOp == AtomicOp::EATOMIC_IADD || atomicOp == AtomicOp::EATOMIC_SUB ||
                              atomicOp == AtomicOp::EATOMIC_UMAX)) ||
-            (umaxMode && (atomicOp == AtomicOp::EATOMIC_UMAX)) || (uminMode && (atomicOp == AtomicOp::EATOMIC_UMIN))) {
+            (umaxMode && (atomicOp == AtomicOp::EATOMIC_UMAX)) || (uminMode && (atomicOp == AtomicOp::EATOMIC_UMIN)) ||
+            ((orZeroMode || checkOrMode) && (atomicOp == AtomicOp::EATOMIC_OR)) ||
+            ((andFFMode || checkAndMode) && (atomicOp == AtomicOp::EATOMIC_AND))) {
           atomicSplit.push_back(std::make_pair(inst, atomicOp));
         }
       }
@@ -7307,13 +7439,15 @@ void InsertBranchOpt::atomicSplitOpt(Function &F, int mode) {
     bool isModified = false;
 
     if ((zeroAddMode && (op == AtomicOp::EATOMIC_IADD || op == AtomicOp::EATOMIC_SUB)) ||
-        (!umaxMode && (op == AtomicOp::EATOMIC_UMAX))) {
+        (!umaxMode && (op == AtomicOp::EATOMIC_UMAX)) || (!checkOrMode && orZeroMode && (op == AtomicOp::EATOMIC_OR)) ||
+        (!checkAndMode && andFFMode && (op == AtomicOp::EATOMIC_AND))) {
       // Create an if-then-else structure.
-      // if (cond != 0)
-      //    use the original atomic add/sub/umax inst
+      // if (src != identity)  identity = 0 for add/sub/umax/or, all-ones for and
+      //    use the original atomic inst
       // else
-      //    use typedread or load
-      Instruction *condInst = cast<Instruction>(builder.CreateICmp(ICmpInst::ICMP_NE, src, builder.getInt32(0)));
+      //    use typedread or load (the atomic is a no-op)
+      Value *identity = ConstantInt::get(src->getType(), (op == AtomicOp::EATOMIC_AND) ? -1 : 0);
+      Instruction *condInst = cast<Instruction>(builder.CreateICmp(ICmpInst::ICMP_NE, src, identity));
       splitBBAndName(condInst, inst, &ThenTerm, &ElseTerm, MergeBlock);
       IGCLLVM::moveBefore(inst, ThenTerm);
 
@@ -7321,14 +7455,27 @@ void InsertBranchOpt::atomicSplitOpt(Function &F, int mode) {
       readI = createReadFromAtomic(builder, inst, isTyped);
 
       isModified = true;
-    } else if ((umaxMode && (op == AtomicOp::EATOMIC_UMAX)) || (uminMode && (op == AtomicOp::EATOMIC_UMIN))) {
+    } else if ((umaxMode && (op == AtomicOp::EATOMIC_UMAX)) || (uminMode && (op == AtomicOp::EATOMIC_UMIN)) ||
+               (checkOrMode && (op == AtomicOp::EATOMIC_OR)) || (checkAndMode && (op == AtomicOp::EATOMIC_AND))) {
       // Create an if-then structure.
       // x = typedread or load
-      // if (src > (for UMax) or < (for Umin) x)
-      //    use the original atomic umax/umin inst src
+      // if (the atomic would change memory)
+      //    use the original atomic inst
       readI = createReadFromAtomic(builder, inst, isTyped);
-      CmpInst::Predicate predicate = (op == AtomicOp::EATOMIC_UMAX) ? ICmpInst::ICMP_UGT : ICmpInst::ICMP_ULT;
-      Instruction *condInst = cast<Instruction>(builder.CreateICmp(predicate, src, readI));
+      Instruction *condInst = nullptr;
+      if (op == AtomicOp::EATOMIC_UMAX || op == AtomicOp::EATOMIC_UMIN) {
+        // if (src > (for UMax) or < (for Umin) x)
+        CmpInst::Predicate predicate = (op == AtomicOp::EATOMIC_UMAX) ? ICmpInst::ICMP_UGT : ICmpInst::ICMP_ULT;
+        condInst = cast<Instruction>(builder.CreateICmp(predicate, src, readI));
+      } else if (op == AtomicOp::EATOMIC_OR) {
+        // if ((x | src) != x), i.e. the OR would set new bits
+        Value *newVal = builder.CreateOr(readI, src);
+        condInst = cast<Instruction>(builder.CreateICmp(ICmpInst::ICMP_NE, newVal, readI));
+      } else {
+        // AND: if ((x & src) != x), i.e. the AND would clear bits
+        Value *newVal = builder.CreateAnd(readI, src);
+        condInst = cast<Instruction>(builder.CreateICmp(ICmpInst::ICMP_NE, newVal, readI));
+      }
 
       splitBBAndName(condInst, inst, &ThenTerm, nullptr, MergeBlock);
       IGCLLVM::moveBefore(inst, ThenTerm);

@@ -13,12 +13,14 @@ SPDX-License-Identifier: MIT
 #include "common/LLVMUtils.h"
 #include "Compiler/CISACodeGen/LowerGEPForPrivMem.hpp"
 #include "Compiler/CodeGenPublic.h"
+#include "GenISAIntrinsics/GenIntrinsicInst.h"
 #include "Compiler/IGCPassSupport.h"
 #include "Compiler/CISACodeGen/ShaderCodeGen.hpp"
 #include "common/LLVMWarningsPush.hpp"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
 #include <llvm/IR/Function.h>
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/Support/SaveAndRestore.h>
 #include <llvm/Transforms/Utils/Local.h>
 #include "common/LLVMWarningsPop.hpp"
 #include "llvmWrapper/IR/DerivedTypes.h"
@@ -162,6 +164,7 @@ bool LowerGEPForPrivMem::runOnFunction(llvm::Function &F) {
 
   m_allocasToPrivMem.clear();
   m_promotedLiveranges.clear();
+
   visit(F);
 
   std::vector<llvm::AllocaInst *> &allocaToHande = m_allocasToPrivMem;
@@ -182,9 +185,14 @@ bool LowerGEPForPrivMem::runOnFunction(llvm::Function &F) {
 
 void TransposeHelper::EraseDeadCode() {
   for (auto pInst = m_toBeRemovedGEP.rbegin(); pInst != m_toBeRemovedGEP.rend(); ++pInst) {
-    [[maybe_unused]] Instruction *I = *pInst;
-    IGC_ASSERT_MESSAGE(I->use_empty(), "Instruction still has usage");
-    (*pInst)->eraseFromParent();
+    Instruction *I = *pInst;
+    if (!I->use_empty()) {
+      // A surviving user (typically a PHI node left after an incomplete hoist)
+      // means the GEP could not be fully eliminated.  Skip it rather than
+      // crashing; the alloca stays in AoS which is safe.
+      continue;
+    }
+    I->eraseFromParent();
   }
 }
 
@@ -278,7 +286,7 @@ StatusPrivArr2Reg LowerGEPForPrivMem::CheckIfAllocaPromotable(llvm::AllocaInst *
   allowedAllocaSizeInBytes = allowedAllocaSizeInBytes * m_ctx->platform.getGRFSize() / 32;
 
   // scale alloc size based on the number of GRFs we have
-  float grfRatio = m_ctx->getNumGRFPerThread() / 128.0f;
+  float grfRatio = m_ctx->getNumGRFPerThread(true, m_pFunc) / 128.0f;
   allowedAllocaSizeInBytes = (uint32_t)(allowedAllocaSizeInBytes * grfRatio);
 
     if (m_ctx->type == ShaderType::OPENCL_SHADER) {
@@ -376,6 +384,60 @@ SOALayoutChecker::SOALayoutChecker(AllocaInst &allocaToCheck, bool isOCL,
   }
 }
 
+// Return true if any load/store reachable from the alloca accesses a vector
+// whose total size exceeds the SOA partition. The new-algo lowering
+// (TransposePrivMem) assumes every access fits within one partition and emits a
+// single contiguous load/store; it cannot stride a vector across partitions.
+// Such accesses must be left to the legacy TransposeHelperPrivateMem path, which
+// scalarizes them into per-partition element loads/stores.
+static bool hasMultiPartitionVectorAccess(llvm::AllocaInst &AI, uint32_t partitionBytes, const llvm::DataLayout &DL) {
+  llvm::SmallPtrSet<llvm::Value *, 32> Seen;
+  llvm::SmallVector<llvm::Value *, 32> Worklist;
+  Worklist.push_back(&AI);
+  while (!Worklist.empty()) {
+    llvm::Value *V = Worklist.pop_back_val();
+    if (!Seen.insert(V).second) {
+      continue;
+    }
+    for (llvm::User *U : V->users()) {
+      if (auto *II = llvm::dyn_cast<llvm::IntrinsicInst>(U)) {
+        llvm::Intrinsic::ID IID = II->getIntrinsicID();
+        if (IID == llvm::Intrinsic::lifetime_start || IID == llvm::Intrinsic::lifetime_end || isDebugInst(II))
+          continue;
+      }
+
+      if (auto *PLI = llvm::dyn_cast<llvm::PredicatedLoadIntrinsic>(U)) {
+        llvm::Type *AccTy = PLI->getType();
+        if (AccTy->isVectorTy() && DL.getTypeStoreSize(AccTy) > partitionBytes)
+          return true;
+        continue;
+      }
+      if (llvm::isa<llvm::CallBase>(*U)) {
+        // Be conservative about function calls. Assume they may read/write the entire alloca.
+        return true;
+      }
+
+      if (llvm::isa<llvm::GetElementPtrInst, llvm::BitCastInst, llvm::AddrSpaceCastInst, llvm::PHINode,
+                    llvm::SelectInst>(U)) {
+        Worklist.push_back(U);
+        continue;
+      }
+
+      llvm::Type *AccTy = nullptr;
+      if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(U)) {
+        AccTy = LI->getType();
+      } else if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(U)) {
+        if (SI->getPointerOperand() == V) {
+          AccTy = SI->getValueOperand()->getType();
+        }
+      }
+      if (AccTy && AccTy->isVectorTy() && DL.getTypeStoreSize(AccTy) > partitionBytes)
+        return true;
+    }
+  }
+  return false;
+}
+
 SOALayoutInfo SOALayoutChecker::getOrGatherInfo() {
   if (pInfo)
     return *pInfo;
@@ -421,12 +483,26 @@ SOALayoutInfo SOALayoutChecker::getOrGatherInfo() {
       }
     }
 
-    // Skip for non-power-of-2 partition size
-    if (isPowerOf2_32(SOAPartitionBytes)) {
+    // A vector access wider than one partition cannot be lowered by the new-algo
+    // (contiguous) TransposePrivMem; only the legacy scalarizing path can stride
+    // it across partitions. Structs are excluded (their access pattern is checked
+    // by checkStruct above).
+    bool WideVecAccess = (STy == nullptr) && hasMultiPartitionVectorAccess(allocaRef, SOAPartitionBytes, *pDL);
+
+    // Skip for non-power-of-2 partition size, or for wide-vector accesses that
+    // only the legacy path can lower.
+    if (isPowerOf2_32(SOAPartitionBytes) && !WideVecAccess) {
+      pInfo->useNewAlgoTranspose = true;
       pInfo->canUseSOALayout = checkUsers(allocaRef);
       pInfo->SOAPartitionBytes = SOAPartitionBytes;
+      return *pInfo;
     }
-    return *pInfo;
+    if (IGC_IS_FLAG_DISABLED(EnableSOAFallbackToOldAlgorithm)) {
+      return *pInfo;
+    }
+    // Non-power-of-2 element (e.g. <3 x float>) or a wide-vector access: fall
+    // through to the legacy scalar/vector path below which handles these via
+    // checkUsers directly.
   }
   // only handle case with a simple base type
   if (!(pInfo->baseType->getScalarType()->isFloatingPointTy() || pInfo->baseType->getScalarType()->isIntegerTy()))
@@ -518,9 +594,10 @@ bool SOALayoutChecker::checkUsers(Instruction &I) {
     return false;
   }
 
-  parentLevelInst = &I;
+  llvm::SaveAndRestore<Instruction *> RestoreParentOnExit(parentLevelInst, &I);
   for (Value::user_iterator userIt = I.user_begin(), userE = I.user_end(); userIt != userE; ++userIt) {
     auto &userInst = *cast<Instruction>(*userIt);
+    parentLevelInst = &I;
     if (!visit(userInst))
       return false;
   }
@@ -544,9 +621,18 @@ bool SOALayoutChecker::visitBitCastInst(BitCastInst &BI) {
     IGC_ASSERT(bSTy || sSTy);
     if (bSTy && sSTy && (bSTy == sSTy || bSTy->isLayoutIdentical(sSTy))) {
       return checkUsers(BI);
-    } else {
-      return false;
     }
+    // Idiom: bitcast T* → struct* (or vice versa) where the
+    // struct pointer is immediately addrspacecast to generic AS for routing.
+    // All users must be addrspacecasts; the effective access is still
+    // element-granular, so SoA scratch promotion can proceed.
+    // NOT safe for GRF promotion (DefaultLowerGEPStrategy): HandleAllocaSources
+    // cannot transform addrspacecast/SELECT user chains.
+    if (MismatchDetectionStrategy != DefaultLowerGEPStrategy) {
+      if (llvm::all_of(BI.users(), [](User *U) { return isa<AddrSpaceCastInst>(U); }))
+        return checkUsers(BI);
+    }
+    return false;
   }
 
   if (baseT->getScalarSizeInBits() != 0 && baseT->getScalarSizeInBits() == sourceType->getScalarSizeInBits()) {
@@ -567,8 +653,60 @@ bool SOALayoutChecker::visitBitCastInst(BitCastInst &BI) {
     return checkUsers(BI);
   }
 
+  // SYCL/OpenCL generic-pointer idiom:
+  //   (a) bitcast T* → i8*  (private ptr → byte ptr)
+  //   (b) bitcast i8* → T*  (byte ptr → element ptr, inverse of the above)
+  // Both appear when DPC++ converts private pointers to generic (addrspace 4) and back,
+  // or as lifetime marker targets (lifetime.start/end use i8*).
+  // Delegate to checkUsers — individual visitors reject unsafe byte-granular accesses
+  // (visitLoadInst/visitStoreInst call MismatchDetected which guards element-size checks).
+  if (baseT->isIntegerTy(8)) {
+    // Case (a): T* → i8* — walk through; checkUsers rejects any non-benign user.
+    return checkUsers(BI);
+  }
+  if (sourceType->isIntegerTy(8)) {
+    // Case (b): i8* → T* — the tail of the generic-pointer round-trip.
+    return checkUsers(BI);
+  }
+
   // Not a candidate.
   return false;
+}
+
+bool SOALayoutChecker::visitAddrSpaceCastInst(AddrSpaceCastInst &ASC) { return checkUsers(ASC); }
+
+/// Is \p GEP a byte-offset ("ptradd") GEP, i.e. `getelementptr i8, ptr %p, i64 <n>`?
+/// InstCombine canonicalizes constant-index GEPs into this form, whose source and result
+/// element type are always i8 - so it says nothing about the type actually accessed.
+static bool isByteOffsetGEP(const GetElementPtrInst &GEP) {
+  return GEP.getSourceElementType()->isIntegerTy(8) && GEP.getNumIndices() == 1;
+}
+
+/// Does \p GEP address whole elements rather than a byte inside one?
+/// handleGEPInst already converts such an offset back to an element index
+/// (offset / m_idxUnitBytes), so only the pre-checks rejected these GEPs. The division
+/// must be exact: a sub-element offset is a genuine byte access no transpose helper can
+/// express, and a non-constant one cannot be proven aligned here.
+static bool isElementAlignedByteGEP(const GetElementPtrInst &GEP, uint64_t indexUnitBytes) {
+  if (indexUnitBytes == 0 || !isByteOffsetGEP(GEP))
+    return false;
+  auto *Offset = dyn_cast<ConstantInt>(GEP.getOperand(1));
+  // handleGEPInst zero-extends before dividing, so a negative offset would not round-trip.
+  if (!Offset || Offset->isNegative())
+    return false;
+  return (Offset->getZExtValue() % indexUnitBytes) == 0;
+}
+
+uint64_t SOALayoutChecker::getByteGEPIndexUnit() const {
+  if (!pInfo || !pInfo->baseType)
+    return 0;
+  // Mirror the helper's m_idxUnitBytes: TransposeHelperPromote indexes the promoted
+  // vector in lanes of the base scalar, TransposeHelperPrivateMem strides scratch by the
+  // whole baseType. Over-estimating only rejects more, which covers both the byte-precise
+  // new algo and a baseType that getOrGatherInfo scalarizes after the walk.
+  Type *unitTy =
+      (MismatchDetectionStrategy == DefaultLowerGEPStrategy) ? pInfo->baseType->getScalarType() : pInfo->baseType;
+  return pDL->getTypeAllocSize(unitTy);
 }
 
 bool SOALayoutChecker::visitGetElementPtrInst(GetElementPtrInst &GEP) {
@@ -578,10 +716,17 @@ bool SOALayoutChecker::visitGetElementPtrInst(GetElementPtrInst &GEP) {
 
   if (pInfo && pInfo->baseType) {
     Type *gepSrcEltTy = GEP.getSourceElementType();
+    if (MismatchDetectionStrategy == DefaultLowerGEPStrategy)
+      while (gepSrcEltTy->isArrayTy())
+        gepSrcEltTy = gepSrcEltTy->getArrayElementType();
     if (!gepSrcEltTy->isAggregateType() && !gepSrcEltTy->isVectorTy()) {
       uint64_t gepBits = pDL->getTypeStoreSizeInBits(gepSrcEltTy);
       uint64_t baseBits = pDL->getTypeStoreSizeInBits(pInfo->baseType->getScalarType());
-      if (gepBits != 0 && baseBits != 0 && gepBits != baseBits) {
+      // An element-aligned byte offset is element-granular despite the i8 source type;
+      // keep walking and let MismatchDetected validate the accesses reached through it.
+      // Tests GEP's own source type, not the unwrapped one, so [4 x i8] still rejects.
+      if (gepBits != 0 && baseBits != 0 && gepBits != baseBits &&
+          !isElementAlignedByteGEP(GEP, getByteGEPIndexUnit())) {
         return false;
       }
     }
@@ -593,6 +738,25 @@ bool SOALayoutChecker::visitGetElementPtrInst(GetElementPtrInst &GEP) {
 bool SOALayoutChecker::visitIntrinsicInst(IntrinsicInst &II) {
   llvm::Intrinsic::ID IID = II.getIntrinsicID();
   return IID == llvm::Intrinsic::lifetime_start || IID == llvm::Intrinsic::lifetime_end;
+}
+
+bool SOALayoutChecker::visitCallInst(CallInst &CI) {
+  // GenISA intrinsics have getIntrinsicID()==not_intrinsic, so InstVisitor routes them here, not to
+  // visitIntrinsicInst.
+  // A scalar GenISA_PredicatedLoad (produced by the no-scratch SELECT-of-alloca-
+  // pointer pre-pass) can be SoA-promoted like a plain scalar load: the transpose
+  // only rewrites the pointer operand, preserving the predicate so the masked,
+  // non-faulting access semantics are kept.
+  if (auto *PLI = dyn_cast<PredicatedLoadIntrinsic>(&CI)) {
+    if (PLI->getType()->isVectorTy() || !PLI->isSimple()) {
+      return false;
+    }
+    isVectorSOA = false;
+    pInfo->allUsesAreVector = false;
+    return !MismatchDetected(*PLI);
+  }
+
+  return false;
 }
 
 /// Can the user type be treated as a same-footprint reinterpretation of
@@ -609,6 +773,21 @@ static bool isSameSizeReinterpret(Type *UserTy, unsigned allocaStoreBits, const 
       return false;
   }
   return (unsigned)DL.getTypeStoreSizeInBits(UserTy) == allocaStoreBits;
+}
+
+// Also accepts a vector covering several whole lanes of laneStoreBits, which
+// loadEltsFromVecAlloca / storeEltsToVecAlloca split across K = size / lane lanes.
+static bool isWholeLaneReinterpret(Type *UserTy, unsigned laneStoreBits, const DataLayout &DL) {
+  if (isSameSizeReinterpret(UserTy, laneStoreBits, DL))
+    return true;
+
+  if (laneStoreBits == 0)
+    return false;
+  auto *FVTy = dyn_cast<IGCLLVM::FixedVectorType>(UserTy);
+  if (!FVTy || FVTy->getElementType()->isPointerTy())
+    return false;
+  unsigned userStoreBits = (unsigned)DL.getTypeStoreSizeInBits(UserTy);
+  return userStoreBits != 0 && (userStoreBits % laneStoreBits) == 0;
 }
 
 // Detect size mismatches between an alloca's element and the corresponding load/store element (directly or via a GEP).
@@ -645,6 +824,7 @@ bool IGC::SOALayoutChecker::MismatchDetected(Instruction &I) {
   // (e.g., [4 x float]) is accessed through i8 GEPs, which the promotion transformation cannot handle correctly.
   if (!allocaEltTy->isIntegerTy(8)) {
     if (allocaEltBitsSize > 8) {
+      const uint64_t indexUnitBytes = getByteGEPIndexUnit();
       SmallVector<Value *, 16> worklist;
       SmallPtrSet<Value *, 16> visited;
 
@@ -665,7 +845,10 @@ bool IGC::SOALayoutChecker::MismatchDetected(Instruction &I) {
             // this is a memcpy-like pattern that we cannot handle correctly.
             // The transformation would incorrectly treat each byte as a separate
             // element rather than accumulating bytes into complete lanes.
-            if (gepSrcTy->isIntegerTy(8)) {
+            // Exempt the ptradd form: an exact multiple of the index unit still addresses
+            // whole elements, and handleGEPInst converts it back. The type of the access
+            // reached through it is validated below.
+            if (gepSrcTy->isIntegerTy(8) && !isElementAlignedByteGEP(*GEP, indexUnitBytes)) {
               pInfo->canUseSOALayout = false;
               return true;
             }
@@ -691,7 +874,7 @@ bool IGC::SOALayoutChecker::MismatchDetected(Instruction &I) {
   // a mismatch and leave them untouched.
   for (User *U : allocaRef.users()) {
     if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
-      auto gepBitsSize = pDL->getTypeStoreSizeInBits(GEP->getSourceElementType());
+      auto gepBitsSize = pDL->getTypeStoreSizeInBits(extractArrayOrVecEleType(GEP->getSourceElementType()));
       if (allocaEltBitsSize != gepBitsSize && GEP->getNumOperands() > 1 && !isa<ConstantInt>(GEP->getOperand(1))) {
         pInfo->canUseSOALayout = false;
         return true;
@@ -704,6 +887,8 @@ bool IGC::SOALayoutChecker::MismatchDetected(Instruction &I) {
     pUserTy = storeInst->getValueOperand()->getType();
   else if (auto *loadInst = dyn_cast<LoadInst>(&I))
     pUserTy = loadInst->getType();
+  else if (auto *predLoad = dyn_cast<PredicatedLoadIntrinsic>(&I))
+    pUserTy = predLoad->getType();
   else
     return false;
 
@@ -717,11 +902,18 @@ bool IGC::SOALayoutChecker::MismatchDetected(Instruction &I) {
 
   auto vecTySize = pUserTy->getScalarSizeInBits();
 
+  auto *pgep = dyn_cast<GetElementPtrInst>(parentLevelInst);
+  // A byte-offset GEP's result element type is always i8, so it must not be compared
+  // against the access type. Its offset is already proven element-aligned; fall through
+  // to the access-vs-alloca-element check, which rejects a genuine byte access.
+  if (pgep && isByteOffsetGEP(*pgep))
+    pgep = nullptr;
+
   // if it's a GEP, we're actually interested in it's element type
-  if (auto *pgep = dyn_cast<GetElementPtrInst>(parentLevelInst)) {
+  if (pgep) {
     auto pgepTySize = pgep->getResultElementType()->getScalarSizeInBits();
     if (pgepTySize != vecTySize) {
-      // Allow reinterpretation when total store sizes match, but only for the
+      // Allow reinterpretation when access covers whole GEP elements, but only for the
       // LowerGEP register-promotion path whose lowering (loadEltsFromVecAlloca /
       // storeEltsToVecAlloca) handles cross-type bitcasts.  The legacy
       // TransposeHelperPrivateMem used by PrivateMemoryResolution asserts that
@@ -729,7 +921,7 @@ bool IGC::SOALayoutChecker::MismatchDetected(Instruction &I) {
       bool allowed = false;
       if (MismatchDetectionStrategy == DefaultLowerGEPStrategy) {
         unsigned pgepStoreBits = (unsigned)pDL->getTypeStoreSizeInBits(pgep->getResultElementType());
-        allowed = isSameSizeReinterpret(pUserTy, pgepStoreBits, *pDL);
+        allowed = isWholeLaneReinterpret(pUserTy, pgepStoreBits, *pDL);
       }
       if (!allowed) {
         pInfo->canUseSOALayout = false;
@@ -777,13 +969,15 @@ bool SOALayoutChecker::visitStoreInst(StoreInst &SI) {
   if (!SI.isSimple())
     return false;
   llvm::Value *pValueOp = SI.getValueOperand();
+
+  // If the value we came from is what gets written instead, the alloca pointer
+  // escapes into memory and cannot be promoted.
+  if (SI.getPointerOperand() != parentLevelInst || pValueOp == parentLevelInst)
+    return false;
+
   bool isVectorStore = pValueOp->getType()->isVectorTy();
   isVectorSOA &= isVectorStore;
   pInfo->allUsesAreVector &= isVectorStore;
-  if (pValueOp == parentLevelInst) {
-    // GEP instruction is the stored value of the StoreInst (unsupported case)
-    return false;
-  }
 
   if (MismatchDetected(SI))
     return false;
@@ -864,7 +1058,6 @@ void LowerGEPForPrivMem::visitAllocaInst(AllocaInst &I) {
   StatusPrivArr2Reg status = CheckIfAllocaPromotable(&I);
   if (status != StatusPrivArr2Reg::OK) {
     MarkNotPromtedAllocas(I, status);
-    // alloca size extends remain per-lane-reg space
     return;
   }
   m_allocasToPrivMem.push_back(&I);
@@ -883,14 +1076,25 @@ void TransposeHelper::HandleAllocaSources(Instruction *v, Value *idx) {
     } else if (BitCastInst *bitcast = dyn_cast<BitCastInst>(instruction)) {
       m_toBeRemovedGEP.push_back(bitcast);
       HandleAllocaSources(bitcast, idx);
+    } else if (AddrSpaceCastInst *asc = dyn_cast<AddrSpaceCastInst>(instruction)) {
+      m_toBeRemovedGEP.push_back(asc);
+      HandleAllocaSources(asc, idx);
     } else if (StoreInst *pStore = llvm::dyn_cast<StoreInst>(instruction)) {
       handleStoreInst(pStore, idx);
     } else if (LoadInst *pLoad = llvm::dyn_cast<LoadInst>(instruction)) {
       handleLoadInst(pLoad, idx);
+    } else if (PredicatedLoadIntrinsic *pPredLoad = dyn_cast<PredicatedLoadIntrinsic>(instruction)) {
+      handlePredicatedLoadInst(pPredLoad, idx);
     } else if (IntrinsicInst *inst = dyn_cast<IntrinsicInst>(instruction)) {
       handleLifetimeMark(inst);
     }
   }
+}
+
+void TransposeHelper::handlePredicatedLoadInst(PredicatedLoadIntrinsic *, Value *) {
+  // Predicated loads only arise on the no-scratch SELECT-of-alloca-pointer path,
+  // which uses the new-algo TransposePrivMem helper (which overrides this).
+  IGC_ASSERT_MESSAGE(0, "predicated load unsupported by this transpose helper");
 }
 
 class TransposeHelperPromote : public TransposeHelper {
@@ -909,6 +1113,11 @@ public:
     llvm::Type *AllocTy = pAI->getAllocatedType();
     llvm::Type *LaneTy = AllocTy->isVectorTy() ? cast<IGCLLVM::FixedVectorType>(AllocTy)->getElementType() : AllocTy;
     m_promotedLaneBytes = (uint32_t)DL.getTypeAllocSize(LaneTy);
+    // The scalarized index counts promoted lanes, so that is the unit a byte offset
+    // divides by. State it instead of letting handleGEPInst infer it from the byte
+    // GEP's pointer operand: that inference only recognizes an alloca, global, load
+    // or store base and silently yields 1 behind a preceding GEP, select or phi.
+    m_idxUnitBytes = m_promotedLaneBytes;
   }
 };
 
@@ -1028,15 +1237,16 @@ void TransposeHelper::handleGEPInst(llvm::GetElementPtrInst *pGEP, llvm::Value *
   // If the GEP is on i8, its index is a byte offset and must be converted to an element index of the underlying base
   // type.
   if (pGEP->getSourceElementType()->isIntegerTy(8)) {
-    // Get the non-scalar/aggregate GEP source element type.
-    Type *baseAggregateTy = getFirstNonScalarSourceElementType(*pGEP);
-    // Find the scalar element type at the bottom of the aggregate.
-    Type *elementTy = baseAggregateTy;
-    while (elementTy->isStructTy() || elementTy->isArrayTy() || elementTy->isVectorTy()) {
-      elementTy = getArrSizeAndEltType(elementTy).second;
+    uint32_t elementBytes = m_idxUnitBytes;
+    // if elementBytes is 0, it means that scalarized index counts innermost scalas
+    if (elementBytes == 0) {
+      Type *elementTy = getFirstNonScalarSourceElementType(*pGEP);
+      while (elementTy->isStructTy() || elementTy->isArrayTy() || elementTy->isVectorTy()) {
+        elementTy = getArrSizeAndEltType(elementTy).second;
+      }
+      elementTy = elementTy->getScalarType();
+      elementBytes = (uint32_t)m_DL.getTypeAllocSize(elementTy);
     }
-    elementTy = elementTy->getScalarType();
-    uint32_t elementBytes = (uint32_t)m_DL.getTypeAllocSize(elementTy);
 
     // The 1st operand is the byte offset, convert bytes to element count.
     Value *byteIndex = IRB.CreateZExtOrTrunc(pGEP->getOperand(1), IRB.getInt32Ty());

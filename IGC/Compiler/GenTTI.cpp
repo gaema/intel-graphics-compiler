@@ -25,8 +25,10 @@ SPDX-License-Identifier: MIT
 #include "common/LLVMWarningsPop.hpp"
 
 #include "llvmWrapper/Transforms/Utils/LoopUtils.h"
+#include "llvmWrapper/IR/BasicBlock.h"
 
 #include <algorithm>
+#include "llvmWrapper/IR/Instructions.h"
 
 using namespace llvm;
 using namespace IGC;
@@ -43,7 +45,7 @@ bool GenIntrinsicsTTIImpl::isLoweredToCall(const Function *F) const {
 
 // CFG simplification may produce illegal integer types while simplifying switch
 // instructions. Set this to false unless IGC legalization can fix them.
-bool GenIntrinsicsTTIImpl::shouldBuildLookupTables() { return false; }
+bool GenIntrinsicsTTIImpl::shouldBuildLookupTables() const { return false; }
 
 bool GenIntrinsicsTTIImpl::enablePromoteLoopUnrollwithAlloca() const {
   const IGC::TriboolFlag RK_PromoteLoopUnrollwithAlloca =
@@ -70,7 +72,8 @@ void *GenIntrinsicsTTIImpl::getAdjustedAnalysisPointer(const void *ID) {
 }
 
 bool isSendMessage(const llvm::GenIntrinsicInst *inst) {
-  if (isa<SamplerLoadIntrinsic, SampleIntrinsic, LdRawIntrinsic, InfoIntrinsic, SamplerGatherIntrinsic>(inst)) {
+  if (isa<SamplerLoadIntrinsic, SampleIntrinsic, LdRawIntrinsic, InfoIntrinsic, SamplerGatherIntrinsic,
+          AtomicRawIntrinsic>(inst)) {
     return true;
   }
 
@@ -103,9 +106,9 @@ unsigned countTotalInstructions(const Function *F, bool CheckSendMsg = true) {
   return EstimatedInstCnt;
 }
 
-unsigned GenIntrinsicsTTIImpl::getFlatAddressSpace() { return ADDRESS_SPACE_PRIVATE; }
+unsigned GenIntrinsicsTTIImpl::getFlatAddressSpace() const { return ADDRESS_SPACE_PRIVATE; }
 
-bool GenIntrinsicsTTIImpl::isGEPLoopConstDerived(GetElementPtrInst *GEP, const Loop *L, ScalarEvolution &SE) {
+bool GenIntrinsicsTTIImpl::isGEPLoopConstDerived(GetElementPtrInst *GEP, const Loop *L, ScalarEvolution &SE) const {
   if (!GEP)
     return false;
 
@@ -154,6 +157,9 @@ bool GenIntrinsicsTTIImpl::isGEPLoopConstDerived(GetElementPtrInst *GEP, const L
 #if LLVM_VERSION_MAJOR > 16
       case scVScale:
 #endif
+#if LLVM_VERSION_MAJOR >= 23
+      case scPtrToAddr:
+#endif
         return true;
 
       case scAddRecExpr: {
@@ -186,8 +192,28 @@ static TargetTransformInfo createTargetTransformInfo(const GenIntrinsicsTTIImpl 
   return IGCLLVM::TargetTransformInfo<GenIntrinsicsTTIImpl>(TTIImpl);
 }
 
+// Counts select-like (two-way) PHIs, stopping once the threshold is reached. ScalarEvolution models these as selects
+// and recurses once per chained PHI, so their number bounds how deep a single SCEV query can go. Counted function-wide,
+// since such chains are not confined to one loop.
+static bool hasLongSelectLikePHIChain(const Function *F, unsigned Threshold) {
+  unsigned Count = 0;
+  for (const BasicBlock &BB : *F) {
+    // Match the shape ScalarEvolution looks for (two-way join block).
+    if (!BB.hasNPredecessors(2))
+      continue;
+    for (const PHINode &PN : BB.phis()) {
+      // SCEV only walks values it can model, so only those can extend a chain.
+      if (PN.getNumIncomingValues() != 2 || !PN.getType()->isIntOrPtrTy())
+        continue;
+      if (++Count >= Threshold)
+        return true;
+    }
+  }
+  return false;
+}
+
 void GenIntrinsicsTTIImpl::getUnrollingPreferences(Loop *L, ScalarEvolution &SE, TTI::UnrollingPreferences &UP,
-                                                   OptimizationRemarkEmitter *ORE) {
+                                                   OptimizationRemarkEmitter *ORE) const {
   bool IsJointMatrixApplyLoop = false;
   for (auto BB : L->blocks()) {
     for (auto &I : *BB) {
@@ -199,6 +225,13 @@ void GenIntrinsicsTTIImpl::getUnrollingPreferences(Loop *L, ScalarEvolution &SE,
     if (IsJointMatrixApplyLoop) {
       break;
     }
+  }
+
+  // Do not analyzeLoopUnrollCost() for long select-like PHI chains. The analysis is implemented in LLVM and recurses
+  // once per PHI in the chain. The recursion is unbounded, so otherwise can hit caller-thread stack limits.
+  const unsigned SelectPHIThreshold = IGC_GET_FLAG_VALUE(SetSelectPHICountThresholdForUnrollAnalysis);
+  if (SelectPHIThreshold != 0 && hasLongSelectLikePHIChain(L->getHeader()->getParent(), SelectPHIThreshold)) {
+    UP.MaxIterationsCountToAnalyze = 0;
   }
 
   unsigned LoopUnrollThreshold = ctx->m_DriverInfo.GetLoopUnrollThreshold();
@@ -280,8 +313,8 @@ void GenIntrinsicsTTIImpl::getUnrollingPreferences(Loop *L, ScalarEvolution &SE,
   }
 
   unsigned totalInstCountInShader = countTotalInstructions(L->getBlocks()[0]->getParent());
-  uint32_t registerPressureEst =
-      (uint32_t)(IGC_GET_FLAG_VALUE(SetRegisterPressureThresholdForLoopUnroll) * (ctx->getNumGRFPerThread() / 128.0));
+  uint32_t registerPressureEst = (uint32_t)(IGC_GET_FLAG_VALUE(SetRegisterPressureThresholdForLoopUnroll) *
+                                            (ctx->getNumGRFPerThread(true, L->getHeader()->getParent()) / 128.0));
   bool lowPressure = (this->ctx->m_tempCount < registerPressureEst) && (totalInstCountInShader < LoopUnrollThreshold);
   // For OCL shaders, do a two-step loop unrolling. The first
   // unrolling is simple and full, and the second runs after
@@ -294,6 +327,7 @@ void GenIntrinsicsTTIImpl::getUnrollingPreferences(Loop *L, ScalarEvolution &SE,
   } else // for high registry pressure shaders, limit the unrolling to small loops and only fully unroll
   {
     UP.Threshold = IGC_GET_FLAG_VALUE(SetLoopUnrollThresholdForHighRegPressure);
+    UP.PartialThreshold = IGC_GET_FLAG_VALUE(SetLoopUnrollThresholdForHighRegPressure);
     // This is similiar to LLVM OptForSize scenario in LoopUnrollPass
     UP.MaxPercentThresholdBoost = IGC_GET_FLAG_VALUE(SetLoopUnrollMaxPercentThresholdBoostForHighRegPressure);
   }
@@ -415,7 +449,7 @@ void GenIntrinsicsTTIImpl::getUnrollingPreferences(Loop *L, ScalarEvolution &SE,
   if (ExitingBlock) {
     if (UP.Partial) {
       IGCLLVM::TerminatorInst *Term = ExitingBlock->getTerminator();
-      if (BranchInst *BI = dyn_cast<BranchInst>(Term)) {
+      if (IGCLLVM::CondBrInst *BI = dyn_cast<IGCLLVM::CondBrInst>(Term)) {
         if (dyn_cast<FCmpInst>(BI->getCondition())) {
           UP.Partial = false;
           return;
@@ -462,7 +496,7 @@ void GenIntrinsicsTTIImpl::getUnrollingPreferences(Loop *L, ScalarEvolution &SE,
     if (IGC_IS_FLAG_ENABLED(EnableAdvRuntimeUnroll) && IGCLLVM::isInnermost(L)) {
       auto countNonPHI = [](BasicBlock *BB) {
         // Count the number of instructions in the basic block without dbg instructions
-        unsigned InstCountInBB = BB->sizeWithoutDebug();
+        unsigned InstCountInBB = IGCLLVM::sizeWithoutDebug(BB);
         unsigned PHIs = 0;
         for (auto BI = BB->begin(), BE = BB->end(); BI != BE; ++BI) {
           if (!isa<PHINode>(&*BI))
@@ -494,21 +528,35 @@ void GenIntrinsicsTTIImpl::getUnrollingPreferences(Loop *L, ScalarEvolution &SE,
       bool HasCall = false;
       bool HasStore = false;
       bool MayHasLoadInHeaderOnly = true;
+      unsigned SamplerCount = 0;
+      bool HasDisallowedSamplerLoopSideEffect = false;
       for (auto BI = L->block_begin(), BE = L->block_end(); BI != BE; ++BI) {
         Count += countNonPHI(*BI);
         HasCall |= hasCall(*BI);
         HasStore |= hasStore(*BI);
         if (L->getHeader() != *BI)
           MayHasLoadInHeaderOnly &= !hasLoad(*BI);
+        for (Instruction &I : **BI) {
+          if (isa<SampleIntrinsic>(&I)) {
+            ++SamplerCount;
+            continue;
+          }
+          HasDisallowedSamplerLoopSideEffect |= I.mayHaveSideEffects();
+        }
       }
+
+      const bool ForceSamplerLoopUnroll =
+          IGC_IS_FLAG_ENABLED(EnableSamplerLoopSpeculation) && SamplerCount == 1 && !HasDisallowedSamplerLoopSideEffect;
+
       // Runtime unroll it.
-      if (!HasCall && !HasStore && MayHasLoadInHeaderOnly && Count < 100) {
+      if (((!HasCall && !HasStore && MayHasLoadInHeaderOnly) || ForceSamplerLoopUnroll) && Count < 100) {
         unsigned C = IGC_GET_FLAG_VALUE(AdvRuntimeUnrollCount);
         if (C == 0)
           C = 4;
         UP.Runtime = true;
         UP.Count = C;
         UP.MaxCount = UP.Count;
+        UP.Force |= ForceSamplerLoopUnroll;
         // The following is only available and required from LLVM 3.7+.
         UP.AllowExpensiveTripCount = true;
       }
@@ -518,8 +566,7 @@ void GenIntrinsicsTTIImpl::getUnrollingPreferences(Loop *L, ScalarEvolution &SE,
 
   llvm::BasicBlock::InstListType::iterator I;
   llvm::BasicBlock *loopBlock = L->getBlocks()[0];
-  int instCount =
-      std::distance(loopBlock->instructionsWithoutDebug().begin(), loopBlock->instructionsWithoutDebug().end());
+  int instCount = (int)IGCLLVM::sizeWithoutDebug(loopBlock);
 
   // Check if the specific basic block has block read or write.
   auto hasBlockReadWrite = [](BasicBlock *BB) {
@@ -617,7 +664,7 @@ void GenIntrinsicsTTIImpl::getUnrollingPreferences(Loop *L, ScalarEvolution &SE,
   } else if (runtimeUnroll == 0) {
     // do not enable runtime unrolling if the loop is long or trip count is already known.
     // skip this check if RuntimeLoopUnrolling is set to force on.
-    if (instCount > 35 || TripCount) {
+    if (instCount > 36 || TripCount) {
       return;
     }
   }
@@ -648,7 +695,7 @@ void GenIntrinsicsTTIImpl::getUnrollingPreferences(Loop *L, ScalarEvolution &SE,
 // https://github.com/llvm/llvm-project/commit/e541e1b757237172c247904b670c9894d6b3759d
 
 void GenIntrinsicsTTIImpl::getPeelingPreferences(Loop *L, ScalarEvolution &SE,
-                                                 llvm::TargetTransformInfo::PeelingPreferences &PP) {
+                                                 llvm::TargetTransformInfo::PeelingPreferences &PP) const {
   if (MDNode *LoopID = L->getLoopID()) {
     const llvm::StringRef peelCountMetadataNames = "spv.loop.peel.count";
 
@@ -665,7 +712,7 @@ void GenIntrinsicsTTIImpl::getPeelingPreferences(Loop *L, ScalarEvolution &SE,
   }
 }
 
-bool GenIntrinsicsTTIImpl::isProfitableToHoist(Instruction *I) {
+bool GenIntrinsicsTTIImpl::isProfitableToHoist(Instruction *I) const {
   if (auto *CI = dyn_cast<CallInst>(I)) {
     if (CI->isConvergent() && CI->onlyAccessesInaccessibleMemory()) {
       return false;

@@ -25,6 +25,7 @@ SPDX-License-Identifier: MIT
 #include "Compiler/CISACodeGen/HoistCongruentPhi.hpp"
 #include "Compiler/CISACodeGen/CodeScheduling.hpp"
 #include "Compiler/CISACodeGen/CodeSinking.hpp"
+#include "Compiler/CISACodeGen/PromotePhiToSourceWidth.hpp"
 #include "Compiler/CISACodeGen/LatencyHidingAnalysis.hpp"
 #include "Compiler/CISACodeGen/AddressArithmeticSinking.hpp"
 #include "Compiler/CISACodeGen/StateIndexAddrChainCanonicalize.hpp"
@@ -60,6 +61,8 @@ SPDX-License-Identifier: MIT
 #include "Compiler/CISACodeGen/VectorProcess.hpp"
 #include "Compiler/CISACodeGen/RuntimeValueLegalizationPass.h"
 #include "Compiler/CISACodeGen/LowerGEPForPrivMem.hpp"
+#include "Compiler/CISACodeGen/SplitPHIsOfAllocaPointers.hpp"
+#include "Compiler/CISACodeGen/SplitSelectsOfAllocaPointers.hpp"
 #include "Compiler/CISACodeGen/MatchCommonKernelPatterns.hpp"
 #include "Compiler/CISACodeGen/POSH_RemoveNonPositionOutput.h"
 #include "Compiler/CISACodeGen/RegisterEstimator.hpp"
@@ -116,6 +119,7 @@ SPDX-License-Identifier: MIT
 #include "Compiler/Optimizer/SinkPointerConstAdd.h"
 #include "Compiler/Optimizer/WaveAllJointReduction.hpp"
 #include "Compiler/Optimizer/InstructionHoistingOptimization.hpp"
+#include "Compiler/Optimizer/SamplerLoopSpeculation.hpp"
 #include "Compiler/Optimizer/WaveBallotCSE.hpp"
 #include "Compiler/Optimizer/RedundantOpsCSE.hpp"
 #include "Compiler/MetaDataApi/PurgeMetaDataUtils.hpp"
@@ -171,6 +175,7 @@ SPDX-License-Identifier: MIT
 #include <llvm/Transforms/IPO/FunctionAttrs.h>
 #include <llvm/Transforms/Utils.h>
 #include <llvm/Transforms/Scalar.h>
+#include <llvm/CodeGen/Passes.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include "common/LLVMWarningsPop.hpp"
 
@@ -201,6 +206,7 @@ SPDX-License-Identifier: MIT
 #include "Compiler/Optimizer/IGCInstCombiner/IGCInstructionCombining.hpp"
 #include "Compiler/Optimizer/HoistConvOpToDom.hpp"
 #include "Compiler/Optimizer/PromoteToPredicatedMemoryAccess.hpp"
+#include "Compiler/Optimizer/BranchToSelect.hpp"
 #include "AdaptorCommon/RayTracing/RayTracingPasses.hpp"
 #include "AdaptorCommon/RayTracing/RayTracingAddressSpaceAliasAnalysis.h"
 #include "AdaptorCommon/RayTracing/API/RayDispatchGlobalData.h"
@@ -210,7 +216,6 @@ SPDX-License-Identifier: MIT
 #include "Compiler/CISACodeGen/AnnotateUniformAllocas.h"
 #include "Probe/Assertion.h"
 #include "Compiler/CISACodeGen/PartialEmuI64OpsPass.h"
-#include "Compiler/TranslateToProgrammableOffsetsPass.hpp"
 #include "Compiler/CISACodeGen/RemoveLoopDependency.hpp"
 
 #include <filesystem>
@@ -273,6 +278,13 @@ void AddAnalysisPasses(CodeGenContext &ctx, IGCPassManager &mpm) {
     mpm.add(createSplitLoadsPass());
   }
 
+  // PromotePhiToSourceWidth widens a zero-guarded merge PHI to its narrowing cast's
+  // source width; the MergeScalarPhis pass that runs right after merges the promoted
+  // scalar PHIs so they reuse the same registers as the PHI's source (usually a loop
+  // accumulator), removing the cross-width register interference that caused spills.
+  if (IGC_IS_FLAG_ENABLED(EnablePromotePhiToSourceWidth) && ctx.type == ShaderType::OPENCL_SHADER)
+    mpm.add(createPromotePhiToSourceWidthPass());
+
   if (IGC_IS_FLAG_ENABLED(EnableScalarPhisMerger) && ctx.type == ShaderType::OPENCL_SHADER) {
     mpm.add(new MergeScalarPhisPass());
   }
@@ -299,6 +311,7 @@ void AddAnalysisPasses(CodeGenContext &ctx, IGCPassManager &mpm) {
       mpm.add(new CodeLoopSinking());
     }
     if (IGC_IS_FLAG_DISABLED(DisableCodeScheduling) && (ctx.type == ShaderType::OPENCL_SHADER) &&
+        ctx.m_instrTypes.hasDPAS &&
         (ctx.platform.isCoreChildOf(IGFX_XE_HPC_CORE) || ctx.platform.isCoreChildOf(IGFX_XE2_HPG_CORE))) {
       if (IGC_IS_FLAG_DISABLED(CodeSchedulingOnlyRecompilation) || ctx.m_retryManager->AllowCodeScheduling()) {
         mpm.add(new CodeScheduling());
@@ -363,6 +376,9 @@ void AddAnalysisPasses(CodeGenContext &ctx, IGCPassManager &mpm) {
 
       if (IGC_IS_FLAG_DISABLED(DisablePromotePrivMem) &&
           !isOptDisabledForModule(ctx.getModuleMetaData(), IGCOpts::LowerGEPForPrivMemPass)) {
+        if (ctx.type == ShaderType::OPENCL_SHADER) {
+          mpm.add(createSplitPHIsOfAllocaPointers());
+        }
         mpm.add(createPromotePrivateArrayToReg());
         mpm.add(createCFGSimplificationPass());
       }
@@ -376,6 +392,13 @@ void AddAnalysisPasses(CodeGenContext &ctx, IGCPassManager &mpm) {
       mpm.add(createReplaceUnsupportedIntrinsicsPass());
     }
     // Resolving private memory allocas
+    if (ctx.type == ShaderType::OPENCL_SHADER) {
+      mpm.add(createSplitPHIsOfAllocaPointers(true));
+      // Must stay immediately before PrivateMemoryResolution: the pass decides
+      // between speculative and predicated loads from the scratch-space
+      // decision, which no later-inserted private memory may change.
+      mpm.add(createSplitSelectsOfAllocaPointers());
+    }
     mpm.add(CreatePrivateMemoryResolution());
   }
 
@@ -711,6 +734,9 @@ void AddLegalizationPasses(CodeGenContext &ctx, IGCPassManager &mpm, PSSignature
 
       if (IGC_IS_FLAG_DISABLED(DisablePromotePrivMem) &&
           !isOptDisabledForModule(ctx.getModuleMetaData(), IGCOpts::LowerGEPForPrivMemPass)) {
+        if (ctx.type == ShaderType::OPENCL_SHADER) {
+          mpm.add(createSplitPHIsOfAllocaPointers());
+        }
         mpm.add(createPromotePrivateArrayToReg());
         mpm.add(createCFGSimplificationPass());
       }
@@ -768,6 +794,13 @@ void AddLegalizationPasses(CodeGenContext &ctx, IGCPassManager &mpm, PSSignature
       mpm.add(new LowerByValAttribute());
       mpm.add(createReplaceUnsupportedIntrinsicsPass());
     }
+    if (ctx.type == ShaderType::OPENCL_SHADER) {
+      mpm.add(createSplitPHIsOfAllocaPointers(true));
+      // Must stay immediately before PrivateMemoryResolution: the pass decides
+      // between speculative and predicated loads from the scratch-space
+      // decision, which no later-inserted private memory may change.
+      mpm.add(createSplitSelectsOfAllocaPointers());
+    }
     mpm.add(CreatePrivateMemoryResolution());
   }
   // Should help MemOpt pass to merge more loads
@@ -808,7 +841,14 @@ void AddLegalizationPasses(CodeGenContext &ctx, IGCPassManager &mpm, PSSignature
       mpm.add(createLSCCacheOptimizationPass());
     }
 
-    mpm.add(createIGCInstructionCombiningPass());
+    if (IGC_IS_FLAG_ENABLED(EnableFastInstCombineForLargeKernels) &&
+        ctx.m_instrTypes.numInsts >= IGC_GET_FLAG_VALUE(FastInstCombineLargeKernelThreshold)) {
+      // For very large kernels, prefer cheaper cleanup over a full InstCombine here.
+      mpm.add(createDeadCodeEliminationPass());
+      mpm.add(createEarlyCSEPass());
+    } else {
+      mpm.add(createIGCInstructionCombiningPass());
+    }
   }
 
   if (IGC_GET_FLAG_VALUE(ExpandNonUniformInsertElementThreshold) > 0) {
@@ -868,6 +908,9 @@ void AddLegalizationPasses(CodeGenContext &ctx, IGCPassManager &mpm, PSSignature
   }
   // Since we don't support switch statements, switch lowering is needed after the last CFG simplication
   mpm.add(llvm::createLowerSwitchPass());
+  // This is the last switch lowering with no CFG simplification after it, so drop
+  // any blocks left unreachable from the entry before they reach codegen.
+  mpm.add(llvm::createUnreachableBlockEliminationPass());
 
   // This pass can create constant expression
   if (ctx.m_DriverInfo.HasDoubleLoadStore()) {
@@ -908,7 +951,14 @@ void AddLegalizationPasses(CodeGenContext &ctx, IGCPassManager &mpm, PSSignature
     // Removing code assumptions can enable some InstructionCombining optimizations.
     // Last instruction combining pass needs to be before Legalization pass, as it can produce illegal instructions.
     mpm.add(new RemoveCodeAssumptions());
-    mpm.add(createIGCInstructionCombiningPass());
+    if (IGC_IS_FLAG_ENABLED(EnableFastInstCombineForLargeKernels) &&
+        ctx.m_instrTypes.numInsts >= IGC_GET_FLAG_VALUE(FastInstCombineLargeKernelThreshold)) {
+      // For very large kernels, prefer cheaper cleanup over a full InstCombine here.
+      mpm.add(createDeadCodeEliminationPass());
+      mpm.add(createEarlyCSEPass());
+    } else {
+      mpm.add(createIGCInstructionCombiningPass());
+    }
     if (ctx.platform.doIntegerMad() && ctx.m_DriverInfo.EnableIntegerMad()) {
       mpm.add(createCanonicalizeMulAddPass());
     }
@@ -1112,10 +1162,22 @@ void AddLegalizationPasses(CodeGenContext &ctx, IGCPassManager &mpm, PSSignature
     // beforehand.
     mpm.add(new Legalizer::PeepholeTypeLegalizer());
     // Lower all GEPs now as Emu64 doesn't know how to handle them.
+#if LLVM_VERSION_MAJOR >= 22
+    // LLVM 22+ InstCombine canonicalizes inttoptr(add(ptrtoint p, off)) back into
+    // getelementptr i8, so a GEP can reappear after the earlier GEP lowering and reach
+    // Emu64Ops (which does not expand GEPs and would drop the 64-bit index to undef).
+    // Always re-lower GEPs here to guarantee none reaches Emu64Ops. EarlyCSE stays
+    // scoped to the KeepGEPs path (its original behavior) to avoid perturbing codegen
+    // on the default path.
+    mpm.add(createGEPLoweringPass());
+    if (KeepGEPs)
+      mpm.add(llvm::createEarlyCSEPass());
+#else
     if (KeepGEPs) {
       mpm.add(createGEPLoweringPass());
       mpm.add(llvm::createEarlyCSEPass());
     }
+#endif
     // Run dead code elimination pass right before Emu64OpsPass,
     // as legalization passes do not always clear unused (operating
     // on illegal types) instructions.
@@ -1415,7 +1477,6 @@ void OptimizeIR(CodeGenContext *const pContext) {
 
     mpm.add(new BreakConstantExprLPM());
     mpm.add(new IGCConstProp());
-    GFX_ONLY_PASS { mpm.add(createTranslateToProgrammableOffsetsPass()); }
 
     mpm.add(new CustomSafeOptPass());
     if (!pContext->m_DriverInfo.WADisableCustomPass()) {
@@ -1641,6 +1702,12 @@ void OptimizeIR(CodeGenContext *const pContext) {
       }
       GFX_ONLY_PASS { mpm.add(new GenUpdateCB()); }
 
+      // Flatten small memory-free branch regions (e.g. short-circuit || chains) into selects so the backend gets
+      // straight-line code.
+      if (pContext->platform.supportBranchToSelect() && IGC_IS_FLAG_ENABLED(EnableBranchToSelect)) {
+        mpm.add(createBranchToSelectPass());
+      }
+
       // Inserting PromoteToPredicatedMemoryAccess after GVN and several
       // other passes, to not block optimizations changing LLVM
       // load/stores, but before multiple SimplifyCFGs to allow more
@@ -1651,11 +1718,16 @@ void OptimizeIR(CodeGenContext *const pContext) {
         mpm.add(new PromoteToPredicatedMemoryAccess());
       }
 
-      if (IGC_IS_FLAG_ENABLED(EnableJumpThreading) && !extensiveShader(pContext)) {
+      if (IGC_IS_FLAG_ENABLED(EnableJumpThreading) && !pContext->m_instrTypes.hasAtomics &&
+          !extensiveShader(pContext)) {
         if (pContext->type == ShaderType::OPENCL_SHADER) {
           // Add CFGSimplification for clean-up before JumpThreading.
           mpm.add(llvm::createCFGSimplificationPass());
         }
+
+        // jump threading currently causes the atomic_flag test from c11 conformance to fail.  Right now,
+        // only do jump threading if we don't have atomics as using atomics as locks seems to be the most common
+        // case of violating the no independent forward progress clause from the spec.
 
         // We need to increase default duplication threshold since JumpThreading pass cost estimation does
         // not consider that not all instructions need to be duplicated.
@@ -1667,12 +1739,6 @@ void OptimizeIR(CodeGenContext *const pContext) {
 #else  // LLVM_VERSION_MAJOR
         mpm.add(llvm::createJumpThreadingPass(false, BBDuplicateThreshold));
 #endif // LLVM_VERSION_MAJOR
-      }
-      // RT shaders have many short equality branches (dispatch patterns)
-      // where live range extension costs outweigh scalarization benefits at SIMD8,
-      // and FunctionMultiversioning is disabled for RT (no compounding benefit).
-      if (IGC_IS_FLAG_ENABLED(EnablePropagateCmpUniformity) && pContext->type != ShaderType::RAYTRACING_SHADER) {
-        mpm.add(createPropagateCmpUniformityPass());
       }
       mpm.add(llvm::createCFGSimplificationPass());
       mpm.add(llvm::createEarlyCSEPass());
@@ -1692,11 +1758,21 @@ void OptimizeIR(CodeGenContext *const pContext) {
       // some optimization can create switch statement we don't support
       mpm.add(llvm::createLowerSwitchPass());
 
+      // RT shaders have many short equality branches (dispatch patterns)
+      // where live range extension costs outweigh scalarization benefits at SIMD8,
+      // and FunctionMultiversioning is disabled for RT (no compounding benefit).
+      if (IGC_IS_FLAG_ENABLED(EnablePropagateCmpUniformity) && pContext->type != ShaderType::RAYTRACING_SHADER) {
+        mpm.add(createPropagateCmpUniformityPass());
+      }
+
       // preferred to be added after all LowerSwitch pass runs, as switch lowering is able
       // to benefit from unreachable instruction when it's in default switch case
       mpm.add(new UnreachableHandling());
 
-      if (IGC_IS_FLAG_ENABLED(EnableJumpThreading) && !extensiveShader(pContext)) {
+      // Conditions apply just as above due to problems with atomics
+      // (see comment above for details).
+      if (IGC_IS_FLAG_ENABLED(EnableJumpThreading) && !pContext->m_instrTypes.hasAtomics &&
+          !extensiveShader(pContext)) {
         // After lowering 'switch', run jump threading to remove redundant jumps.
         mpm.add(IGCLLVM::createLegacyWrappedJumpThreadingPass());
       }
@@ -1804,6 +1880,7 @@ void OptimizeIR(CodeGenContext *const pContext) {
       mpm.add(IGCLLVM::createLegacyWrappedDeadStoreEliminationPass());
       mpm.add(IGCLLVM::createLegacyWrappedMemCpyOptPass());
       mpm.add(createLdShrinkPass());
+      mpm.add(IGCLLVM::createLegacyWrappedDeadStoreEliminationPass());
     }
 
     mpm.add(llvm::createDeadCodeEliminationPass());
@@ -1873,6 +1950,13 @@ void OptimizeIR(CodeGenContext *const pContext) {
       mpm.add(IGCLLVM::createLegacyWrappedADCEPass());
     }
 
+
+    // Speculatively cluster the sampler iterations produced by the forced
+    // partial unroll of a data-dependent sampler loop (GenTTI UP.Force gate).
+    // This runs while the cloned-iteration structure is still recognizable.
+    if (pContext->m_instrTypes.numOfLoop && IGC_IS_FLAG_ENABLED(EnableSamplerLoopSpeculation)) {
+      mpm.add(createSamplerLoopSpeculation());
+    }
 
     mpm.run(*pContext->getModule());
   } // end scope

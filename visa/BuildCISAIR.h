@@ -429,7 +429,8 @@ public:
 
   bool create3DLoadInstruction(VISA_opnd *pred,
                                VISASampler3DSubOpCode subOpcode,
-                               bool pixelNullMask, ChannelMask channels,
+                               bool pixelNullMask,
+                               ChannelMask channels,
                                VISA_EMask_Ctrl emask, unsigned exec_size,
                                VISA_opnd *aoffimmi, const char *surface_name,
                                unsigned int surfaceIndex,
@@ -689,6 +690,7 @@ public:
   bool CISA_create_fcvt_instruction(bool sat, VISA_EMask_Ctrl emask,
                                     unsigned exec_size, VISA_opnd *dst,
                                     VISA_opnd *src0, int lineNum);
+
 
   bool CISA_create_nbarrier(bool isWait, VISA_opnd *barrierId,
                             VISA_opnd *threadCount, int lineNum);

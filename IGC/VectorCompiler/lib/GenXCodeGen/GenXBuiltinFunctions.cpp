@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2023 Intel Corporation
+Copyright (C) 2023-2026 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -22,6 +22,7 @@ SPDX-License-Identifier: MIT
 #include "vc/Support/GenXDiagnostic.h"
 #include "vc/Utils/GenX/IntrinsicsWrapper.h"
 #include "vc/Utils/GenX/KernelInfo.h"
+#include "vc/Utils/GenX/Region.h"
 #include "vc/Utils/General/BiF.h"
 
 #include <llvm/CodeGen/TargetPassConfig.h>
@@ -29,6 +30,9 @@ SPDX-License-Identifier: MIT
 #include <llvm/IR/Module.h>
 #include <llvm/Linker/Linker.h>
 #include <llvm/Pass.h>
+
+#include "llvmWrapper/IR/Module.h"
+#include "llvmWrapper/Support/MathExtras.h"
 
 #include <string>
 
@@ -75,6 +79,8 @@ private:
 
   Value *createLibraryCall(Instruction &I, Function *Func,
                            ArrayRef<Value *> Args);
+  Value *createIntDivRemLibraryCall(BinaryOperator &I, StringRef Name,
+                                    bool IsSigned);
   Value *createAtomicLibraryCall(llvm::CallInst &II, StringRef Name);
 
   bool isHandleUgmAtomics(const CallInst &II) const;
@@ -117,7 +123,8 @@ bool GenXBuiltinFunctions::runOnModule(Module &M) {
             .getGenXSubtarget();
 
   auto &Ctx = M.getContext();
-  auto Lib = loadBuiltinLib(Ctx, M.getDataLayout(), M.getTargetTriple());
+  auto Lib =
+      loadBuiltinLib(Ctx, M.getDataLayout(), IGCLLVM::getTargetTriple(M));
   if (Lib && Linker::linkModules(M, std::move(Lib))) {
     vc::diagnose(Ctx, "GenXBuiltinFunctions",
                  "Error linking built-in functions");
@@ -244,7 +251,12 @@ Value *GenXBuiltinFunctions::visitFRem(BinaryOperator &I) {
   return createLibraryCall(I, Func, {I.getOperand(0), I.getOperand(1)});
 }
 
-Value *GenXBuiltinFunctions::visitSDiv(BinaryOperator &I) {
+// Emulate integer div/rem. The precise "__rtz_" builtin exists only for i32, so
+// promote narrower types to i32 to avoid the imprecise reciprocal path (which
+// mis-rounds the quotient) that LLVM 20+ srem/urem narrowing started hitting.
+Value *GenXBuiltinFunctions::createIntDivRemLibraryCall(BinaryOperator &I,
+                                                        StringRef Name,
+                                                        bool IsSigned) {
   auto &M = *I.getModule();
   auto *Ty = I.getType();
   auto *STy = Ty->getScalarType();
@@ -252,52 +264,102 @@ Value *GenXBuiltinFunctions::visitSDiv(BinaryOperator &I) {
   if (ST->hasIntDivRem32() && !STy->isIntegerTy(64))
     return nullptr;
 
-  StringRef Suffix = STy->isIntegerTy(32) ? "__rtz_" : "";
+  IRBuilder<> Builder(&I);
 
-  auto *Func = getBuiltinDeclaration(M, "sdiv", false, {Ty}, Suffix);
-  return createLibraryCall(I, Func, {I.getOperand(0), I.getOperand(1)});
+  auto *EmuTy = Ty;
+  auto *VTy = dyn_cast<IGCLLVM::FixedVectorType>(Ty);
+  bool Promote = STy->getIntegerBitWidth() < 32;
+  if (Promote) {
+    auto *I32Ty = Builder.getInt32Ty();
+    if (VTy)
+      EmuTy = IGCLLVM::FixedVectorType::get(I32Ty, VTy->getNumElements());
+    else
+      EmuTy = I32Ty;
+  }
+
+  // This pass runs after legalization, so promotion must not introduce calls
+  // whose operands exceed the two-GRF width invariant.
+  unsigned MaxPromotedWidth = 2 * ST->getGRFByteSize() / genx::DWordBytes;
+  if (Promote && VTy && VTy->getNumElements() > MaxPromotedWidth) {
+    SmallVector<std::pair<unsigned, Function *>, 4> SplitFuncs;
+    for (unsigned StartIdx = 0; StartIdx < VTy->getNumElements();) {
+      unsigned SplitWidth =
+          std::min(MaxPromotedWidth, static_cast<unsigned>(IGCLLVM::bit_floor(
+                                         VTy->getNumElements() - StartIdx)));
+      auto *SplitEmuTy =
+          IGCLLVM::FixedVectorType::get(Builder.getInt32Ty(), SplitWidth);
+      auto *Func =
+          getBuiltinDeclaration(M, Name, false, {SplitEmuTy}, "__rtz_");
+      if (!Func)
+        return nullptr;
+      SplitFuncs.emplace_back(SplitWidth, Func);
+      StartIdx += SplitWidth;
+    }
+
+    Value *Result = PoisonValue::get(Ty);
+    unsigned StartIdx = 0;
+    for (auto [SplitWidth, Func] : SplitFuncs) {
+      vc::Region SplitRegion{Ty};
+      SplitRegion.getSubregion(StartIdx, SplitWidth);
+      auto *Op0 = SplitRegion.createRdRegion(
+          I.getOperand(0), I.getName() + ".lhs.split" + Twine(StartIdx), &I,
+          I.getDebugLoc());
+      auto *Op1 = SplitRegion.createRdRegion(
+          I.getOperand(1), I.getName() + ".rhs.split" + Twine(StartIdx), &I,
+          I.getDebugLoc());
+
+      auto *SplitEmuTy =
+          IGCLLVM::FixedVectorType::get(Builder.getInt32Ty(), SplitWidth);
+      Value *ExtOp0 = IsSigned ? Builder.CreateSExt(Op0, SplitEmuTy)
+                               : Builder.CreateZExt(Op0, SplitEmuTy);
+      Value *ExtOp1 = IsSigned ? Builder.CreateSExt(Op1, SplitEmuTy)
+                               : Builder.CreateZExt(Op1, SplitEmuTy);
+      auto *Call = Builder.CreateCall(Func, {ExtOp0, ExtOp1},
+                                      I.getName() + ".split" + Twine(StartIdx));
+      auto *SplitTy = IGCLLVM::FixedVectorType::get(STy, SplitWidth);
+      Value *Trunc = Builder.CreateTrunc(Call, SplitTy);
+      Result = SplitRegion.createWrRegion(
+          Result, Trunc, I.getName() + ".join" + Twine(StartIdx), &I,
+          I.getDebugLoc());
+      StartIdx += SplitWidth;
+    }
+    return Result;
+  }
+
+  StringRef Suffix = EmuTy->getScalarType()->isIntegerTy(32) ? "__rtz_" : "";
+  auto *Func = getBuiltinDeclaration(M, Name, false, {EmuTy}, Suffix);
+  if (!Func)
+    return nullptr;
+
+  auto *Op0 = I.getOperand(0);
+  auto *Op1 = I.getOperand(1);
+  if (Promote) {
+    Op0 = IsSigned ? Builder.CreateSExt(Op0, EmuTy)
+                   : Builder.CreateZExt(Op0, EmuTy);
+    Op1 = IsSigned ? Builder.CreateSExt(Op1, EmuTy)
+                   : Builder.CreateZExt(Op1, EmuTy);
+  }
+
+  auto *Call = createLibraryCall(I, Func, {Op0, Op1});
+  if (!Promote)
+    return Call;
+  return Builder.CreateTrunc(Call, Ty);
+}
+
+Value *GenXBuiltinFunctions::visitSDiv(BinaryOperator &I) {
+  return createIntDivRemLibraryCall(I, "sdiv", /*IsSigned=*/true);
 }
 
 Value *GenXBuiltinFunctions::visitSRem(BinaryOperator &I) {
-  auto &M = *I.getModule();
-  auto *Ty = I.getType();
-  auto *STy = Ty->getScalarType();
-
-  if (ST->hasIntDivRem32() && !STy->isIntegerTy(64))
-    return nullptr;
-
-  StringRef Suffix = STy->isIntegerTy(32) ? "__rtz_" : "";
-
-  auto *Func = getBuiltinDeclaration(M, "srem", false, {Ty}, Suffix);
-  return createLibraryCall(I, Func, {I.getOperand(0), I.getOperand(1)});
+  return createIntDivRemLibraryCall(I, "srem", /*IsSigned=*/true);
 }
 
 Value *GenXBuiltinFunctions::visitUDiv(BinaryOperator &I) {
-  auto &M = *I.getModule();
-  auto *Ty = I.getType();
-  auto *STy = Ty->getScalarType();
-
-  if (ST->hasIntDivRem32() && !STy->isIntegerTy(64))
-    return nullptr;
-
-  StringRef Suffix = STy->isIntegerTy(32) ? "__rtz_" : "";
-
-  auto *Func = getBuiltinDeclaration(M, "udiv", false, {Ty}, Suffix);
-  return createLibraryCall(I, Func, {I.getOperand(0), I.getOperand(1)});
+  return createIntDivRemLibraryCall(I, "udiv", /*IsSigned=*/false);
 }
 
 Value *GenXBuiltinFunctions::visitURem(BinaryOperator &I) {
-  auto &M = *I.getModule();
-  auto *Ty = I.getType();
-  auto *STy = Ty->getScalarType();
-
-  if (ST->hasIntDivRem32() && !STy->isIntegerTy(64))
-    return nullptr;
-
-  StringRef Suffix = STy->isIntegerTy(32) ? "__rtz_" : "";
-
-  auto *Func = getBuiltinDeclaration(M, "urem", false, {Ty}, Suffix);
-  return createLibraryCall(I, Func, {I.getOperand(0), I.getOperand(1)});
+  return createIntDivRemLibraryCall(I, "urem", /*IsSigned=*/false);
 }
 
 bool GenXBuiltinFunctions::isHandleUgmAtomics(const CallInst &II) const {
@@ -310,14 +372,17 @@ bool GenXBuiltinFunctions::isHandleUgmAtomics(const CallInst &II) const {
   switch (Opcode->getZExtValue()) {
   case LSC_ATOMIC_FADD:
   case LSC_ATOMIC_FSUB:
-    return (Ty->isDoubleTy() && !ST->hasGlobalAtomicAddF64()) ||
+    // Double-precision emulation relies on fp64 arithmetic in the BiF library,
+    // which GenXBiFPrepare removes on targets without fp64 support.
+    return (Ty->isDoubleTy() && ST->hasFP64() &&
+            !ST->hasGlobalAtomicAddF64()) ||
            (cast<ConstantInt>(II.getArgOperand(3))->getZExtValue() ==
                 LSC_DATA_SIZE_16c32b &&
             !ST->hasInstrAtomicHF16());
   case LSC_ATOMIC_FMIN:
   case LSC_ATOMIC_FMAX:
   case LSC_ATOMIC_FCAS:
-    return Ty->isDoubleTy();
+    return Ty->isDoubleTy() && ST->hasFP64();
   default:
     return false;
   }
@@ -335,7 +400,9 @@ bool GenXBuiltinFunctions::isHandleSlmAtomics(const CallInst &II) const {
     return false;
   case LSC_ATOMIC_FADD:
   case LSC_ATOMIC_FSUB:
-    return (Ty->isDoubleTy() && ST->hasLocalIntegerCas64()) ||
+    // Double-precision emulation relies on fp64 arithmetic in the BiF library,
+    // which GenXBiFPrepare removes on targets without fp64 support.
+    return (Ty->isDoubleTy() && ST->hasFP64() && ST->hasLocalIntegerCas64()) ||
            (Ty->isFloatTy() && !ST->hasInstrLocalAtomicAddF32()) ||
            (cast<ConstantInt>(II.getArgOperand(3))->getZExtValue() ==
                 LSC_DATA_SIZE_16c32b &&
@@ -347,7 +414,7 @@ bool GenXBuiltinFunctions::isHandleSlmAtomics(const CallInst &II) const {
   case LSC_ATOMIC_BFCAS:
     return false;
   default:
-    return (Ty->isIntegerTy(64) || Ty->isDoubleTy()) &&
+    return (Ty->isIntegerTy(64) || (Ty->isDoubleTy() && ST->hasFP64())) &&
            ST->hasLocalIntegerCas64();
   }
 }
@@ -529,7 +596,7 @@ GenXBuiltinFunctions::loadBuiltinLib(LLVMContext &Ctx, const DataLayout &DL,
   auto BiFModule = vc::getBiFModuleOrReportError(BiFBuffer, Ctx);
 
   BiFModule->setDataLayout(DL);
-  BiFModule->setTargetTriple(Triple);
+  IGCLLVM::setTargetTriple(*BiFModule, Triple);
 
   return BiFModule;
 }

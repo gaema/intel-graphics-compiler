@@ -86,7 +86,15 @@ void CCommand::replaceGenISACallInst(GenISAIntrinsic::ID intrinsicName, ArrayRef
   Function *func = getFunctionDeclaration(intrinsicName, Tys);
   Instruction *newCall = CallInst::Create(func, m_args, m_pCallInst->getName(), IGCLLVM::insertPosition(m_pCallInst));
   newCall->setDebugLoc(m_DL);
-  m_pCallInst->replaceAllUsesWith(newCall);
+  if (m_pCallInst->getType()->isVoidTy()) {
+    IGC_ASSERT_MESSAGE(newCall->getType()->isVoidTy(), "Wrong type");
+  } else {
+    if (newCall->getType()->isVoidTy()) {
+      IGC_ASSERT_MESSAGE(m_pCallInst->getNumUses() == 0, "invalid intrinsic replacement");
+    } else {
+      m_pCallInst->replaceAllUsesWith(newCall);
+    }
+  }
 }
 
 void CCommand::emitError(const char *ErrorStr, const Value *Context) {
@@ -776,7 +784,7 @@ public:
     m_args.push_back(m_pFloatZero); // ai (?)
     m_args.push_back(m_pFloatZero); // minLOD (?)
     preparePairedResource();
-    prepareImageBTI();
+    createGetBufferPtr();
     prepareSamplerValue();
     prepareZeroOffsets();
     Type *types[] = {
@@ -872,7 +880,7 @@ public:
     m_args.push_back(CoordY);
     m_args.push_back(CoordZ);
     m_args.push_back(m_pIntZero); // LOD
-    prepareImageBTI();
+    createGetBufferPtr();
     prepareZeroOffsets();
     Type *types[] = {m_pCallInst->getType(), m_pIntType, m_args[4]->getType()};
     replaceGenISACallInst(GenISAIntrinsic::GenISA_ldmcsptr, types);
@@ -919,7 +927,7 @@ public:
     m_args.push_back(CoordY);
     m_args.push_back(CoordZ);
     m_args.push_back(m_pIntZero); // LOD
-    prepareImageBTI();
+    createGetBufferPtr();
     prepareZeroOffsets();
     replaceGenISACallInst(GenISAIntrinsic::GenISA_ldmsptr, {m_pCallInst->getType(), m_args[7]->getType()});
   }
@@ -939,7 +947,7 @@ public:
     m_args.push_back(CoordY);
     m_args.push_back(CoordZ);
     m_args.push_back(m_pIntZero); // LOD
-    prepareImageBTI();
+    createGetBufferPtr();
     prepareZeroOffsets();
     replaceGenISACallInst(GenISAIntrinsic::GenISA_ldmsptr, {m_pCallInst->getType(), m_args[7]->getType()});
   }

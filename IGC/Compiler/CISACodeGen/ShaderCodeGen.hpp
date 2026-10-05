@@ -326,6 +326,9 @@ public:
   int PrivateMemoryPerWI() const { return m_PrivateMemoryPerWI; }
   bool TryNoScratchPointer() const { return m_TryNoScratchPointer; }
 
+  void SetEmitMoreMoviCases(bool value) { m_EmitMoreMoviCases = value; }
+  bool GetEmitMoreMoviCases() const { return m_EmitMoreMoviCases; }
+
   IGCMD::MetaDataUtils *GetMetaDataUtils() { return m_pMdUtils; }
 
   virtual void SetShaderSpecificHelper(EmitPass *emitPass) { IGC_UNUSED(emitPass); }
@@ -350,6 +353,25 @@ public:
   SProgramOutput *ProgramOutput();
 
   bool CanTreatAsAlias(llvm::ExtractElementInst *inst);
+  // EnableSampleTailDeAlias optimization: return true if this extractelement is the
+  // lone long-lived component of a sample/ld payload whose sibling components die
+  // much earlier, under high register pressure. When true, CanTreatAsAlias()
+  // refuses the sub-register alias so emitExtract() emits a copy into a fresh
+  // variable, letting the payload response variable (and its dead sibling GRFs)
+  // die early. Samples/ld with a non-uniform resource or sampler are excluded:
+  // they emit inside a resource loop that keeps the whole payload loop-carried
+  // live, defeating the premise and regressing spill. Result is memoized in
+  // m_sampleTailDeAliasCache.
+  bool isSampleTailToDeAlias(llvm::ExtractElementInst *inst);
+  // EnableSampleTailDeAlias peak-aware experiment: lazily return the function's
+  // highest register-pressure basic block, computing it (a full-function
+  // liveness run) only on first call -- i.e. only when isSampleTailToDeAlias()
+  // reaches a genuine candidate, so candidate-free shaders pay nothing. The
+  // result (SIMD-independent) is cached on the shared CShaderProgram so it is
+  // computed once per function, not once per SIMD. De-aliasing a sample/ld tail
+  // whose def block is this peak only adds the copy footprint on top of the
+  // still-live payload at the peak (a strict loss), so those are suppressed.
+  llvm::BasicBlock *getSampleTailPeakBB();
   bool CanTreatScalarSourceAsAlias(llvm::InsertElementInst *);
 
   bool HasBecomeNoop(llvm::Instruction *inst);
@@ -395,6 +417,7 @@ public:
   uint m_loopNestedStallCycle = 0;
   uint m_loopNestedCycle = 0;
   unsigned m_spillSize = 0;
+  unsigned m_spillThreshold = 0;
   float m_spillCost = 0; // num weighted spill inst / total inst
   uint m_asmInstrCount = 0;
 
@@ -470,7 +493,10 @@ public:
         } else if (bufType == UAV) {
           m_State.m_uavLoaded |= QWBIT(typeBti);
         } else if (bufType == RENDER_TARGET) {
-          m_State.m_renderTargetLoaded |= BIT(typeBti);
+          constexpr uint32_t numRenderTargetBits = sizeof(m_State.m_renderTargetLoaded) * 8;
+          if (typeBti < numRenderTargetBits) {
+            m_State.m_renderTargetLoaded |= BIT(typeBti);
+          }
         }
       } else {
         // Indirect addressing, set the maximum BTI.
@@ -610,6 +636,9 @@ protected:
   const llvm::DataLayout *m_DL = nullptr;
   GenXFunctionGroupAnalysis *m_FGA = nullptr;
   VariableReuseAnalysis *m_VRA = nullptr;
+  // Memoizes the EnableSampleTailDeAlias decision per extractelement so the
+  // repeated CanTreatAsAlias() calls from GetSymbol() are not recomputed.
+  llvm::DenseMap<llvm::Instruction *, char> m_sampleTailDeAliasCache;
   ResourceLoopAnalysis *m_RLA = nullptr;
 
   IGC::IGCMD::MetaDataUtils *m_pMdUtils = nullptr;
@@ -708,6 +737,13 @@ protected:
   bool m_HasNestedCall = false;
   bool m_HasIndirectCall = false;
   bool m_IsIntelSymbolTableVoidProgram = false;
+  // Whether EmitMoreMoviCases movi promotion is enabled for this shader.
+  // Computed once per shader in EmitPass before the
+  // encoder is initialized, then consumed by emitSimdShuffle (as
+  // moviPromotionEnabled) and by CISABuilder (to decide vISA_emitMoreMoviCases).
+  // Computing it once keeps both consumers consistent: CISABuilder runs at
+  // encoder init, before emitSimdShuffle, so it can't observe an emit-time value.
+  bool m_EmitMoreMoviCases = false;
   int m_PrivateMemoryPerWI = 0;
 };
 

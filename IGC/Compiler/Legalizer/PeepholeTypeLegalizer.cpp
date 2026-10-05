@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2022 Intel Corporation
+Copyright (C) 2017-2026 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -262,6 +262,57 @@ void PeepholeTypeLegalizer::legalizeExtractElement(Instruction &I) {
 
   unsigned elementWidth = extract->getType()->getScalarSizeInBits();
   unsigned numElements = (unsigned)cast<IGCLLVM::FixedVectorType>(extract->getOperand(0)->getType())->getNumElements();
+
+  // Extract of a sub-byte integer element (e.g. <32 x i4>): reinterpret the
+  // vector as a vector of legal-width integer chunks and pull the element out
+  // with a shift and mask. Promotion is unusable here as it would change the
+  // total bit width.
+  if (extract->getType()->isIntegerTy() && elementWidth > 1 && elementWidth < 8 && !isLegalInteger(elementWidth) &&
+      isa<ConstantInt>(extract->getOperand(1))) {
+    unsigned totalBits = elementWidth * numElements;
+    unsigned chunkWidth = 0;
+    for (unsigned w : {32u, 16u, 8u, 64u}) {
+      if (totalBits % w == 0 && w % elementWidth == 0) {
+        chunkWidth = w;
+        break;
+      }
+    }
+    if (chunkWidth) {
+      m_builder->SetInsertPoint(&I);
+      unsigned numChunks = totalBits / chunkWidth;
+      unsigned elemsPerChunk = chunkWidth / elementWidth;
+      Type *chunkTy = Type::getIntNTy(I.getContext(), chunkWidth);
+
+      // Look through a feeding bitcast (e.g. <4 x float> -> <32 x i4>) so the
+      // illegal vector type is never recreated; reinterpret the original value.
+      Value *vecSrc = extract->getOperand(0);
+      BitCastInst *srcBC = dyn_cast<BitCastInst>(vecSrc);
+      if (srcBC)
+        vecSrc = srcBC->getOperand(0);
+      Value *legalVec = m_builder->CreateBitCast(vecSrc, IGCLLVM::FixedVectorType::get(chunkTy, numChunks));
+
+      // The requested element lives in chunk (extractIndex / elemsPerChunk) at bit
+      // offset (extractIndex % elemsPerChunk) * elementWidth within that chunk.
+      unsigned extractIndex = (unsigned)cast<ConstantInt>(extract->getOperand(1))->getZExtValue();
+      unsigned chunkIdx = extractIndex / elemsPerChunk;
+      unsigned within = extractIndex % elemsPerChunk;
+      Value *chunk = m_builder->CreateExtractElement(legalVec, m_builder->getInt32(chunkIdx));
+      if (within)
+        chunk = m_builder->CreateLShr(chunk, ConstantInt::get(chunkTy, (uint64_t)within * elementWidth));
+      Value *masked = m_builder->CreateAnd(chunk, ConstantInt::get(chunkTy, ((uint64_t)1 << elementWidth) - 1));
+      Value *result = m_builder->CreateTrunc(masked, extract->getType());
+
+      extract->replaceAllUsesWith(result);
+      extract->eraseFromParent();
+      // Drop the now-dead source bitcast so the illegal <M x i4> type does not
+      // linger into EmitVISAPass.
+      if (srcBC && srcBC->use_empty())
+        srcBC->eraseFromParent();
+      Changed = true;
+      return;
+    }
+  }
+
   unsigned quotient = 0, promoteToInt = 0;
   if (elementWidth > 0)
     promoteInt(elementWidth, quotient, promoteToInt, DL->getLargestLegalIntTypeSizeInBits());
@@ -354,6 +405,27 @@ void PeepholeTypeLegalizer::legalizeBinaryOperator(Instruction &I) {
 
   Src1width = Src1->getType()->getScalarSizeInBits();
 
+  if (Src1width == 1 && isa<BinaryOperator>(&I)) {
+    Value *NewVal = nullptr;
+    switch (I.getOpcode()) {
+    case Instruction::Add:
+    case Instruction::Sub:
+      NewVal = m_builder->CreateXor(Src1, Src2);
+      break;
+    case Instruction::Mul:
+      NewVal = m_builder->CreateAnd(Src1, Src2);
+      break;
+    default:
+      break;
+    }
+    if (NewVal) {
+      I.replaceAllUsesWith(NewVal);
+      I.eraseFromParent();
+      Changed = true;
+      return;
+    }
+  }
+
   if (isLegalInteger(Src1width) || Src1width == 1) // nothing to legalize
     return;
 
@@ -373,6 +445,8 @@ void PeepholeTypeLegalizer::legalizeBinaryOperator(Instruction &I) {
         NewLargeSrc2, IGCLLVM::FixedVectorType::get(llvm::Type::getIntNTy(I.getContext(), promoteToInt), quotient));
     Value *NewLargeResVecForm =
         UndefValue::get(IGCLLVM::FixedVectorType::get(llvm::Type::getIntNTy(I.getContext(), promoteToInt), quotient));
+
+    SmallVector<Value *, 4> MulResult;
 
     bool instSupported = true;
     for (unsigned Idx = 0; Idx < quotient; Idx++) {
@@ -429,36 +503,104 @@ void PeepholeTypeLegalizer::legalizeBinaryOperator(Instruction &I) {
         }
         break;
       }
-      case Instruction::Mul:
-        if (Idx == 0) {
-          NewInst = m_builder->CreateMul(m_builder->CreateExtractElement(NewLargeSrc1VecForm, Idx),
-                                         m_builder->CreateExtractElement(NewLargeSrc2VecForm, Idx));
-        } else if (Idx == 1) {
-          Type *type = llvm::Type::getIntNTy(I.getContext(), promoteToInt);
-          Function *MulHFunc = llvm::GenISAIntrinsic::getDeclaration(
-              m_builder->GetInsertBlock()->getParent()->getParent(), llvm::GenISAIntrinsic::GenISA_umulH, type);
+      case Instruction::Shl: {
+        if (auto val = dyn_cast<ConstantInt>(Src2)) {
+          int64_t ShiftAmt = val->getSExtValue();
+          IGC_ASSERT(ShiftAmt >= 0 && ShiftAmt < (int64_t)Src1width);
+          int64_t EltShift = ShiftAmt / promoteToInt;
+          uint64_t NewShiftAmt = ShiftAmt % promoteToInt;
+          // The element at position Idx of the result is built from the source
+          // element shifted up by EltShift whole elements.
+          int64_t SrcIdx = (int64_t)Idx - EltShift;
 
-          Value *Lo1 = m_builder->CreateExtractElement(NewLargeSrc1VecForm, uint64_t(0));
-          Value *Hi1 = m_builder->CreateExtractElement(NewLargeSrc1VecForm, uint64_t(1));
-          Value *Lo2 = m_builder->CreateExtractElement(NewLargeSrc2VecForm, uint64_t(0));
-          Value *Hi2 = m_builder->CreateExtractElement(NewLargeSrc2VecForm, uint64_t(1));
+          auto getElt = [&](Value *Vec, int64_t i) -> Value * {
+            // if the source index is out of bounds (shifted in from below or
+            // above the vector), the contribution is 0
+            if (i >= 0 && i < (int64_t)cast<IGCLLVM::FixedVectorType>(Vec->getType())->getNumElements())
+              return m_builder->CreateExtractElement(Vec, (uint64_t)i);
+            else
+              return ConstantInt::get(IntegerType::get(I.getContext(), promoteToInt), 0, false);
+          };
 
-          Value *MulHiLo1Lo2 = m_builder->CreateCall(MulHFunc, {Lo1, Lo2});
-          Value *MulLo1Hi2 = m_builder->CreateMul(Lo1, Hi2);
-          Value *MulLo2Hi1 = m_builder->CreateMul(Lo2, Hi1);
-          Value *AddLoHi = m_builder->CreateAdd(MulLo1Hi2, MulLo2Hi1);
-          Value *AddMulHi = m_builder->CreateAdd(AddLoHi, MulHiLo1Lo2);
-          if (Src1width < promoteToInt * 2) {
-            uint64_t mask = (1ULL << (Src1width - promoteToInt)) - 1;
-            NewInst = m_builder->CreateAnd(AddMulHi, mask);
+          if (NewShiftAmt == 0) {
+            // Simple case: we can just move whole elements up
+            NewInst = getElt(NewLargeSrc1VecForm, SrcIdx);
           } else {
-            NewInst = AddMulHi;
+            auto lshr = [&](Value *Op0, uint64_t ShiftAmt) -> Value * {
+              if (auto *C = dyn_cast<Constant>(Op0); C && C->isNullValue())
+                return C;
+              return m_builder->CreateLShr(Op0, ShiftAmt);
+            };
+            auto shl = [&](Value *Op0, uint64_t ShiftAmt) -> Value * {
+              if (auto *C = dyn_cast<Constant>(Op0); C && C->isNullValue())
+                return C;
+              return m_builder->CreateShl(Op0, ShiftAmt);
+            };
+            // V[Idx] = (V[SrcIdx] << NewShiftAmt) | (V[SrcIdx - 1] >> (promoteToInt - NewShiftAmt))
+            NewInst = m_builder->CreateOr(shl(getElt(NewLargeSrc1VecForm, SrcIdx), NewShiftAmt),
+                                          lshr(getElt(NewLargeSrc1VecForm, SrcIdx - 1), promoteToInt - NewShiftAmt));
           }
         } else {
-          IGC_ASSERT_MESSAGE(0, "Mul legalization for width > 64 (quotient => 3) is not fully supported");
-          NewInst = ConstantInt::get(IntegerType::get(I.getContext(), promoteToInt), 0, false);
+          instSupported = false;
+          IGC_ASSERT_MESSAGE(0, "Shift by amount is not a constant.");
         }
         break;
+      }
+      case Instruction::Mul: {
+        auto computeMulResult = [&]() -> SmallVector<Value *, 4> {
+          Type *ChunkTy = llvm::Type::getIntNTy(I.getContext(), promoteToInt);
+          Function *MulHFunc = llvm::GenISAIntrinsic::getDeclaration(
+              m_builder->GetInsertBlock()->getParent()->getParent(), llvm::GenISAIntrinsic::GenISA_umulH, ChunkTy);
+          Value *Zero = ConstantInt::get(ChunkTy, 0);
+
+          // Split value into chunks
+          SmallVector<Value *, 4> A(quotient), B(quotient);
+          for (unsigned i = 0; i < quotient; ++i) {
+            A[i] = m_builder->CreateExtractElement(NewLargeSrc1VecForm, i);
+            B[i] = m_builder->CreateExtractElement(NewLargeSrc2VecForm, i);
+          }
+
+          // Result vector
+          SmallVector<Value *, 4> R(quotient, Zero);
+
+          // Accumulate `V` into chunk `Pos`, propagating the unsigned carry up to the
+          // most-significant kept chunk (any carry out of that chunk is discarded).
+          auto addWithCarry = [&](unsigned Pos, Value *V) {
+            for (unsigned k = Pos; k < quotient; ++k) {
+              if (auto *C = dyn_cast<Constant>(R[k]); C && C->isNullValue()) {
+                // Adding a single value into an empty chunk cannot carry.
+                R[k] = V;
+                return;
+              }
+              Value *Old = R[k];
+              R[k] = m_builder->CreateAdd(Old, V);
+              if (k + 1 >= quotient)
+                return; // no kept chunk left to receive the carry
+              V = m_builder->CreateZExt(m_builder->CreateICmpULT(R[k], Old), ChunkTy);
+            }
+          };
+
+          for (unsigned i = 0; i < quotient; ++i) {
+            for (unsigned j = 0; i + j < quotient; ++j) {
+              unsigned Pos = i + j;
+              addWithCarry(Pos, m_builder->CreateMul(A[i], B[j]));
+              if (Pos + 1 < quotient)
+                addWithCarry(Pos + 1, m_builder->CreateCall(MulHFunc, {A[i], B[j]}));
+            }
+          }
+          if (Src1width < promoteToInt * quotient) {
+            unsigned ValidBits = Src1width - promoteToInt * (quotient - 1);
+            R[quotient - 1] = m_builder->CreateAnd(R[quotient - 1], (uint64_t(1) << ValidBits) - 1);
+          }
+
+          return R;
+        };
+
+        if (MulResult.empty())
+          MulResult = computeMulResult();
+        NewInst = MulResult[Idx];
+        break;
+      }
       case Instruction::Add:
         instSupported = false;
         IGC_ASSERT_MESSAGE(0, "Add Instruction seen with 'large' illegal int type. Legalization support missing.");

@@ -28,6 +28,7 @@ set(IGC_BUILD__SRC__Optimizer
     "${CMAKE_CURRENT_SOURCE_DIR}/OCLBIUtils.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/PreCompiledFuncImport.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/PromoteToPredicatedMemoryAccess.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/BranchToSelect.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/HoistConvOpToDom.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ReduceOptPass.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/Scalarizer.cpp"
@@ -41,6 +42,7 @@ set(IGC_BUILD__SRC__Optimizer
     "${CMAKE_CURRENT_SOURCE_DIR}/WaveAllJointReduction.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/IntDivRemIncrementReduction.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/InstructionHoistingOptimization.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/SamplerLoopSpeculation.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/WaveBallotCSE.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/RedundantOpsCSE.cpp"
   )
@@ -64,6 +66,7 @@ set(IGC_BUILD__HDR__Optimizer
     "${CMAKE_CURRENT_SOURCE_DIR}/OCLBIUtils.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/PreCompiledFuncImport.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/PromoteToPredicatedMemoryAccess.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/BranchToSelect.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/HoistConvOpToDom.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ReduceOptPass.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/Scalarizer.h"
@@ -77,6 +80,7 @@ set(IGC_BUILD__HDR__Optimizer
     "${CMAKE_CURRENT_SOURCE_DIR}/WaveAllJointReduction.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/IntDivRemIncrementReduction.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/InstructionHoistingOptimization.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/SamplerLoopSpeculation.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/WaveBallotCSE.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/RedundantOpsCSE.hpp"
   )

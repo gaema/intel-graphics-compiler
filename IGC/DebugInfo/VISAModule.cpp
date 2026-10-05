@@ -164,12 +164,6 @@ bool VISAModule::HasVisaOffset(const llvm::Instruction *pInst) const {
   return m_instInfoMap.find(pInst) != m_instInfoMap.end();
 }
 
-unsigned int VISAModule::GetVisaOffset(const llvm::Instruction *pInst) const {
-  InstInfoMap::const_iterator itr = m_instInfoMap.find(pInst);
-  IGC_ASSERT_MESSAGE(itr != m_instInfoMap.end(), "Invalid Instruction");
-  return itr->second.m_offset;
-}
-
 const Module *VISAModule::GetModule() const { return m_Func->getParent(); }
 
 const Function *VISAModule::GetEntryFunction() const { return m_Func; }
@@ -448,6 +442,8 @@ VISAModule::GenISARange VISAModule::getGenISARange(const VISAObjectDebugInfo &VD
 
   auto startIndex = m_genISARangeIndex.find(start)->second;
   const auto endIndex = m_genISARangeIndex.find(end)->second;
+  if (startIndex > endIndex)
+    return GenISARange;
   while (startIndex != (endIndex + 1)) {
     if (!GenISARanges[startIndex].empty()) {
       GenISARange.insert(GenISARange.end(), GenISARanges[startIndex].begin(), GenISARanges[startIndex].end());
@@ -506,13 +502,6 @@ const DbgDecoder::VarInfo *VISAModule::getVarInfo(const VISAObjectDebugInfo &VDI
   if (FoundIt->second->lrs.empty())
     return nullptr;
   return FoundIt->second;
-}
-
-bool VISAModule::hasOrIsStackCall(const VISAObjectDebugInfo &VDI) const {
-  const auto &CFI = VDI.getCFI();
-  if (CFI.befpValid || CFI.frameSize > 0 || CFI.retAddr.size() > 0)
-    return true;
-  return IsIntelSymbolTableVoidProgram();
 }
 
 const std::vector<DbgDecoder::SubroutineInfo> *VISAModule::getSubroutines(const VISAObjectDebugInfo &VDI) const {

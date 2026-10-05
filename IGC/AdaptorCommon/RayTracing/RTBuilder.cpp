@@ -109,15 +109,23 @@ Value *RTBuilder::getMaxBVHLevels(void) {
   if (!DisableRTGlobalsKnownValues)
     return this->getInt32(MAX_BVH_LEVELS);
 
+  Value *rawLevels = nullptr;
   switch (getMemoryStyle()) {
   case RTMemoryStyle::Xe:
-    return _get_maxBVHLevels_Xe(VALUE_NAME("maxBVHLevels"));
+    rawLevels = _get_maxBVHLevels_Xe(VALUE_NAME("maxBVHLevels"));
+    break;
   case RTMemoryStyle::Xe3:
   case RTMemoryStyle::Xe3PEff64:
-    return _get_maxBVHLevels_Xe3(VALUE_NAME("maxBVHLevels"));
+    rawLevels = _get_maxBVHLevels_Xe3(VALUE_NAME("maxBVHLevels"));
+    break;
   }
-  IGC_ASSERT(0);
-  return {};
+
+  IGC_ASSERT(rawLevels != nullptr);
+
+  // maxBVHLevels is encoded as a 3-bit field where 0 wraps to max value.
+  // (0->8, 1->1, 2->2, ...).
+  Value *isZero = this->CreateICmpEQ(rawLevels, this->getInt32(0));
+  return this->CreateSelect(isZero, this->getInt32(8), rawLevels, VALUE_NAME("maxBVHLevelsDecoded"));
 }
 
 Value *RTBuilder::getStatelessScratchPtr(void) { return _get_statelessScratchPtr(VALUE_NAME("statelessScratchPtr")); }
@@ -727,7 +735,8 @@ Value *RTBuilder::alignVal(Value *V, uint64_t Align) {
 
   uint32_t NumBits = V->getType()->getIntegerBitWidth();
   uint64_t Mask = Align - 1;
-  Value *Aligned = this->CreateAnd(this->CreateAdd(V, this->getIntN(NumBits, Mask)), this->getIntN(NumBits, ~Mask),
+  Value *Aligned = this->CreateAnd(this->CreateAdd(V, this->getIntN(NumBits, Mask)),
+                                   this->getIntN(NumBits, ~Mask & llvm::maxUIntN(NumBits)),
                                    VALUE_NAME(V->getName() + Twine("-align-") + Twine(Align)));
 
   return Aligned;
@@ -1886,7 +1895,15 @@ void RTBuilder::createPotentialHit2CommittedHit(StackPointerVal *StackPtr) {
 
 void RTBuilder::createTraceRayInlinePrologue(StackPointerVal *StackPtr, Value *RayInfo, Value *RootNodePtr,
                                              Value *RayFlags, Value *InstanceInclusionMask, Value *ComparisonValue,
-                                             Value *TMax, bool updateFlags, bool initialDoneBitValue) {
+                                             Value *TMax, bool updateFlags, bool initialDoneBitValue,
+                                             Value *MissShaderIndex, Value *HitGroupIndex,
+                                             Value *ShaderIndexMultiplier) {
+  if (!MissShaderIndex)
+    MissShaderIndex = getInt32(0);
+  if (!HitGroupIndex)
+    HitGroupIndex = getInt32(0);
+  if (!ShaderIndexMultiplier)
+    ShaderIndexMultiplier = getInt32(0);
   switch (getMemoryStyle()) {
   case RTMemoryStyle::Xe:
     _createTraceRayInlinePrologue_Xe(StackPtr, RayInfo, RootNodePtr, RayFlags, InstanceInclusionMask, ComparisonValue,
@@ -1894,12 +1911,14 @@ void RTBuilder::createTraceRayInlinePrologue(StackPointerVal *StackPtr, Value *R
     break;
   case RTMemoryStyle::Xe3:
     _createTraceRayInlinePrologue_Xe3(StackPtr, RayInfo, RootNodePtr, RayFlags, InstanceInclusionMask, ComparisonValue,
-                                      TMax, VAdapt{*this, updateFlags}, VAdapt{*this, initialDoneBitValue});
+                                      TMax, VAdapt{*this, updateFlags}, VAdapt{*this, initialDoneBitValue},
+                                      MissShaderIndex, HitGroupIndex, ShaderIndexMultiplier);
     break;
   case RTMemoryStyle::Xe3PEff64:
     _createTraceRayInlinePrologue_Xe3PEff64(StackPtr, RayInfo, RootNodePtr, RayFlags, InstanceInclusionMask,
                                             ComparisonValue, TMax, VAdapt{*this, updateFlags},
-                                            VAdapt{*this, initialDoneBitValue});
+                                            VAdapt{*this, initialDoneBitValue}, MissShaderIndex, HitGroupIndex,
+                                            ShaderIndexMultiplier);
     break;
   }
 }

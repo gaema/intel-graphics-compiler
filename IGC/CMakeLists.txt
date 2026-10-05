@@ -42,7 +42,7 @@ if(NOT DEFINED IGC_API_MAJOR_VERSION)
   set(IGC_API_MAJOR_VERSION 2)
 endif()
 if(NOT DEFINED IGC_API_MINOR_VERSION)
-  set(IGC_API_MINOR_VERSION 38)
+  set(IGC_API_MINOR_VERSION 41)
 endif()
 if(NOT DEFINED IGC_API_PATCH_VERSION)
   set(IGC_API_PATCH_VERSION 0)
@@ -61,6 +61,13 @@ endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
+
+# GFX_DEVELOPMENT_DIR shall be provided by UFO build system. Must be set
+# before including bs_dir_names.cmake, which requires it to already be
+# defined (see Tools/bldsys/include/bs_dir_names.cmake).
+if(NOT GFX_DEVELOPMENT_DIR)
+  get_filename_component(GFX_DEVELOPMENT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../ ABSOLUTE)
+endif()
 
 # ======================================================================================================
 # ================================================ UTILS ===============================================
@@ -200,10 +207,6 @@ unset(_targetArchitecture)
 unset(_hostArchitecture)
 
 
-# GFX_DEVELOPMENT_DIR shall be provided by UFO build system
-if(NOT GFX_DEVELOPMENT_DIR)
-  get_filename_component(GFX_DEVELOPMENT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../ ABSOLUTE)
-endif()
 
 find_program(PYTHON_EXECUTABLE NAMES "python3" "python")
 
@@ -1261,6 +1264,14 @@ igc_config_flag_apply_settings(
       "/ignore:4197"
     )
 
+igc_config_flag_apply_settings(
+    LinkerOptions
+    CMAKE_EXE_LINKER_FLAGS
+    ALL_PATTERN ""
+    SET_RAW
+      "/ignore:4099"
+    )
+
 set(IGC_BUILD__EXPORT_SYMBOLS_LINK_FLAGS_DEBUG
   "${IGC_BUILD__EXPORT_SYMBOLS_LINK_FLAGS_DEBUG}"
   "/ignore:4099")
@@ -1398,12 +1409,6 @@ if(IGC_OPTION__BIF_LINK_BC)
   )
 endif()
 
-if(DEFINED VME_TYPES_DEFINED)
-add_compile_definitions(
-      VME_TYPES_DEFINED=${VME_TYPES_DEFINED}
-    )
-endif()
-
 #SPIRV consumption flag
 if(IGC_BUILD__SPIRV_ENABLED)
   add_compile_definitions(
@@ -1516,6 +1521,12 @@ include_directories(
 include_directories("${IGC_BUILD__IGC_SRC_DIR}/AdaptorOCL/ocl_igc_interface/extensions")
 include_directories("${IGC_BUILD__IGC_BIN_DIR}/AdaptorOCL/ocl_igc_interface/extensions")
 
+string(REGEX MATCH "^[0-9]+" _ocl_spirv_llvm_major "${IGC_OPTION__LLVM_PREFERRED_VERSION}")
+set(_igc_ocl_spirv_headers_dir "${IGC_BUILD__IGC_SRC_DIR}/../SPIRV-Headers-OCL-${_ocl_spirv_llvm_major}")
+set_source_files_properties(
+    "${IGC_BUILD__IGC_SRC_DIR}/AdaptorOCL/ocl_igc_interface/extensions/SPIRVExtensionsSupport.cpp"
+    PROPERTIES INCLUDE_DIRECTORIES "${_igc_ocl_spirv_headers_dir}/include")
+
 
 include_directories(
   "${IGC_BUILD__COMMON_COMPILER_DIR}/common"
@@ -1584,10 +1595,10 @@ if(UNIX)
 
     set(IGC_BUILD__PROJ_SYMBOL_SCRIPT_NAME "igc_create_linker_script.sh")
     set(IGC_BUILD__PROJ_SYMBOL_SCRIPT_FULL_PATH ${CMAKE_CURRENT_SOURCE_DIR}/Scripts/${IGC_BUILD__PROJ_SYMBOL_SCRIPT_NAME})
-    set(IGC_BUILD__PROJ_SYMBOL_SCRIPT_COPY_PATH ${CMAKE_CURRENT_SOURCE_DIR}/${IGC_BUILD__PROJ_SYMBOL_SCRIPT_NAME})
+    set(IGC_BUILD__PROJ_SYMBOL_SCRIPT_COPY_PATH ${CMAKE_CURRENT_BINARY_DIR}/${IGC_BUILD__PROJ_SYMBOL_SCRIPT_NAME})
 
     set(IGC_BUILD__PROJ_LINKER_SCRIPT_NAME igc_symbols.ld)
-    set(IGC_BUILD__PROJ_LINKER_SCRIPT_FULL_PATH ${CMAKE_CURRENT_SOURCE_DIR}/${IGC_BUILD__PROJ_LINKER_SCRIPT_NAME})
+    set(IGC_BUILD__PROJ_LINKER_SCRIPT_FULL_PATH ${CMAKE_CURRENT_BINARY_DIR}/${IGC_BUILD__PROJ_LINKER_SCRIPT_NAME})
 
     set(IGC_BUILD__PROJ_BIF_LIBRARY_NAME "null")
     set(IGC_BUILD__PROJ_DX10_LIBRARY_NAME "null")
@@ -1642,6 +1653,10 @@ igc_sg_define(IGC__AdaptorOCL)
 
 if(FCL_ENABLED)
   include(igc_find_opencl_clang)
+  # Locate the optional igc-clang prebuild (SYCL-based clang). Creates the
+  # GLOBAL igc-clang-lib IMPORTED target when fetched; consumed by the install
+  # rules below and by the ocloc lit tests (IGC_LibClangOverride).
+  include(igc_find_igc_clang)
 endif()
 
 if(IGC_BUILD__VC_ENABLED)
@@ -1704,7 +1719,15 @@ if(IGC_BUILD__VC_ENABLED)
         endforeach()
         set(IGC_BUILD__CMOPT_DEFAULT_DIR "${IGC_BUILD__CMOPT_DEFAULT_DIR}/usr")
       else()
-        message(WARNING "LLVM packages directory not found: ${LLVM_PACKAGES_DIR}")
+        message(FATAL_ERROR
+          "Pre-built shared linked opt and llc are required for VC LIT testing, "
+          "but the LLVM packages directory was not found: ${LLVM_PACKAGES_DIR}\n"
+          "VC LIT tests must run against the SharedRelease LLVM prebuild matching "
+          "IGC_OPTION__LLVM_PREFERRED_VERSION=${IGC_OPTION__LLVM_PREFERRED_VERSION}; "
+          "otherwise the build silently falls back to the system LLVM 'opt', which "
+          "cannot load the VC backend plugin.\n"
+          "Provide the prebuild at the path above, or disable VC LIT tests with "
+          "-DIGC_BUILD__CMLIT_ENABLE=OFF.")
       endif()
     endif()
 
@@ -1850,9 +1873,12 @@ if(IGC_BUILD__VC_ENABLED)
 endif()
 
 # Build-order dependencies for generated headers.
+add_dependencies("${IGC_BUILD__PROJ__igc_objs}" MDAutogen)
 add_dependencies("${IGC_BUILD__PROJ__igc_objs}" RTStackReflectionIRBG)
 add_dependencies("${IGC_BUILD__PROJ__igc_objs}" RenderSurfaceStateIRBG)
 add_dependencies("${IGC_BUILD__PROJ__igc_objs}" SPIRVExtensionsSupportGen)
+add_dependencies("${IGC_BUILD__PROJ__igc_objs}" IGCOptionsTablegen)
+add_dependencies("${IGC_BUILD__PROJ__igc_objs}" "${IGC_BUILD__PROJ__GenISAIntrinsics}")
 
 # Main library targets: they consume the shared .obj set via
 # $<TARGET_OBJECTS:...> and only differ by output type + resources.
@@ -1930,11 +1956,11 @@ if(UNIX)
   endif()
 
 
-  #Copying script to current directory to elevate permissions - replaces file if already exists
+  #Copying script to the build directory to elevate permissions - replaces file if already exists
   file(
       COPY ${IGC_BUILD__PROJ_SYMBOL_SCRIPT_FULL_PATH}
       FILE_PERMISSIONS OWNER_EXECUTE OWNER_WRITE OWNER_READ
-      DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}
+      DESTINATION ${CMAKE_CURRENT_BINARY_DIR}
   )
 
   if(TARGET ${IGC_BUILD__PROJ__AdaptorDX})
@@ -2070,8 +2096,6 @@ if(IGC_OPTION__BUILD_IGC_OPT OR IGC_OPTION__INCLUDE_IGC_COMPILER_TOOLS)
     )
   set_target_properties("${IGC_BUILD__PROJ__igc_lib}" PROPERTIES FOLDER "Libraries")
 
-  add_dependencies(${IGC_BUILD__PROJ__igc_lib} RTStackReflectionIRBG)
-  add_dependencies(${IGC_BUILD__PROJ__igc_lib} RenderSurfaceStateIRBG)
   if(IGC_OPTION__LINK_KHRONOS_SPIRV_TRANSLATOR)
     target_link_libraries("${IGC_BUILD__PROJ__igc_lib}" PRIVATE LLVMSPIRVLib)
   endif()
@@ -2125,13 +2149,6 @@ set_property(TARGET "GenX_IR" PROPERTY PROJECT_LABEL "${IGC_BUILD__PROJ_LABEL__G
 # =================================== Link targets and dependencies ====================================
 
 foreach(_libBuildSuffix ${IGC_BUILD__MAIN_IGC_LIB_SUFFIXES})
-  add_dependencies("${IGC_BUILD__PROJ${_libBuildSuffix}}"     "${IGC_BUILD__PROJ__GenISAIntrinsics}")
-  add_dependencies("${IGC_BUILD__PROJ${_libBuildSuffix}}"     MDAutogen)
-  add_dependencies("${IGC_BUILD__PROJ${_libBuildSuffix}}"     RTStackReflectionIRBG)
-  add_dependencies("${IGC_BUILD__PROJ${_libBuildSuffix}}"     RenderSurfaceStateIRBG)
-
-  add_dependencies("${IGC_BUILD__PROJ${_libBuildSuffix}}"     SPIRVExtensionsSupportGen)
-
   if(MSVC AND IGC_OPTION__BIF_LINK_BC)
     add_dependencies("${IGC_BUILD__PROJ${_libBuildSuffix}}"   "${IGC_BUILD__PROJ__BiFModule_OCL}")
   add_dependencies("${IGC_BUILD__PROJ${_libBuildSuffix}}"   "${IGC_BUILD__PROJ__BiFModuleCache_OCL}")
@@ -2412,6 +2429,12 @@ if(IGC_OPTION__ENABLE_OCLOC_LIT_TESTS)
   add_subdirectory(ocloc_tests)
 endif()
 
+# ========================================= INTERFACE LIT TESTS =======================================
+
+if(IGC_OPTION__ENABLE_LIT_TESTS)
+  add_subdirectory(OCLInterfaceTester)
+endif()
+
 # ======================================================================================================
 
 # Workaround for MSVS10 to avoid the "Dialog Hell"
@@ -2480,6 +2503,23 @@ elseif (WIN32)
           RUNTIME DESTINATION Release/bin          CONFIGURATIONS Release)
   install(TARGETS ${IGC_BUILD__PROJ__igc_dll}
           RUNTIME DESTINATION Debug/bin            CONFIGURATIONS Debug)
+
+  # Ship the optional igc-clang prebuild when present, excluding Production builds.
+  if(TARGET igc-clang-lib AND NOT "${PRODUCTION_BUILD}" STREQUAL "True")
+    install(FILES $<TARGET_FILE:igc-clang-lib>
+            DESTINATION Debug/bin            CONFIGURATIONS Debug)
+    install(FILES $<TARGET_FILE:igc-clang-lib>
+            DESTINATION ../Test_Tools/Debug/x64/Standalones            CONFIGURATIONS Debug)
+
+    # Imported target, so reference the prebuild PDB directly
+    # ($<TARGET_PDB_FILE> is unavailable); guarded on its presence.
+    get_filename_component(_igc_clang_pdb_name "${IGC_CLANG_LIB_PATH}" NAME_WE)
+    set(_igc_clang_pdb "${IGC_CLANG_PREBUILD_DIR}/${_igc_clang_pdb_name}.pdb")
+    if(EXISTS "${_igc_clang_pdb}")
+      install(FILES "${_igc_clang_pdb}"
+              DESTINATION Debug/pdb            CONFIGURATIONS Debug)
+    endif()
+  endif()
 
   install(FILES $<TARGET_PDB_FILE:${IGC_BUILD__PROJ__igc_dll}>
           DESTINATION Release/pdb              CONFIGURATIONS Release)
@@ -2565,8 +2605,8 @@ if(UNIX)
 
   set(CPACK_PACKAGE_INSTALL_DIRECTORY ${IGC_INSTALL_TIME_ROOT_DIR})
   set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA "postinst;postrm")
-  set(CPACK_DEBIAN_PACKAGE_DESCRIPTION "Intel(R) Graphics Compiler for OpenCL(TM)\nBase revision: ${IGC_BUILD_METADATA+IGC_RELEASE_METADATA}")
-  set(CPACK_RPM_PACKAGE_DESCRIPTION "Intel(R) Graphics Compiler for OpenCL(TM)\nBase revision: ${IGC_BUILD_METADATA+IGC_RELEASE_METADATA}")
+  set(CPACK_DEBIAN_PACKAGE_DESCRIPTION "Intel(R) Graphics Compiler for OpenCL(TM)")
+  set(CPACK_RPM_PACKAGE_DESCRIPTION "Intel(R) Graphics Compiler for OpenCL(TM)")
   set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
   set(CPACK_RPM_PACKAGE_RELOCATABLE TRUE)
 

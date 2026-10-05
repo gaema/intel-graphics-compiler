@@ -12,6 +12,7 @@ SPDX-License-Identifier: MIT
 #include "Probe/Assertion.h"
 #include "llvmWrapper/Support/Alignment.h"
 #include "llvmWrapper/IR/Intrinsics.h"
+#include "llvmWrapper/IR/IntrinsicInst.h"
 #include "llvmWrapper/IR/Type.h"
 
 #include <llvm/ADT/ArrayRef.h>
@@ -32,7 +33,7 @@ static Type *getIntrinsicRetTypeBasedOnArgs(Intrinsic::ID IID,
   switch (IID) {
   case Intrinsic::masked_gather:
     // "Pass through" operand.
-    return ArgTys[3];
+    return ArgTys[IGCLLVM::getMaskedGatherPassThruOperandNo()];
   case Intrinsic::masked_scatter:
     return Type::getVoidTy(C);
   default:

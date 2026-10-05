@@ -21,19 +21,14 @@ See LICENSE.TXT for details.
 #include "common/LLVMWarningsPush.hpp"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/IR/Constants.h"
-#include "llvm/IR/DIBuilder.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Demangle/Demangle.h"
-#include "llvm/CodeGen/DIE.h"
-#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/MC/MCSection.h"
 #include "llvm/MC/MCSymbol.h"
-#include "llvm/MC/MCSymbolELF.h"
-#include "llvm/MC/MachineLocation.h"
 #include "common/LLVMWarningsPop.hpp"
-#include "llvmWrapper/IR/IntrinsicInst.h"
+#include "llvmWrapper/IR/DebugInfo.h"
 #include <cmath>
 #include <optional>
 // clang-format on
@@ -49,7 +44,6 @@ See LICENSE.TXT for details.
 #include "Compiler/CISACodeGen/messageEncoding.hpp"
 
 #include "Probe/Assertion.h"
-#include <cmath>
 #include <variant>
 #define DEBUG_TYPE "dwarfdebug"
 
@@ -275,13 +269,6 @@ void CompileUnit::addString(DIE *Die, dwarf::Attribute Attribute, StringRef Stri
   Die->addValue(Attribute, dwarf::DW_FORM_string, Str);
 }
 
-/// addExpr - Add a Dwarf expression attribute data and value.
-///
-void CompileUnit::addExpr(IGC::DIEBlock *Die, dwarf::Form Form, const MCExpr *Expr) {
-  DIEValue *Value = new (DIEValueAllocator) DIEExpr(Expr);
-  Die->addValue((dwarf::Attribute)0, Form, Value);
-}
-
 /// addLabel - Add a Dwarf label attribute data and value.
 ///
 void CompileUnit::addLabel(DIE *Die, dwarf::Attribute Attribute, dwarf::Form Form, const MCSymbol *Label) {
@@ -484,18 +471,6 @@ void CompileUnit::addRegisterOp(IGC::DIEBlock *TheDie, unsigned DWReg) {
     addUInt(TheDie, dwarf::DW_FORM_data1, dwarf::DW_OP_regx);
     addUInt(TheDie, dwarf::DW_FORM_udata, DWRegEncoded);
   }
-}
-
-/// addRegisterOffset - Add register offset.
-void CompileUnit::addRegisterOffset(IGC::DIEBlock *TheDie, unsigned DWReg, int64_t Offset) {
-  auto DWRegEncoded = GetEncodedRegNum<RegisterNumbering::GRFBase>(DWReg);
-  if (DWRegEncoded < 32) {
-    addUInt(TheDie, dwarf::DW_FORM_data1, dwarf::DW_OP_breg0 + DWRegEncoded);
-  } else {
-    addUInt(TheDie, dwarf::DW_FORM_data1, dwarf::DW_OP_bregx);
-    addUInt(TheDie, dwarf::DW_FORM_udata, DWRegEncoded);
-  }
-  addSInt(TheDie, dwarf::DW_FORM_sdata, Offset);
 }
 
 /// isTypeSigned - Return true if the type is signed.
@@ -1149,46 +1124,6 @@ void CompileUnit::addSimdLaneRegionBase(IGC::DIEBlock *Block, const DbgVariable 
   }
 }
 
-/// getParentContextString - Walks the metadata parent chain in a language
-/// specific manner (using the compile unit language) and returns
-/// it as a string. This is done at the metadata level because DIEs may
-/// not currently have been added to the parent context and walking the
-/// DIEs looking for names is more expensive than walking the metadata.
-std::string CompileUnit::getParentContextString(DIScope *Context) const {
-  if (!Context)
-    return "";
-
-  // FIXME: Decide whether to implement this for non-C++ languages.
-  if (getLanguage() != dwarf::DW_LANG_C_plus_plus)
-    return "";
-
-  std::string CS;
-
-  SmallVector<DIScope *, 1> Parents;
-  while (!isa<DICompileUnit>(Context)) {
-    Parents.push_back(Context);
-    if (Context->getScope())
-      Context = resolve(Context->getScope());
-    else
-      // Structure, etc types will have a NULL context if they're at the top
-      // level.
-      break;
-  }
-
-  // Reverse iterate over our list to go from the outermost construct to the
-  // innermost.
-  for (SmallVectorImpl<DIScope *>::reverse_iterator I = Parents.rbegin(), E = Parents.rend(); I != E; ++I) {
-    DIScope *Ctx = *I;
-    StringRef Name = Ctx->getName();
-    if (!Name.empty()) {
-      CS += Name;
-      CS += "::";
-    }
-  }
-
-  return CS;
-}
-
 /// constructTypeDIE - Construct basic type die from DIBasicType.
 void CompileUnit::constructTypeDIE(DIE &Buffer, DIBasicType *BTy) {
   // Get core information.
@@ -1275,40 +1210,8 @@ void CompileUnit::constructTypeDIE(DIE &Buffer, DIDerivedType *DTy) {
   }
 }
 
-/// Return true if the type is appropriately scoped to be contained inside
-/// its own type unit.
-static bool isTypeUnitScoped(DIType *Ty, const DwarfDebug *DD) {
-  DIScope *Parent = DD->resolve(Ty->getScope());
-  while (Parent) {
-    // Don't generate a hash for anything scoped inside a function.
-    if (isa<DISubprogram>(Parent))
-      return false;
-
-    Parent = DD->resolve(Parent->getScope());
-  }
-  return true;
-}
-
-/// Return true if the type should be split out into a type unit.
-static bool shouldCreateTypeUnit(DICompositeType *CTy, const DwarfDebug *DD) {
-  uint16_t Tag = (uint16_t)CTy->getTag();
-
-  switch (Tag) {
-  case dwarf::DW_TAG_structure_type:
-  case dwarf::DW_TAG_union_type:
-  case dwarf::DW_TAG_enumeration_type:
-  case dwarf::DW_TAG_class_type:
-    // If this is a class, structure, union, or enumeration type
-    // that is a definition (not a declaration), and not scoped
-    // inside a function then separate this out as a type unit.
-    return !CTy->isForwardDecl() && isTypeUnitScoped(CTy, DD);
-  default:
-    return false;
-  }
-}
-
 void CompileUnit::constructTypeDIE(DIE &Buffer, DISubroutineType *STy) {
-  DITypeRefArray Elements = cast<DISubroutineType>(STy)->getTypeArray();
+  IGCLLVM::DITypeRefArray Elements = cast<DISubroutineType>(STy)->getTypeArray();
   DIType *RTy = resolve(Elements[0]);
   if (RTy)
     addType(&Buffer, RTy);
@@ -1356,7 +1259,7 @@ void CompileUnit::constructTypeDIE(DIE &Buffer, DICompositeType *CTy) {
     break;
   case dwarf::DW_TAG_subroutine_type: {
     // Add return type. A void return won't have a type.
-    DITypeRefArray Elements = cast<DISubroutineType>(CTy)->getTypeArray();
+    IGCLLVM::DITypeRefArray Elements = cast<DISubroutineType>(CTy)->getTypeArray();
     DIType *RTy = resolve(Elements[0]);
     if (RTy)
       addType(&Buffer, RTy);
@@ -1464,12 +1367,6 @@ void CompileUnit::constructTypeDIE(DIE &Buffer, DICompositeType *CTy) {
       addSourceLine(&Buffer, CTy);
     }
   }
-  // If this is a type applicable to a type unit it then add it to the
-  // list of types we'll compute a hash for later.
-  if (shouldCreateTypeUnit(CTy, DD)) {
-    DD->addTypeUnitType(&Buffer);
-  }
-
   // Add flags if available
   if (CTy->isTypePassByValue())
     addUInt(&Buffer, dwarf::DW_AT_calling_convention, dwarf::DW_FORM_data1, dwarf::DW_CC_pass_by_value);
@@ -1719,7 +1616,7 @@ IGC::DIE *CompileUnit::getOrCreateSubprogramDIE(DISubprogram *SP) {
   IGC_ASSERT_MESSAGE(SPTy->getTag() == dwarf::DW_TAG_subroutine_type,
                      "the type of a subprogram should be a subroutine");
 
-  DITypeRefArray Args = SPTy->getTypeArray();
+  IGCLLVM::DITypeRefArray Args = SPTy->getTypeArray();
   // Add a return type. If this is a type like a C/C++ void type we don't add a
   // return type.
   if (Args.size() > 0 && resolve(Args[0]))
@@ -1795,12 +1692,6 @@ IGC::DIE *CompileUnit::getOrCreateModuleDIE(DIModule *MD) {
 DIEDwarfExpression::DIEDwarfExpression(const StreamEmitter &AP, CompileUnit &CU, DIEBlock &DIE)
     : DwarfExpression(CU), AP(AP), OutDIE(DIE) {}
 
-void DwarfExpression::addExpression(DIExpressionCursor &&ExprCursor) {
-  addExpression(std::move(ExprCursor), [](unsigned Idx, DIExpressionCursor &Cursor) -> bool {
-    llvm_unreachable("unhandled opcode found in expression");
-  });
-}
-
 void DIEDwarfExpression::emitOp(uint8_t Op, const char *Comment) {
   CU.addUInt(&getActiveDIE(), dwarf::DW_FORM_data1, Op);
 }
@@ -1829,7 +1720,6 @@ void CompileUnit::constructSubrangeDIE(DIE &Buffer, DISubrange *SR, DIE *IndexTy
     } else if (auto *BE = Bound.dyn_cast<DIExpression *>()) {
       DIEBlock *Loc = new (DIEValueAllocator) DIEBlock;
       IGC::DIEDwarfExpression DwarfExpr(*Asm, getCU(), *Loc);
-      // DwarfExpr.setMemoryLocationKind();
       DwarfExpr.addExpression(BE);
       addBlock(DW_Subrange, Attr, DwarfExpr.finalize());
     } else if (auto *BI = Bound.dyn_cast<ConstantInt *>()) {
@@ -1864,7 +1754,6 @@ void CompileUnit::constructArrayTypeDIE(DIE &Buffer, DICompositeType *CTy) {
   } else if (DIExpression *Expr = CTy->getDataLocationExp()) {
     DIEBlock *Loc = new (DIEValueAllocator) DIEBlock;
     IGC::DIEDwarfExpression DwarfExpr(*Asm, getCU(), *Loc);
-    // DwarfExpr.setMemoryLocationKind();
     DwarfExpr.addExpression(Expr);
     addBlock(&Buffer, dwarf::DW_AT_data_location, DwarfExpr.finalize());
   }
@@ -1878,7 +1767,6 @@ void CompileUnit::constructArrayTypeDIE(DIE &Buffer, DICompositeType *CTy) {
   } else if (DIExpression *Expr = CTy->getAssociatedExp()) {
     DIEBlock *Loc = new (DIEValueAllocator) DIEBlock;
     DIEDwarfExpression DwarfExpr(*Asm, getCU(), *Loc);
-    // DwarfExpr.setMemoryLocationKind();
     DwarfExpr.addExpression(Expr);
     addBlock(&Buffer, dwarf::DW_AT_associated, DwarfExpr.finalize());
   }
@@ -1892,7 +1780,6 @@ void CompileUnit::constructArrayTypeDIE(DIE &Buffer, DICompositeType *CTy) {
   } else if (DIExpression *Expr = CTy->getAllocatedExp()) {
     DIEBlock *Loc = new (DIEValueAllocator) DIEBlock;
     DIEDwarfExpression DwarfExpr(*Asm, getCU(), *Loc);
-    // DwarfExpr.setMemoryLocationKind();
     DwarfExpr.addExpression(Expr);
     addBlock(&Buffer, dwarf::DW_AT_allocated, DwarfExpr.finalize());
   }
@@ -2061,7 +1948,11 @@ void CompileUnit::buildLocation(const DbgVarInstEntry *dbgEntry, DbgVariable &DV
     } else {
       DwarfDebug::DataVector rawData;
       DD->ExtractConstantData(pConstVal, rawData);
-      addConstantData(VariableDie, rawData.data(), rawData.size());
+      const DIType *Ty = DV.getType();
+      const bool SizeMatches = !Ty || Ty->getSizeInBits() == 0 || rawData.size() * 8 == Ty->getSizeInBits();
+      IGC_ASSERT_MESSAGE(SizeMatches, "DW_AT_const_value size does not match the variable type size");
+      if (SizeMatches)
+        addConstantData(VariableDie, rawData.data(), rawData.size());
     }
     LLVM_DEBUG(dbgs() << "  location is built as an imm\n");
     DV.setDIE(VariableDie);
@@ -2163,7 +2054,9 @@ bool CompileUnit::buildPrivateBaseRegBased(const DbgVariable &var, IGC::DIEBlock
   const auto *VISAMod = loc.GetVISAModule();
 
   auto storageOffsetOpt = VISAMod->getStorageOffset(dbgEntry);
+  auto storageStrideOpt = VISAMod->getStorageStride(dbgEntry);
   IGC_ASSERT(storageOffsetOpt.has_value());
+  IGC_ASSERT(storageStrideOpt.has_value());
   const int64_t rawStorageOffset = static_cast<int64_t>(*storageOffsetOpt);
 
   auto privateBaseRegNum = VISAMod->getPrivateBaseReg();
@@ -2273,14 +2166,12 @@ bool CompileUnit::buildPrivateBaseRegBased(const DbgVariable &var, IGC::DIEBlock
   addUInt(Block, dwarf::DW_FORM_data1,
           DW_OP_INTEL_push_simd_lane); // 12 DW_OP_INTEL_push_simd_lane
 
-  auto varSizeInBytes = var.getRegisterValueSizeInBits(DD) / 8;
+  auto perLaneStride = *storageStrideOpt;
 
-  LLVM_DEBUG(dbgs() << "  var Offset: " << offset << ", var Size: " << varSizeInBytes << "\n");
-  IGC_ASSERT_MESSAGE((var.getRegisterValueSizeInBits(DD) & 0x7) == 0, "Unexpected variable size");
+  LLVM_DEBUG(dbgs() << "  var Offset: " << offset << ", per-lane stride: " << perLaneStride << "\n");
 
   addConstantUValue(Block,
-                    varSizeInBytes);                       // 13 DW_OP_const1u/2u/4u/8u <variableSize>
-                                                           // , i.e. size in bytes
+                    perLaneStride);                        // 13 DW_OP_const1u/2u/4u/8u <per-lane stride> in bytes
   addUInt(Block, dwarf::DW_FORM_data1, dwarf::DW_OP_mul);  // 14 DW_OP_mul
   addUInt(Block, dwarf::DW_FORM_data1, dwarf::DW_OP_plus); // 15 DW_OP_plus
 
@@ -2299,17 +2190,16 @@ bool CompileUnit::buildFpBasedLoc(const DbgVariable &var, IGC::DIEBlock *Block, 
   const auto *VISAMod = loc.GetVISAModule();
 
   auto storageOffsetOpt = VISAMod->getStorageOffset(var.getDbgEntry());
-  auto storageSizeOpt = VISAMod->getStorageSize(var.getDbgEntry());
+  auto storageStrideOpt = VISAMod->getStorageStride(var.getDbgEntry());
   IGC_ASSERT(storageOffsetOpt.has_value());
-  IGC_ASSERT(storageSizeOpt.has_value());
+  IGC_ASSERT(storageStrideOpt.has_value());
   uint64_t rawOffset = *storageOffsetOpt;
-  uint64_t rawSize = *storageSizeOpt;
+  uint64_t storageStride = *storageStrideOpt;
 
   LLVM_DEBUG(dbgs() << "  generating FP-based location\n");
   auto simdSize = VISAMod->GetSIMDSize();
   uint64_t storageOffset = simdSize * rawOffset;
-  uint64_t storageSize = rawSize;
-  LLVM_DEBUG(dbgs() << "  StorageOffset: " << storageOffset << ", StorageSize: " << storageSize << "\n");
+  LLVM_DEBUG(dbgs() << "  StorageOffset: " << storageOffset << ", StorageStride: " << storageStride << "\n");
 
   // There is a private value in the current stack frame
   // 1 DW_OP_regx <Frame Pointer reg encoded>
@@ -2319,7 +2209,7 @@ bool CompileUnit::buildFpBasedLoc(const DbgVariable &var, IGC::DIEBlock *Block, 
   // 5 DW_OP_plus_uconst  SIZE_OWORD         -- i.e. 0x10 taken from getFPOffset();
   //                                            same as emitted in EmitPass::emitStackAlloca()
   // 6 DW_OP_push_simd_lane
-  // 7 DW_OP_const1u/2u/4u/8u  storageSize   -- storage map: StorageSize; the size of the variable
+  // 7 DW_OP_const1u/2u/4u/8u  storageStride -- storage map: StorageStride; per lane stride
   // 8 DW_OP_mul
   // 9 DW_OP_plus
   // 10 DW_OP_plus_uconst storageOffset      -- storage map: StorageOffset; the offset where each
@@ -2353,7 +2243,7 @@ bool CompileUnit::buildFpBasedLoc(const DbgVariable &var, IGC::DIEBlock *Block, 
 
   addUInt(Block, dwarf::DW_FORM_data1,
           DW_OP_INTEL_push_simd_lane);                     // 6 DW_OP_INTEL_push_simd_lane
-  addConstantUValue(Block, storageSize);                   // 7 DW_OP_const1u/2u/4u/8u storageSize
+  addConstantUValue(Block, storageStride);                 // 7 DW_OP_const1u/2u/4u/8u storageStride
   addUInt(Block, dwarf::DW_FORM_data1, dwarf::DW_OP_mul);  // 8 DW_OP_mul
   addUInt(Block, dwarf::DW_FORM_data1, dwarf::DW_OP_plus); // 9 DW_OP_plus
 
@@ -2516,7 +2406,7 @@ IGC::DIEBlock *CompileUnit::buildGeneral(DbgVariable &var, const VISAVariableLoc
   IGC_ASSERT_MESSAGE(VISAMod, "VISA Module is expected for LOC");
 
   bool hasStorageOffset = VISAMod->getStorageOffset(var.getDbgEntry()).has_value();
-  bool hasStorageSize = VISAMod->getStorageSize(var.getDbgEntry()).has_value();
+  bool isStackBasedStorage = VISAMod->getStorageIsStackBased(var.getDbgEntry()).value_or(false);
 
   if (VISAMod->getPrivateBase() && VISAMod->hasPTO() && hasStorageOffset) {
     // This is executed only when llvm.dbg.declare still exists and no stack
@@ -2532,7 +2422,7 @@ IGC::DIEBlock *CompileUnit::buildGeneral(DbgVariable &var, const VISAVariableLoc
     }
   }
 
-  if (hasStorageOffset && hasStorageSize) {
+  if (hasStorageOffset && isStackBasedStorage) {
     emitLocation = true;
     if (!buildFpBasedLoc(var, Block, loc))
       return Block;
@@ -2545,8 +2435,8 @@ IGC::DIEBlock *CompileUnit::buildGeneral(DbgVariable &var, const VISAVariableLoc
   }
 
   if (skipOff) {
-    // In split SIMD case, we want to skip to DW_OP_stack_value at the end,
-    // not past it.
+    // In split SIMD, branch to a shared trailing DW_OP_stack_value when
+    // present; otherwise branch to the end of the expression.
     unsigned int offsetEnd = Block->ComputeSizeOnTheFly(Asm) - stackValueOffset;
     cast<DIEInteger>(skipOff)->setValue(offsetEnd - offsetTaken);
   }

@@ -26,22 +26,24 @@
 ; below delta-3, or threshold >= 3) or leaves them as two separate <4 x float>
 ; reads (threshold in (0, 3)).
 
-; REQUIRES: llvm-14-plus, regkeys
+; REQUIRES: llvm-14-plus, regkeys, shader-types
 
 ; delta = 0 disables the check -> merge as before
-; RUN: igc_opt --opaque-pointers %s -S -o - -ocl -platformdg2 --regkey ConstantCoalescingMaxBBDepthDelta=0 -igc-constant-coalescing | FileCheck %s --check-prefixes=CHECK,MERGE
+; Run as a pixel shader: the guard is shader-type-agnostic, not RT-gated.
+; RUN: igc_opt --opaque-pointers %s -S -o - -inputps -platformdg2 --regkey ConstantCoalescingMaxBBDepthDelta=0,ConstantCoalescingDepthCheckMinBytes=0 -igc-constant-coalescing | FileCheck %s --check-prefixes=CHECK,MERGE
 
 ; delta = 1 (< 3) -> reject the merge, leave both loads separate
-; RUN: igc_opt --opaque-pointers %s -S -o - -ocl -platformdg2 --regkey ConstantCoalescingMaxBBDepthDelta=1 -igc-constant-coalescing | FileCheck %s --check-prefixes=CHECK,SPLIT
+; RUN: igc_opt --opaque-pointers %s -S -o - -inputrt -platformdg2 --regkey ConstantCoalescingMaxBBDepthDelta=1,ConstantCoalescingDepthCheckMinBytes=0 -igc-constant-coalescing | FileCheck %s --check-prefixes=CHECK,SPLIT
 
 ; delta = 2 (< 3) -> reject the merge as well
-; RUN: igc_opt --opaque-pointers %s -S -o - -ocl -platformdg2 --regkey ConstantCoalescingMaxBBDepthDelta=2 -igc-constant-coalescing | FileCheck %s --check-prefixes=CHECK,SPLIT
+; Run as a compute shader: the guard is shader-type-agnostic, not RT-gated.
+; RUN: igc_opt --opaque-pointers %s -S -o - -inputcs -platformdg2 --regkey ConstantCoalescingMaxBBDepthDelta=2,ConstantCoalescingDepthCheckMinBytes=0 -igc-constant-coalescing | FileCheck %s --check-prefixes=CHECK,SPLIT
 
 ; delta = 3 (== 3) -> allow the merge (the check rejects only delta > maxDepthDelta)
-; RUN: igc_opt --opaque-pointers %s -S -o - -ocl -platformdg2 --regkey ConstantCoalescingMaxBBDepthDelta=3 -igc-constant-coalescing | FileCheck %s --check-prefixes=CHECK,MERGE
+; RUN: igc_opt --opaque-pointers %s -S -o - -ocl -platformdg2 --regkey ConstantCoalescingMaxBBDepthDelta=3,ConstantCoalescingDepthCheckMinBytes=0 -igc-constant-coalescing | FileCheck %s --check-prefixes=CHECK,MERGE
 
 ; delta = 10 (> 3) -> allow the merge
-; RUN: igc_opt --opaque-pointers %s -S -o - -ocl -platformdg2 --regkey ConstantCoalescingMaxBBDepthDelta=10 -igc-constant-coalescing | FileCheck %s --check-prefixes=CHECK,MERGE
+; RUN: igc_opt --opaque-pointers %s -S -o - -ocl -platformdg2 --regkey ConstantCoalescingMaxBBDepthDelta=10,ConstantCoalescingDepthCheckMinBytes=0 -igc-constant-coalescing | FileCheck %s --check-prefixes=CHECK,MERGE
 
 target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
 target triple = "spir64-unknown-unknown"

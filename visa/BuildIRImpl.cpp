@@ -23,6 +23,11 @@ SPDX-License-Identifier: MIT
 #include "visa_igc_common_header.h"
 #include <optional>
 
+// clang-format off
+#include "common/LLVMWarningsPush.hpp"
+#include "llvm/Support/MathExtras.h"
+#include "common/LLVMWarningsPop.hpp"
+// clang-format on
 
 using namespace vISA;
 
@@ -387,6 +392,84 @@ bool IR_Builder::tryToAlignOperand(G4_Operand *opnd, unsigned short &offset,
 bool IR_Builder::tryToAlignOperand(G4_Operand *opnd, int alignByte) const {
   uint16_t offset = 0; // ignored
   return tryToAlignOperand(opnd, offset, alignByte);
+}
+
+// Try to align the root dcl of "opnd" with the given alignment
+// "alignBytes" (a variant of tryToAlignOperand()).
+//
+// Only srcRegRegion/dstRegRegion operands with direct register access are
+// handled; anything else returns false.
+//
+//   Return value:  true if the root dcl's alignment is (or was just forced
+//                  to be) at least "alignBytes". Input variables (G4_INPUT)
+//                  are always treated as GRF-aligned without modification.
+//   offset:        offset in bytes for this operand, valid only when the
+//                  return value is true.
+//
+// Note: for getting an operand's subreg, the operand subreg is known if
+// its root dcl is GRF aligned. This function forces the root dcl to be
+// GRF aligned; once aligned, ("offset" % GRFSizeBytes) is the subreg
+// in bytes.
+bool IR_Builder::tryToAlignOperandRootDcl(G4_Operand *opnd, uint32_t &offset,
+                                          int alignBytes) {
+  vASSERT(alignBytes <= (int)numEltPerGRF<Type_UB>());
+  vASSERT(llvm::isPowerOf2_32(alignBytes));
+
+  offset = 0;
+  switch (opnd->getKind()) {
+  case G4_Operand::srcRegRegion:
+  case G4_Operand::dstRegRegion: {
+    int type_size = opnd->getTypeSize();
+    G4_Declare *dcl = NULL;
+    if (opnd->getBase()->isRegVar()) {
+      dcl = opnd->getBase()->asRegVar()->getDeclare();
+      dcl = dcl->getRootDeclare(offset);
+      if (dcl && dcl->getRegVar() && dcl->getRegVar()->isPhyRegAssigned()) {
+        offset +=
+            static_cast<unsigned short>(dcl->getRegVar()->getByteAddr(*this));
+      }
+    }
+
+    if (opnd->isDstRegRegion()) {
+      if (opnd->asDstRegRegion()->getRegAccess() != Direct) {
+        return false;
+      }
+      offset += opnd->asDstRegRegion()->getRegOff() * numEltPerGRF<Type_UB>() +
+                opnd->asDstRegRegion()->getSubRegOff() * type_size;
+    } else if (opnd->isSrcRegRegion()) {
+      if (opnd->asSrcRegRegion()->getRegAccess() != Direct) {
+        return false;
+      }
+      offset += opnd->asSrcRegRegion()->getRegOff() * numEltPerGRF<Type_UB>() +
+                opnd->asSrcRegRegion()->getSubRegOff() * type_size;
+    }
+
+    if (!dcl)
+      return false;
+
+    if (dcl->getRegFile() == G4_GRF) {
+      // "Any" means unconstrained; treat as 1-byte alignment so it's
+      // always widened below.
+      int dclAlignBytes =
+          (dcl->getSubRegAlign() == Any) ? 1 : dcl->getSubRegAlign() * 2;
+      if (dclAlignBytes < alignBytes) {
+        vASSERT((alignBytes % dclAlignBytes) == 0);
+        dcl->setSubRegAlign(G4_SubReg_Align(alignBytes / 2));
+      } else {
+        // Already sufficiently aligned.
+        vASSERT((dclAlignBytes % alignBytes) == 0);
+      }
+      return true;
+    } else if (dcl->getRegFile() == G4_INPUT) {
+      // Always GRF aligned for input (relative to r0).
+      return true;
+    }
+    break;
+  }
+  default:
+    break;
+  }
+  return false;
 }
 
 void IR_Builder::predefinedVarRegAssignment(uint8_t inputSize) {
@@ -1920,6 +2003,7 @@ G4_INST *IR_Builder::createInternalDpasInst(
                         options, A, W, D, C, false);
 }
 
+
 G4_INST *IR_Builder::createBfnInst(uint8_t booleanFuncCtrl, G4_Predicate *prd,
                                    G4_CondMod *mod, G4_Sat sat,
                                    G4_ExecSize execSize, G4_DstRegRegion *dst,
@@ -2916,6 +3000,7 @@ G4_SendgDesc *IR_Builder::createRenderTargetDesc(
 }
 
 // sampler descriptor construction
+
 G4_SendgDesc *IR_Builder::createSamplerDesc(
     MsgOp op, ChannelMask chMask, bool FP16Return, bool FP16Input,
     bool pixelNullMask, bool feedbackMessage,
@@ -2972,8 +3057,7 @@ G4_SendgDesc *IR_Builder::createSamplerDesc(
   // data return type
   desc |= (FP16Return) ? 1 << 15 : 0 << 15;
 
-  // cache options are MBZ
-  desc |= (uint64_t)0 << 16;
+    desc |= (uint64_t)0 << 16;
 
   // trtt_null
   desc |= (uint64_t)pixelNullMask << 20;
@@ -3565,6 +3649,7 @@ uint32_t IR_Builder::LSCComputeCachingEncodingLoad(
       std::get<2>(cacheOpts) == l3;
   };
 
+
   if (matches(Caching::DF, Caching::DF, Caching::DF)) {
     cacheEnc = 0x0;
   } else if (matches(Caching::UC, Caching::UC, Caching::UC)) {
@@ -3608,6 +3693,7 @@ uint32_t IR_Builder::LSCComputeCachingEncodingStore(
       std::get<1>(cacheOpts) == l2) &&
       std::get<2>(cacheOpts) == l3;
   };
+
 
   if (matches(Caching::DF, Caching::DF, Caching::DF)) {
     cacheEnc = 0x0;

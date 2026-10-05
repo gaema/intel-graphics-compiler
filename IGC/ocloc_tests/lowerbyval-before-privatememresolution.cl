@@ -6,6 +6,8 @@ SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
+// ShaderDisplayAllPassesNames is unavailable in Release builds.
+// UNSUPPORTED: release
 // REQUIRES: regkeys, dg2-supported
 
 // RUN: ocloc compile -file %s -options " -igc_opts 'ShaderDisplayAllPassesNames=1 EnableExplicitCopyForByVal=1'"  -device dg2 2>&1 | FileCheck %s
@@ -20,6 +22,8 @@ SPDX-License-Identifier: MIT
 
 // CHECK: LowerByValAttribute
 // CHECK-NEXT: ReplaceUnsupportedIntrinsics
+// CHECK-NEXT: SplitPHIsOfAllocaPointers
+// CHECK-NEXT: SplitSelectsOfAllocaPointers
 // CHECK-NEXT: PrivateMemoryResolution
 
 __kernel void foo(int a, int b, __global int *res) { *res = a + b; }

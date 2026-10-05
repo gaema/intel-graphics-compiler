@@ -35,6 +35,7 @@ SPDX-License-Identifier: MIT
 #include "vc/Utils/General/Types.h"
 
 #include "llvmWrapper/IR/Constants.h"
+#include "llvmWrapper/IR/IntrinsicInst.h"
 #include "llvmWrapper/IR/Intrinsics.h"
 #include "llvmWrapper/IR/IRBuilder.h"
 #include "llvmWrapper/Support/Alignment.h"
@@ -177,17 +178,14 @@ static void createScatterWithNewAS(IntrinsicInst &OldScatter,
                                    Value *UpdateMask = nullptr) {
   auto Val = OldScatter.getArgOperand(0);
   auto PtrOp = OldScatter.getArgOperand(1);
-  auto Align = OldScatter.getArgOperand(2);
-  auto Mask = OldScatter.getArgOperand(3);
+  auto Alignment = IGCLLVM::getMaskedGatherScatterAlign(&OldScatter);
+  auto Mask = IGCLLVM::getMaskedGatherScatterMask(&OldScatter);
 
   if (UpdateMask)
     Mask = IRB.CreateAnd(UpdateMask, Mask);
   PtrOp = createASCast(IRB, PtrOp, NewAS);
 
-  auto Func = IGCLLVM::getOrInsertDeclaration(
-      OldScatter.getModule(), Intrinsic::masked_scatter,
-      llvm::ArrayRef<Type *>{Val->getType(), PtrOp->getType()});
-  IRB.CreateCall(Func, {Val, PtrOp, Align, Mask});
+  IRB.CreateMaskedScatter(Val, PtrOp, Alignment, Mask);
 }
 
 static IntrinsicInst *createGatherWithNewAS(IntrinsicInst &OldGather,
@@ -196,19 +194,17 @@ static IntrinsicInst *createGatherWithNewAS(IntrinsicInst &OldGather,
                                             Value *UpdateMask = nullptr,
                                             Value *NewPassthru = nullptr) {
   auto PtrOp = OldGather.getArgOperand(0);
-  auto Align = OldGather.getArgOperand(1);
-  auto Mask = OldGather.getArgOperand(2);
-  auto Passthru = NewPassthru ? NewPassthru : OldGather.getArgOperand(3);
+  auto Alignment = IGCLLVM::getMaskedGatherScatterAlign(&OldGather);
+  auto Mask = IGCLLVM::getMaskedGatherScatterMask(&OldGather);
+  auto Passthru =
+      NewPassthru ? NewPassthru : IGCLLVM::getMaskedGatherPassThru(&OldGather);
 
   if (UpdateMask)
     Mask = IRB.CreateAnd(UpdateMask, Mask);
   PtrOp = createASCast(IRB, PtrOp, NewAS);
 
-  auto Func = IGCLLVM::getOrInsertDeclaration(
-      OldGather.getModule(), Intrinsic::masked_gather,
-      llvm::ArrayRef<Type *>{OldGather.getType(), PtrOp->getType()});
-  return cast<IntrinsicInst>(
-      IRB.CreateCall(Func, {PtrOp, Align, Mask, Passthru}, Name));
+  return cast<IntrinsicInst>(IRB.CreateMaskedGather(
+      OldGather.getType(), PtrOp, Alignment, Mask, Passthru, Name));
 }
 
 char GenXGASDynamicResolution::ID = 0;

@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2021 Intel Corporation
+Copyright (C) 2021-2026 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -16,12 +16,15 @@ SPDX-License-Identifier: MIT
 #include <llvm/Analysis/LoopPass.h>
 #include <llvm/Analysis/RegionPass.h>
 #include <llvm/IR/IRPrintingPasses.h>
+#include <llvm/IR/Function.h>
 #include <llvm/IR/LegacyPassManager.h>
+#include <llvm/IR/Module.h>
 #if LLVM_VERSION_MAJOR >= 16
 #include <llvm/IR/PassInstrumentation.h>
 #endif
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/CommandLine.h>
+#include <llvm/Support/ManagedStatic.h>
 #include <llvm/Support/Mutex.h>
 #include <llvm/Support/Regex.h>
 #include <llvm/Support/raw_ostream.h>
@@ -352,10 +355,10 @@ void vc::addPass(legacy::PassManagerBase &PM, Pass *P) {
 }
 
 #if LLVM_VERSION_MAJOR >= 16
-static const Module *unwrapModuleFromAny(Any IR) {
-  if (const auto **M = any_cast<const Module *>(&IR))
+static const Module *unwrapModuleFromAny(const Any &IR) {
+  if (const Module *const *M = any_cast<const Module *>(&IR))
     return *M;
-  if (const auto **F = any_cast<const Function *>(&IR))
+  if (const Function *const *F = any_cast<const Function *>(&IR))
     return (*F)->getParent();
   return nullptr;
 }

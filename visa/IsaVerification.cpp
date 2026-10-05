@@ -475,21 +475,78 @@ void vISAVerifier::verifyVariableDecl(unsigned declID) {
 #endif
 }
 
-// get the start byte offset from the top level declare
+// get the start byte offset from the top level declare. If baseVar is not null,
+// it passes out the base var's var_info_t
 static unsigned int getStartByteOffset(const print_format_provider_t *header,
                                        const var_info_t *var,
-                                       unsigned int numPredefinedVars) {
+                                       unsigned int numPredefinedVars,
+                                       const var_info_t **baseVar = nullptr) {
+  // init baseVar if it is passed in
+  if (baseVar)
+    *baseVar = nullptr;
+
   unsigned int offset = 0;
   while (var->alias_index != 0) {
     offset += var->alias_offset;
-    if (var->alias_index <= numPredefinedVars) {
+    if (var->alias_index < numPredefinedVars) {
       // predefined variables don't have aliases, so we can stop
       break;
     } else {
       var = header->getVar(var->alias_index - numPredefinedVars);
     }
   }
+  if (baseVar)
+    *baseVar = var;
   return offset;
+}
+
+// get the start byte offset of a raw operand from its (possibly aliased)
+// base declare. It returns the valid offset if *baseVar is not nullptr.
+// Note: callers must have already called verifyRawOperand() on the same
+// operand, so the alias chain is known-valid here.
+static unsigned getRawOperandStartByte(const print_format_provider_t *header,
+                                       const raw_opnd &opnd,
+                                       unsigned numPreDefinedVars,
+                                       const var_info_t **baseVar = nullptr) {
+  // init *baseVar if it is passed in
+  if (baseVar)
+    *baseVar = nullptr;
+
+  if (numPreDefinedVars > opnd.index) {
+    return 0; // predefined variable, it must be zero.
+  }
+  uint32_t opnd_index = opnd.index - numPreDefinedVars;
+  vASSERT(opnd_index < header->getVarCount());
+  const var_info_t *var = header->getVar(opnd_index);
+  return getStartByteOffset(header, var, numPreDefinedVars, baseVar) +
+         opnd.offset;
+}
+
+// get the start byte offset of a general vector operand (row/col offset
+// into its, possibly aliased, base declare). It returns the valid offset
+// if *baseVar is not nullptr.
+// Note: callers must have already called verifyVectorOperand() on the same
+// operand, so the alias chain and index are known-valid here.
+static unsigned
+getVectorOperandStartByte(const print_format_provider_t *header,
+                          const vector_opnd &vect, unsigned numPreDefinedVars,
+                          unsigned grfSize,
+                          const var_info_t **baseVar = nullptr) {
+  // init *baseVar if it is passed in
+  if (baseVar)
+    *baseVar = nullptr;
+
+  uint32_t operand_index = vect.getOperandIndex();
+  if (operand_index < numPreDefinedVars ||
+      vect.getOperandClass() != OPERAND_GENERAL) {
+    return 0;
+  }
+  vASSERT(operand_index - numPreDefinedVars < header->getVarCount());
+  const var_info_t *var = header->getVar(operand_index - numPreDefinedVars);
+  return getStartByteOffset(header, var, numPreDefinedVars, baseVar) +
+         vect.opnd_val.gen_opnd.row_offset * grfSize +
+         vect.opnd_val.gen_opnd.col_offset *
+             CISATypeTable[var->getType()].typeSize;
 }
 
 void vISAVerifier::verifyRegion(const CISA_INST *inst, unsigned i) {
@@ -694,7 +751,11 @@ void vISAVerifier::verifyRegion(const CISA_INST *inst, unsigned i) {
 
       unsigned firstElementIndex = row_offset * grfSize + col_offset * VN_size;
 
-      for (int i = 0; i < exec_sz / width_val; i++) {
+      // Every fcvt4 operand is one GRF regardless of its exec size of 32.
+      // Changing bound_exec_sz to utilize the general checking
+      unsigned bound_exec_sz = exec_sz;
+
+      for (int i = 0; i < (int)bound_exec_sz / width_val; i++) {
         for (int j = 0; j < width_val; j++) {
           unsigned region_offset =
               firstElementIndex +
@@ -958,14 +1019,6 @@ void vISAVerifier::verifyVectorOperand(const CISA_INST *inst, unsigned i) {
 }
 
 void vISAVerifier::verifyOperand(const CISA_INST *inst, unsigned i) {
-  // skip verifying bdpas like other dpas variant as it is verified in
-  // verifyInstructionMisc().
-  if (inst->opcode == ISA_BDPAS)
-    return;
-  if (inst->opcode == ISA_DPAS || inst->opcode == ISA_DPASW) {
-    // skip, as dpas is verified in verifyInstructionMisc().
-    return;
-  }
   vISA_ASSERT(header, "Argument Exception: argument header is NULL.");
   vISA_ASSERT(inst, "Argument Exception: argument inst   is NULL.");
   vISA_ASSERT(inst->opnd_num > i,
@@ -1028,15 +1081,52 @@ void vISAVerifier::verifyInstructionMove(const CISA_INST *inst) {
       if (isRawMov)
         break;
 
-      if ((dstType != ISA_TYPE_HF && src0Type == ISA_TYPE_HF8) ||
-          (dstType == ISA_TYPE_HF8 && src0Type != ISA_TYPE_HF)) {
-        REPORT_INSTRUCTION(options, false,
-                           "Unsupported hf8 mov: the other type must be hf.");
-      }
-      if ((dstType == ISA_TYPE_BF8 && src0Type != ISA_TYPE_HF) ||
-          (dstType != ISA_TYPE_HF && src0Type == ISA_TYPE_BF8)) {
-        REPORT_INSTRUCTION(options, false,
-                           "Unsupported bf8 mov: the other type must be hf.");
+      // Verify each custom float at a time.
+      if (dstType == ISA_TYPE_TF32 || src0Type == ISA_TYPE_TF32) {
+        // If one operand is TF32, the other must be F or TF32 [PVCXT].
+        bool isTF32ToF = (dstType == ISA_TYPE_F && src0Type == ISA_TYPE_TF32);
+        bool isFToTF32 = (dstType == ISA_TYPE_TF32 && src0Type == ISA_TYPE_F);
+        REPORT_INSTRUCTION(
+            options,
+            irBuilder->getPlatform() >= Xe_PVCXT && (isTF32ToF || isFToTF32),
+            "Unsupported tf32 mov: must be {tf32, f} <- {tf32, f}.");
+
+        // The genuine tf32<-f down-convert may not use predicate, saturation,
+        // or source modifiers.
+        if (dstType == ISA_TYPE_TF32 && src0Type == ISA_TYPE_F) {
+          REPORT_INSTRUCTION(options,
+                             inst->pred.isNullPred() &&
+                                 dstModifier != MODIFIER_SAT &&
+                                 src0.getOperandModifier() == MODIFIER_NONE,
+                             "Predicate, saturation, and source modifier are "
+                             "not allowed for tf32<-f mov.");
+        }
+      } else if (dstType == ISA_TYPE_BF8 || src0Type == ISA_TYPE_BF8) {
+        // If one operand is BF8, the other must be HF [PVC].
+        bool isBF8ToHF = (dstType == ISA_TYPE_HF && src0Type == ISA_TYPE_BF8);
+        bool isHFToBF8 = (dstType == ISA_TYPE_BF8 && src0Type == ISA_TYPE_HF);
+        REPORT_INSTRUCTION(options,
+                           irBuilder->getPlatform() >= Xe_PVC &&
+                               (isBF8ToHF || isHFToBF8),
+                           "bf8 mov is not supported on the selected platform");
+        REPORT_INSTRUCTION(options,
+                           inst->pred.isNullPred() &&
+                               src0.getOperandModifier() == MODIFIER_NONE,
+                           "Predicate and source modifier of 8-bit float mov "
+                           "are not allowed.");
+      } else if (dstType == ISA_TYPE_HF8 || src0Type == ISA_TYPE_HF8) {
+        bool isHF8ToHF = (dstType == ISA_TYPE_HF && src0Type == ISA_TYPE_HF8);
+        bool isHFToHF8 = (dstType == ISA_TYPE_HF8 && src0Type == ISA_TYPE_HF);
+        bool isLegal =
+            irBuilder->getPlatform() >= Xe3 && (isHF8ToHF || isHFToHF8);
+        REPORT_INSTRUCTION(options, isLegal,
+                           "hf8 mov is not supported on the selected platform");
+
+        REPORT_INSTRUCTION(options,
+                           inst->pred.isNullPred() &&
+                               src0.getOperandModifier() == MODIFIER_NONE,
+                           "Predicate and source modifier of 8-bit float mov "
+                           "are not allowed.");
       }
     }
 
@@ -1100,11 +1190,11 @@ void vISAVerifier::verifyInstructionMove(const CISA_INST *inst) {
 
     REPORT_INSTRUCTION(options, operand_class_dst == OPERAND_GENERAL,
                        "Destination operand of fcvt instruction only "
-                       "supports general and operands.");
+                       "supports general operands.");
 
     REPORT_INSTRUCTION(options, operand_class_src0 == OPERAND_GENERAL,
                        "Source0 operand of fcvt instruction only "
-                       "supports general,  operands.");
+                       "supports general operands.");
 
     VISA_Type dstType = getVectorOperandType(header, dst);
     VISA_Type src0Type = getVectorOperandType(header, src0);
@@ -1547,7 +1637,260 @@ void vISAVerifier::verifyInstructionMisc(const CISA_INST *inst) {
   }
   case ISA_DPAS:
   case ISA_DPASW:
-  {
+  case ISA_BDPAS:
+    verifyInstructionDpas(inst, i);
+    break;
+  case ISA_LIFETIME: {
+    uint8_t properties = getPrimitiveOperand<uint8_t>(inst, i++);
+    getPrimitiveOperand<uint32_t>(inst, i++); // uint32_t varId
+
+    unsigned char type = (properties >> 4) & 0x3;
+
+    if (type != OPERAND_GENERAL && type != OPERAND_ADDRESS &&
+        type != OPERAND_PREDICATE) {
+      REPORT_INSTRUCTION(options, false, "Invalid encoding for register file");
+    }
+
+    break;
+  }
+  case ISA_BREAKPOINT:
+    break;
+  default:
+    REPORT_INSTRUCTION(options, false,
+                       "Illegal Miscellaneous Flow Instruction Opcode: %d, %s.",
+                       opcode, ISA_Inst_Table[opcode].str);
+  }
+}
+
+void vISAVerifier::verifyInstructionDpas(const CISA_INST *inst, unsigned i) {
+  // verifyOperand() has been invoked already from verifyInstruction() before
+  // reaching to this function. Thus, we can assume that operands are correct
+  // at this point.
+  ISA_Opcode opcode = (ISA_Opcode)inst->opcode;
+  unsigned numPreDefinedVars = Get_CISA_PreDefined_Var_Count();
+  unsigned grfSize = irBuilder->getGRFSize();
+
+  // mirrors G4_InstDpas::is2xInt8() (G4_IR.cpp), computed directly from the
+  // unpacked dpas precision qualifiers.
+  auto isDpas2xInt8 = [&](GenPrecision Src1Precision,
+                          GenPrecision Src2Precision) -> bool {
+    auto isS4U4S2U2 = [](GenPrecision P) {
+      return P == GenPrecision::S4 || P == GenPrecision::U4 ||
+             P == GenPrecision::S2 || P == GenPrecision::U2;
+    };
+    return isS4U4S2U2(Src1Precision) && isS4U4S2U2(Src2Precision);
+  };
+
+  // mirrors G4_InstDpas::getOpsPerChan().
+  auto getDpasOpsPerChan = [&](GenPrecision Src1Precision,
+                               GenPrecision Src2Precision) -> uint8_t {
+    if (Src1Precision == GenPrecision::BF16 ||
+        Src1Precision == GenPrecision::FP16)
+      return 2;
+    if (Src1Precision == GenPrecision::TF32)
+      return 1;
+    if (Src1Precision == GenPrecision::BF8 ||
+        Src1Precision == GenPrecision::HF8)
+      return 4;
+    if (isDpas2xInt8(Src1Precision, Src2Precision))
+      return 8;
+    if (Src1Precision == GenPrecision::E2M1)
+      return 8;
+    return 4; // plain int8 (S8/U8)
+  };
+
+  auto getPrecisionSizeInBits = [](GenPrecision P) {
+    return GenPrecisionTable[(int)P].BitSize;
+  };
+
+  // Return input_info_t if var_info_t base is input; nullptr otherwise.
+  auto getKernelInputDecl = [&](const var_info_t *base) {
+    for (unsigned idx = 0; idx < header->getInputCount(); ++idx) {
+      const input_info_t *in = header->getInput(idx);
+      if (in->getInputClass() == INPUT_GENERAL &&
+          in->index >= numPreDefinedVars &&
+          header->getVar(in->index - numPreDefinedVars) == base) {
+        return in;
+      }
+    }
+    return (const input_info_t *)nullptr;
+  };
+
+  // Common dst/src0/src1/src2 alignment check: the operand's base declare
+  // must itself be aligned at least as strictly as required, and the
+  // operand's offset within that base must also be a multiple of it. Skipped
+  // when base is null (predefined operand, e.g. %null).
+  auto checkDpasOperandAlignment = [&](const var_info_t *base, unsigned offset,
+                                       unsigned align,
+                                       const char *operandName) {
+    if (!base)
+      return;
+    unsigned baseAlignBytes = getAlignInBytes(base->getAlignment(), grfSize);
+    if (const input_info_t *iit = getKernelInputDecl(base)) {
+      // For input decl, check the alignment using its offset
+      baseAlignBytes = iit->offset;
+    }
+
+    bool isBaseAligned = (baseAlignBytes % align) == 0;
+    bool isAligned = isBaseAligned && (offset % align) == 0;
+    if (align == grfSize) {
+      REPORT_INSTRUCTION(options, isAligned, "%s %s %s must be GRF-aligned",
+                         ISA_Inst_Table[opcode].str, operandName,
+                         isBaseAligned ? "operand" : "operand's base variable");
+    } else {
+      REPORT_INSTRUCTION(options, isAligned, "%s %s %s must be %d-byte aligned",
+                         ISA_Inst_Table[opcode].str, operandName,
+                         isBaseAligned ? "operand" : "operand's base variable",
+                         align);
+    }
+  };
+
+  auto checkDpasRawOperandAlignment = [&](const raw_opnd &opnd, unsigned align,
+                                          const char *operandName) {
+    const var_info_t *base;
+    unsigned offset =
+        getRawOperandStartByte(header, opnd, numPreDefinedVars, &base);
+    checkDpasOperandAlignment(base, offset, align, operandName);
+  };
+
+  auto checkDpasVectorOperandAlignment =
+      [&](const vector_opnd &opnd, unsigned align, const char *operandName) {
+        const var_info_t *base;
+        unsigned offset = getVectorOperandStartByte(
+            header, opnd, numPreDefinedVars, grfSize, &base);
+        checkDpasOperandAlignment(base, offset, align, operandName);
+      };
+
+  // No predicate
+  REPORT_INSTRUCTION(options, inst->pred.isNullPred(),
+                     "%s inst does not support predicate",
+                     ISA_Inst_Table[opcode].str);
+
+  if (opcode == ISA_BDPAS) {
+    auto IsLegalDstOrSrc0Ty = [](VISA_Type Ty) -> bool {
+      return Ty == ISA_TYPE_F || Ty == ISA_TYPE_BF || Ty == ISA_TYPE_HF;
+    };
+    auto IsLegalSrc1OrSrc2Ty = [](VISA_Type Ty) -> bool {
+      return Ty == ISA_TYPE_BF || Ty == ISA_TYPE_HF || Ty == ISA_TYPE_UD;
+    };
+
+    // execsize must be simd16
+    REPORT_INSTRUCTION(options, inst->getExecSize() == EXEC_SIZE_16,
+                       "Only execution size of 16 is supported for %s",
+                       ISA_Inst_Table[opcode].str);
+    // dst
+    const raw_opnd &dst = getRawOperand(inst, i);
+    verifyRawOperandType(inst, dst, IsLegalDstOrSrc0Ty);
+    ++i;
+    // src0
+    const raw_opnd &src0 = getRawOperand(inst, i);
+    verifyRawOperandType(inst, src0, IsLegalDstOrSrc0Ty);
+    ++i;
+    // src1
+    const raw_opnd &src1 = getRawOperand(inst, i);
+    verifyRawOperandType(inst, src1, IsLegalSrc1OrSrc2Ty);
+    ++i;
+    // src2
+    const raw_opnd &src2 = getRawOperand(inst, i);
+    verifyRawOperandType(inst, src2, IsLegalSrc1OrSrc2Ty);
+    ++i;
+    // src3
+    const vector_opnd &src3 = getVectorOperand(inst, i);
+    VISA_Type src3Ty = ISA_TYPE_UB;
+    if (src3.opnd_val.gen_opnd.index != 0) {
+      src3Ty = getVectorOperandType(header, src3);
+      REPORT_INSTRUCTION(options, src3Ty == ISA_TYPE_UB,
+                         "Only UB src3 allowed for %s",
+                         ISA_Inst_Table[opcode].str);
+    }
+    ++i;
+    // src4
+    const vector_opnd &src4 = getVectorOperand(inst, i);
+    if (src4.opnd_val.gen_opnd.index != 0) {
+      [[maybe_unused]] VISA_Type src4Ty = getVectorOperandType(header, src4);
+      REPORT_INSTRUCTION(options, src4Ty == ISA_TYPE_UB,
+                         "Only UB src4 allowed for %s",
+                         ISA_Inst_Table[opcode].str);
+    }
+
+    // Alignment/subreg checks for dst/src0/src1/src2/src3/src4 after
+    // reading DPAS's other operand.
+    {
+      GenPrecision A = GenPrecision::INVALID, W = GenPrecision::INVALID;
+      uint8_t D = 0, C = 0;
+      uint32_t dpasOtherOpnd = getPrimitiveOperand<uint32_t>(inst, ++i);
+      UI32ToDpasInfo(dpasOtherOpnd, A, W, D, C);
+
+      unsigned execSize = Get_VISA_Exec_Size(inst->getExecSize());
+
+      // dst: aligned at execSize * typeSize
+      VISA_Type dstTy = getRawOperandType(header, dst);
+      unsigned dstAlign = execSize * CISATypeTable[dstTy].typeSize;
+      checkDpasRawOperandAlignment(dst, dstAlign, "dst");
+
+      // src0: aligned at execSize * typeSize (same as dst)
+      VISA_Type src0Ty = getRawOperandType(header, src0);
+      unsigned src0Align = execSize * CISATypeTable[src0Ty].typeSize;
+      checkDpasRawOperandAlignment(src0, src0Align, "src0");
+
+      // Src1: grf-aligned
+      checkDpasRawOperandAlignment(src1, grfSize, "src1");
+
+      // Src2: grf aligned
+      checkDpasRawOperandAlignment(src2, grfSize, "src2");
+
+      bool isFp16OrFp8 = (A == GenPrecision::FP16 || A == GenPrecision::BF16 ||
+                          A == GenPrecision::BF8 || A == GenPrecision::HF8);
+      bool isE2M1 = (A == GenPrecision::E2M1);
+
+      if (src3.opnd_val.gen_opnd.index != 0) {
+        const var_info_t *src3Base = nullptr;
+        unsigned src3Offset = getVectorOperandStartByte(
+            header, src3, numPreDefinedVars, grfSize, &src3Base);
+        unsigned src3Sub = src3Offset % grfSize;
+        if (isFp16OrFp8) {
+          // Both base and offset must be 16-byte aligned
+          //   subreg : {0,16,32,48}
+          checkDpasOperandAlignment(src3Base, src3Sub, 16, "Src3");
+        } else if (isE2M1) {
+          // base is grf aligned
+          checkDpasOperandAlignment(src3Base, 0, grfSize, "Src3");
+          {
+            REPORT_INSTRUCTION(
+                options, src3Sub == 0 || src3Sub == 16,
+                "%s src3 subreg offset must be one of {0,16}:ub for e2m1 "
+                "(e8m0 scaling)",
+                ISA_Inst_Table[opcode].str);
+          }
+        }
+      }
+
+      if (src4.opnd_val.gen_opnd.index != 0) {
+        [[maybe_unused]] VISA_Type src4Ty = getVectorOperandType(header, src4);
+        const var_info_t *src4Base = nullptr;
+        unsigned src4Offset = getVectorOperandStartByte(
+            header, src4, numPreDefinedVars, grfSize, &src4Base);
+        unsigned src4Sub = src4Offset % grfSize;
+        if (isFp16OrFp8) {
+          // Both base and offset must be 8-byte aligned
+          //   subreg offset: {0,8,16,24,32,40,48,56}
+          checkDpasOperandAlignment(src4Base, src4Sub, 8, "Src4");
+        } else if (isE2M1) {
+          // base should be GRF aligned
+          checkDpasOperandAlignment(src4Base, 0, grfSize, "Src4");
+          {
+            REPORT_INSTRUCTION(
+                options,
+                src4Sub == 0 || src4Sub == 8 || src4Sub == 16 ||
+                    src4Sub == 24,
+                "%s src4 subreg offset must be one of {0,8,16,24}:ub for "
+                "e2m1 (e8m0 scaling)",
+                ISA_Inst_Table[opcode].str);
+          }
+        }
+      }
+    }
+  } else {
     auto FNIsInt = [](VISA_Type Ty) -> bool {
       return (Ty == ISA_TYPE_UD || Ty == ISA_TYPE_D);
     };
@@ -1562,13 +1905,8 @@ void vISAVerifier::verifyInstructionMisc(const CISA_INST *inst) {
       return (Ty == ISA_TYPE_UD || Ty == ISA_TYPE_D || Ty == ISA_TYPE_F ||
               isHFOrBF);
     };
-    // No predicate
-    REPORT_INSTRUCTION(options, inst->pred.isNullPred(),
-                       "%s inst does not support predicate",
-                       ISA_Inst_Table[opcode].str);
 
     // dst
-    verifyRawOperand(inst, i);
     const raw_opnd &dst = getRawOperand(inst, i);
     if (irBuilder->getPlatform() < Xe_PVC) {
       verifyRawOperandType(inst, dst, FNIsIntOrFloat);
@@ -1579,8 +1917,7 @@ void vISAVerifier::verifyInstructionMisc(const CISA_INST *inst) {
     }
 
     // src0
-    verifyRawOperand(inst, ++i);
-    const raw_opnd &src0 = getRawOperand(inst, i);
+    const raw_opnd &src0 = getRawOperand(inst, ++i);
     if (irBuilder->getPlatform() < Xe_PVC) {
       verifyRawOperandType(inst, src0, FNIsIntOrFloat);
     }
@@ -1589,8 +1926,7 @@ void vISAVerifier::verifyInstructionMisc(const CISA_INST *inst) {
     }
 
     // src1
-    verifyRawOperand(inst, ++i);
-    const raw_opnd &src1 = getRawOperand(inst, i);
+    const raw_opnd &src1 = getRawOperand(inst, ++i);
     {
       verifyRawOperandType(inst, src1, FNIsInt);
     }
@@ -1607,6 +1943,32 @@ void vISAVerifier::verifyInstructionMisc(const CISA_INST *inst) {
                          ISA_Inst_Table[opcode].str);
     }
 
+
+    // Alignment checks for dst/src0/src1/src2.
+    {
+      GenPrecision A = GenPrecision::INVALID, W = GenPrecision::INVALID;
+      uint8_t D = 0, C = 0;
+      uint32_t dpasOtherOpnd = getPrimitiveOperand<uint32_t>(inst, ++i);
+      UI32ToDpasInfo(dpasOtherOpnd, A, W, D, C);
+
+      unsigned execSize = Get_VISA_Exec_Size(inst->getExecSize());
+
+      VISA_Type dstTy = getRawOperandType(header, dst);
+      unsigned dstAlign = execSize * CISATypeTable[dstTy].typeSize;
+      checkDpasRawOperandAlignment(dst, dstAlign, "dst");
+
+      VISA_Type src0Ty = getRawOperandType(header, src0);
+      unsigned src0Align = execSize * CISATypeTable[src0Ty].typeSize;
+      checkDpasRawOperandAlignment(src0, src0Align, "src0");
+
+      checkDpasRawOperandAlignment(src1, grfSize, "src1");
+
+      unsigned src2Align =
+          (D * getPrecisionSizeInBits(A) * getDpasOpsPerChan(W, A)) / 8;
+      if (src2Align != 0) {
+        checkDpasVectorOperandAlignment(src2, src2Align, "src2");
+      }
+    }
 
     if (irBuilder->getPlatform() >= Xe_PVC) {
       REPORT_INSTRUCTION(options, opcode != ISA_DPASW,
@@ -1627,89 +1989,6 @@ void vISAVerifier::verifyInstructionMisc(const CISA_INST *inst) {
           "Only execution size of 8 is supported for %s on platform %s",
           ISA_Inst_Table[opcode].str, irBuilder->getGenxPlatformString());
     }
-
-    break;
-  }
-  case ISA_BDPAS: {
-    auto IsLegalDstOrSrc0Ty = [](VISA_Type Ty) -> bool {
-      return Ty == ISA_TYPE_F || Ty == ISA_TYPE_BF || Ty == ISA_TYPE_HF;
-    };
-    auto IsLegalSrc1OrSrc2Ty = [](VISA_Type Ty) -> bool {
-      return Ty == ISA_TYPE_BF || Ty == ISA_TYPE_HF || Ty == ISA_TYPE_UD;
-    };
-    // No predicate
-    REPORT_INSTRUCTION(options, inst->pred.isNullPred(),
-                       "%s inst does not support predicate",
-                       ISA_Inst_Table[opcode].str);
-    // execsize must be simd16
-    REPORT_INSTRUCTION(
-        options, inst->getExecSize() == EXEC_SIZE_16,
-        "Only execution size of 16 is supported for %s",
-        ISA_Inst_Table[opcode].str);
-    // dst
-    verifyRawOperand(inst, i);
-    const raw_opnd &dst = getRawOperand(inst, i);
-    verifyRawOperandType(inst, dst, IsLegalDstOrSrc0Ty);
-    ++i;
-    // src0
-    verifyRawOperand(inst, i);
-    const raw_opnd &src0 = getRawOperand(inst, i);
-    verifyRawOperandType(inst, src0, IsLegalDstOrSrc0Ty);
-    ++i;
-    // src1
-    verifyRawOperand(inst, i);
-    const raw_opnd &src1 = getRawOperand(inst, i);
-    verifyRawOperandType(inst, src1, IsLegalSrc1OrSrc2Ty);
-    ++i;
-    // src2
-    verifyRawOperand(inst, i);
-    const raw_opnd &src2 = getRawOperand(inst, i);
-    verifyRawOperandType(inst, src2, IsLegalSrc1OrSrc2Ty);
-    ++i;
-    // TODO: Check src3/src4 subreg offset.
-    // src3
-    const vector_opnd &src3 = getVectorOperand(inst, i);
-    VISA_Type src3Ty = ISA_TYPE_UB;
-    if (src3.opnd_val.gen_opnd.index != 0) {
-      src3Ty = getVectorOperandType(header, src3);
-      REPORT_INSTRUCTION(
-          options,
-          src3Ty == ISA_TYPE_UB,
-          "Only UB src3 allowed for %s",
-          ISA_Inst_Table[opcode].str);
-    }
-    ++i;
-    // src4
-    const vector_opnd &src4 = getVectorOperand(inst, i);
-    if (src4.opnd_val.gen_opnd.index != 0) {
-      VISA_Type src4Ty = getVectorOperandType(header, src4);
-      REPORT_INSTRUCTION(
-          options,
-          src4Ty == ISA_TYPE_UB,
-          "Only UB src4 allowed for %s",
-          ISA_Inst_Table[opcode].str);
-    }
-    break;
-  }
-  case ISA_LIFETIME: {
-    uint8_t properties = getPrimitiveOperand<uint8_t>(inst, i++);
-    getPrimitiveOperand<uint32_t>(inst, i++); // uint32_t varId
-
-    unsigned char type = (properties >> 4) & 0x3;
-
-    if (type != OPERAND_GENERAL && type != OPERAND_ADDRESS &&
-        type != OPERAND_PREDICATE) {
-      REPORT_INSTRUCTION(options, false, "Invalid encoding for register file");
-    }
-
-    break;
-  }
-  case ISA_BREAKPOINT:
-    break;
-  default:
-    REPORT_INSTRUCTION(options, false,
-                       "Illegal Miscellaneous Flow Instruction Opcode: %d, %s.",
-                       opcode, ISA_Inst_Table[opcode].str);
   }
 }
 
@@ -4073,7 +4352,8 @@ struct LscInstVerifier {
     uint32_t enc = 0;
     LSC_CACHE_OPTS cacheOpts{l1, l2, l3};
     // set isBits17_19 to false to check for all cases
-    if (!LscTryEncodeCacheOptsL1L2L3(opInfo, cacheOpts, enc)) {
+    if (!LscTryEncodeCacheOptsL1L2L3(opInfo, cacheOpts, enc
+                                     )) {
       if (opInfo.isLoad()) {
         error("invalid cache-control options for load (#53560)");
       } else if (opInfo.isAtomic()) {
@@ -4194,6 +4474,37 @@ struct LscInstVerifier {
       break;
     default:
       badEnum("LSC_ADDR_TYPE is invalid", addrType);
+      break;
+    }
+  }
+
+  // A real Src0 address payload register's .decl type must match the address
+  // size: :a64 addresses are 64b (Q/UQ) and :a32/:a32u/:a32s addresses are
+  // 32b (D/UD). %null is typeless and is exempt (e.g. a base-only
+  // access with a null per-lane offset is legal for any address size).
+  void verifyAddrPayloadType(int addrOpIx, LSC_ADDR_SIZE addrSize) {
+    if (opInfo.isApndCtrAtomic())
+      return; // append-counter atomics carry no address payload
+    if (getOperandType(inst, addrOpIx) != CISA_OPND_RAW)
+      return; // malformed operand shape is diagnosed elsewhere
+    const raw_opnd &addr = getRawOperand(inst, addrOpIx);
+    if (addr.index == 0)
+      return; // %null is typeless: permit it for any address size
+    VISA_Type ty = getRawOperandType(header, addr);
+    switch (addrSize) {
+    case LSC_ADDR_SIZE_64b:
+      verify(ty == ISA_TYPE_Q || ty == ISA_TYPE_UQ,
+             ":a64 address payload must have Q/UQ type, but decl type is ",
+             CISATypeTable[ty].typeName);
+      break;
+    case LSC_ADDR_SIZE_32b:
+    case LSC_ADDR_SIZE_32bU:
+    case LSC_ADDR_SIZE_32bS:
+      verify(ty == ISA_TYPE_D || ty == ISA_TYPE_UD,
+             ":a32* address payload must have D/UD type, but decl type is ",
+             CISATypeTable[ty].typeName);
+      break;
+    default:
       break;
     }
   }
@@ -4520,6 +4831,7 @@ struct LscInstVerifier {
       src1DataIx = currOpIx + 5;
     const char *src0Name = opInfo.isStrided() ? "Src0AddrBase" : "Src0Addr";
     verifyRawOperand(src0Name, src0Ix); // Src0Addr
+    verifyAddrPayloadType(src0Ix, addrSize);
     if (opInfo.isStrided()) {
       if (verifyVectorOperand("Src0AddrStride", currOpIx + 4)) {
         const auto &vo = getVectorOperand(inst, currOpIx + 4);
@@ -5049,6 +5361,7 @@ int vISAVerifier::verifyInstruction(const CISA_INST *inst) {
 
   return initialErrors == getNumErrors() ? VISA_SUCCESS : VISA_FAILURE;
 }
+
 
 void vISAVerifier::verifyInstructionShflIdx4(const CISA_INST *inst) {
   unsigned i = 0;

@@ -178,6 +178,9 @@ struct ISA_Inst_Info ISA_Inst_Table[ISA_OPCODE_ENUM_SIZE] = {
     {ISA_DNSCL, ISA_Inst_Mov, "dnscl", 3, 1},
     {ISA_INVM,  ISA_Inst_Arith, "invm",  2, 2},
     {ISA_RSQTM, ISA_Inst_Arith, "rsqtm", 1, 2},
+    { ISA_RESERVED_9D, ISA_Inst_Reserved, "reserved9d", 0, 0 },
+    { ISA_RESERVED_9E, ISA_Inst_Reserved, "reserved9e", 0, 0 },
+    { ISA_RESERVED_9F, ISA_Inst_Reserved, "reserved9f", 0, 0 },
 };
 
 VISA_INST_Desc CISA_INST_table[ISA_NUM_OPCODE] = {
@@ -3837,10 +3840,12 @@ bool LscTryEncodeCacheOptsBits17_19(const LscOpInfo &opInfo,
 }
 // return the encoding value for descriptor bits[19:17] for XE3P three cache control
 bool LscTryEncodeCacheOptsL1L2L3(const LscOpInfo &opInfo, LSC_CACHE_OPTS cacheOpts,
-                                 uint32_t &cacheEnc) {
+                                 uint32_t &cacheEnc
+) {
   auto matches = [&](LSC_CACHE_OPT l1, LSC_CACHE_OPT l2, LSC_CACHE_OPT l3) {
     return (cacheOpts.l1 == l1 && cacheOpts.l2 == l2 && cacheOpts.l3 == l3);
   };
+
 
   if (matches(LSC_CACHING_DEFAULT, LSC_CACHING_DEFAULT, LSC_CACHING_DEFAULT)) {
     // same for load/atomic/store

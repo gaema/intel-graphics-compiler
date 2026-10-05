@@ -10,6 +10,7 @@
 // passsed in register will have an entry in location list for the O2 compilation.
 
 // UNSUPPORTED: sys32
+// UNSUPPORTED: lib-igc-clang
 // REQUIRES: oneapi-readelf
 
 __kernel void foo(__global int* result) {

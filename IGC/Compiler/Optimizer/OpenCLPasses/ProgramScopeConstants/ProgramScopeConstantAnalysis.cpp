@@ -9,13 +9,13 @@ SPDX-License-Identifier: MIT
 #include "AdaptorCommon/ImplicitArgs.hpp"
 #include "AdaptorCommon/AddImplicitArgs.hpp"
 #include "Compiler/Optimizer/OpenCLPasses/ProgramScopeConstants/ProgramScopeConstantAnalysis.hpp"
-#include "Compiler/Optimizer/OpenCLPasses/OpenCLPrintf/OpenCLPrintfAnalysis.hpp"
 #include "Compiler/IGCPassSupport.h"
 #include "common/LLVMWarningsPush.hpp"
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Function.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include "common/LLVMWarningsPop.hpp"
+#include "llvmWrapper/IR/Constants.h"
 #include "Probe/Assertion.h"
 
 using namespace llvm;
@@ -121,16 +121,11 @@ bool ProgramScopeConstantAnalysis::run(Module &M, IGC::IGCMD::MetaDataUtils *pMd
 
     InlineProgramScopeBufferType inlineProgramScopeBufferType = {};
 
-    // Constant variables that are string literals
-    // used by printf will be stored in the second constant buffer.
-    bool isZebinPrintfStringConst = OpenCLPrintfAnalysis::isPrintfStringConstant(globalVar);
-    // Here we follow SPV_EXT_relaxed_printf_string_address_space to relax
-    // the address space requirement of printf strings and accept
-    // non-constant address space printf strings. However, we expect it is
-    // the only exception and FE should produce a IGC input that satisfies
-    // any other OpenCL printf restrictions.
+    // Printf string literals go into the second constant buffer. Membership is
+    // decided by OpenCLPrintfResolution, which runs earlier and populates
+    // stringConstants; here we only consume it.
+    bool isZebinPrintfStringConst = m_pModuleMd->stringConstants.count(globalVar);
     if (isZebinPrintfStringConst) {
-      m_pModuleMd->stringConstants.insert(globalVar);
       inlineProgramScopeBufferType = InlineProgramScopeBufferType::ConstantStrings;
       hasConstantStrings = true;
     } else {
@@ -143,7 +138,7 @@ bool ProgramScopeConstantAnalysis::run(Module &M, IGC::IGCMD::MetaDataUtils *pMd
       }
     }
 
-    if (initializer->isZeroValue() && !isZebinPrintfStringConst) {
+    if (IGCLLVM::Constant::isNullValue(initializer) && !isZebinPrintfStringConst) {
       zeroInitializedGlobals.push_back(globalVar);
       continue;
     }

@@ -30,14 +30,12 @@ typedef char debugString[1024];
 #include <vector>
 #if defined(IGC_DEBUG_VARIABLES)
 struct HashRange {
-  enum class Type {
-    Asm, // asmhash:, hash:
-    Pso  // psohash:
-  };
+  enum class Type { Asm, Pso, Pipeline };
 
   unsigned long long start;
   unsigned long long end;
   Type Ty;
+  bool implied = false;
   union {
     unsigned m_Value;
     debugString m_string;
@@ -49,6 +47,8 @@ struct HashRange {
       return Hash.getAsmHash();
     case Type::Pso:
       return Hash.getPsoHash();
+    case Type::Pipeline:
+      return Hash.getPipelineHash();
     }
     return {};
   }
@@ -172,6 +172,7 @@ struct DEVICE_INFO {
 #endif
 
 void GetKeysSetExplicitly(std::string *KeyValuePairs, std::string *OptionKeys);
+void LoadIGCFlagsFromRegistryAndGetString(std::string &outToken);
 void DumpIGCRegistryKeyDefinitions();
 void DumpIGCRegistryKeyDefinitions3(std::string driverRegistryPath, unsigned long pciBus, unsigned long pciDevice,
                                     unsigned long pciFunction);
@@ -188,6 +189,7 @@ static inline void GetKeysSetExplicitly(std::string *KeyValuePairs, std::string 
   IGC_UNUSED(KeyValuePairs);
   IGC_UNUSED(OptionKeys);
 }
+static inline void LoadIGCFlagsFromRegistryAndGetString(std::string &outToken) { IGC_UNUSED(outToken); }
 static inline void SetCurrentDebugHash(const ShaderHash &hash) { IGC_UNUSED(hash); }
 static inline void SetCurrentEntryPoints(const std::vector<std::string> &entry_points) { IGC_UNUSED(entry_points); }
 static inline void InitializeRegKeys() {};

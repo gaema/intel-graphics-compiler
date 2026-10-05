@@ -668,6 +668,7 @@ CREATE_PRIVATE void _createTraceRayInlinePrologue_Xe(RTSAS RTStack2<Xe> *__restr
   }
 
   ray0.instLeafPtr = 0;
+  ray0.flagsFromTraceRay.rayFlags = RayFlags & RTStackFormat::RayFlagsMask;
   ray0.rayMask = InstanceInclusionMask;
   ray0.pad2 = 0;
 
@@ -700,7 +701,9 @@ CREATE_PRIVATE void _createTraceRayInlinePrologue_Xe(RTSAS RTStack2<Xe> *__restr
 template <typename RTStackT>
 IMPL void _createTraceRayInlinePrologue(RTSAS RTStackT *__restrict__ StackPtr, _float8 RayInfo, uint64_t RootNodePtr,
                                         uint32_t RayFlags, uint32_t InstanceInclusionMask, uint32_t ComparisonValue,
-                                        float TMax, bool updateFlags, bool initialDoneBitValue) {
+                                        float TMax, bool updateFlags, bool initialDoneBitValue,
+                                        uint32_t MissShaderIndex = 0, uint32_t HitGroupIndex = 0,
+                                        uint32_t ShaderIndexMultiplier = 0) {
   *((RTSAS _float8 *)&StackPtr->ray0.org) = RayInfo;
 
   auto &ray0 = StackPtr->ray0;
@@ -716,10 +719,10 @@ IMPL void _createTraceRayInlinePrologue(RTSAS RTStackT *__restrict__ StackPtr, _
   ray0.ComparisonValue = ComparisonValue;
   ray0.pad1 = 0;
 
-  ray0.hitGroupIndex = 0;
+  ray0.hitGroupIndex = HitGroupIndex;
 
-  ray0.missShaderIndex = 0;
-  ray0.shaderIndexMultiplier = 0;
+  ray0.missShaderIndex = MissShaderIndex;
+  ray0.shaderIndexMultiplier = ShaderIndexMultiplier;
   ray0.pad2 = 0;
   ray0.internalRayFlags = 0;
 
@@ -758,17 +761,23 @@ IMPL void _createTraceRayInlinePrologue(RTSAS RTStackT *__restrict__ StackPtr, _
 CREATE_PRIVATE void _createTraceRayInlinePrologue_Xe3(RTSAS RTStack2<Xe3> *__restrict__ StackPtr, _float8 RayInfo,
                                                       uint64_t RootNodePtr, uint32_t RayFlags,
                                                       uint32_t InstanceInclusionMask, uint32_t ComparisonValue,
-                                                      float TMax, bool updateFlags, bool initialDoneBitValue) {
+                                                      float TMax, bool updateFlags, bool initialDoneBitValue,
+                                                      uint32_t MissShaderIndex = 0, uint32_t HitGroupIndex = 0,
+                                                      uint32_t ShaderIndexMultiplier = 0) {
   _createTraceRayInlinePrologue(StackPtr, RayInfo, RootNodePtr, RayFlags, InstanceInclusionMask, ComparisonValue, TMax,
-                                updateFlags, initialDoneBitValue);
+                                updateFlags, initialDoneBitValue, MissShaderIndex, HitGroupIndex,
+                                ShaderIndexMultiplier);
 }
 
 CREATE_PRIVATE void _createTraceRayInlinePrologue_Xe3PEff64(RTSAS RTStack2<Xe3PEff64> *__restrict__ StackPtr,
                                                             _float8 RayInfo, uint64_t RootNodePtr, uint32_t RayFlags,
                                                             uint32_t InstanceInclusionMask, uint32_t ComparisonValue,
-                                                            float TMax, bool updateFlags, bool initialDoneBitValue) {
+                                                            float TMax, bool updateFlags, bool initialDoneBitValue,
+                                                            uint32_t MissShaderIndex = 0, uint32_t HitGroupIndex = 0,
+                                                            uint32_t ShaderIndexMultiplier = 0) {
   _createTraceRayInlinePrologue(StackPtr, RayInfo, RootNodePtr, RayFlags, InstanceInclusionMask, ComparisonValue, TMax,
-                                updateFlags, initialDoneBitValue);
+                                updateFlags, initialDoneBitValue, MissShaderIndex, HitGroupIndex,
+                                ShaderIndexMultiplier);
 }
 
 
@@ -991,7 +1000,6 @@ IMPL bool _syncStackToShadowMemory(RTSAS RTStack2<GenT> *__restrict__ HWStackPtr
         // Quad or Procedural. It is enough for just candidate processing, as
         // we only need to distinguish Procedural from other type (e.g. Quad).
         // NODE_TYPE_PROCEDURAL has LSB bit set, while others not.
-
           CH.leafType =
               Data.committedStatus == COMMITTED_STATUS::COMMITTED_TRIANGLE_HIT ? NODE_TYPE_QUAD : NODE_TYPE_PROCEDURAL;
       }
@@ -1174,9 +1182,6 @@ CREATE_PRIVATE uint32_t _getSyncStackID_Xe3p() {
 }
 
 CREATE_PRIVATE uint32_t _getSyncStackID_Xe3pEff64() {
-  // SyncStackID = (EUID[2:0] * maxThreadsPerEU * maxSIMDSize) +
-  //               (ThreadID[3:0] *maxSIMDSize) +
-  //                SIMDLaneID[3:0]; // Xe3pv2
   auto sr0 = [](uint32_t Start, uint32_t End) { return emitStateRegID(Start, End); };
 
   uint32_t EUID = sr0(4, 6);
@@ -1336,7 +1341,6 @@ CREATE_PRIVATE void _createForwardRayMotionBlurPrologue_Xe3PEff64(RTSAS RTStack2
                                                                   uint32_t InstanceFlags, uint32_t HitGroupOffset) {
   return _createForwardRayMotionBlurPrologue(StackPtr, StartNodePtr, Origin, Dir, InstanceFlags, HitGroupOffset);
 }
-
 template <typename GenT>
 IMPL RTSAS void *_getHitAddress(RTSAS RTStack2<GenT> *__restrict__ HWStackPtr, bool Committed) {
   return Committed ? &HWStackPtr->committedHit : &HWStackPtr->potentialHit;

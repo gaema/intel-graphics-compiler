@@ -192,13 +192,6 @@ function(igc_bif_build_bc)
       list(APPEND LLVM_VERSION_DEPENDENT_ARGS "-fpreserve-vec3-type")
     endif()
 
-    # TODO:
-    # Temporary workaround to enable BiF compilation
-    # Needs to be removed ASAP if possible
-    if(LLVM_VERSION_MAJOR GREATER_EQUAL 22)
-      list(APPEND LLVM_VERSION_DEPENDENT_ARGS "-Wno-incompatible-pointer-types")
-    endif()
-
     # OpenCL source compilation is triggered by CLANG change, change of source files, change of precompiled header, change of
     # forcibly included headers or change of additional dependencies.
     execute_process(
@@ -348,7 +341,6 @@ message("[IGC\\BiFModuleCache] - Buidling from source start")
 
 set(_concatScript   "${IGC_SOURCE_DIR}/BiFModule/concat.py")
 set(IGC_BUILD__BIF_OCL_FORCE_INC "${IGC_BUILD__BIF_DIR}/opencl_cth.h")
-list(APPEND IGC_BUILD__BIF_OCL_INCLUDES ${IGC_BUILD__BIF_OCL_FORCE_INC})
 
 message("[IGC\\BiFModule] - Generating opencl_cth.h")
 
@@ -357,7 +349,6 @@ execute_process(
     COMMAND ${PYTHON_EXECUTABLE} ${_concatScript} -new ${IGC_BUILD__BIF_OCL_FORCE_INC} ${IGC_BUILD__BIF_OCL_SHARED_INC} ${IGC_BUILD__BIF_OCL_SHARED_INC_PRE_RELEASE}
   COMMAND_ECHO STDOUT
     )
-
 
 set(IGC_BUILD__BIF_OCL_COMMON_INC_DIRS
     "${IGC_OPTION__BIF_SRC_OCL_DIR}/Languages/OpenCL"
@@ -379,9 +370,6 @@ file(GLOB_RECURSE _MATH_SRC_BC      "${IGC_OPTION__BIF_SRC_OCL_DIR}/*.bc")
 file(GLOB_RECURSE SVML_FILES "${IGC_OPTION__BIF_SRC_OCL_DIR}/Implementation/BinaryReleaseOnly/*.cl" )
 
 set(FLAG "")
-if(${VME_TYPES_DEFINED} STREQUAL "TRUE")
-    list(APPEND FLAG "__VME_TYPES_DEFINED__")
-endif()
 
 set(KHR_DEFINES "cl_khr_f16" "cl_khr_fp64" "cl_khr_gl_msaa_sharing" "cl_khr_mipmap_image" "cl_khr_depth_images" "cl_intel_subgroups_short"
                 "cl_intel_subgroups_char" "cl_intel_subgroups_long" "cl_intel_subgroup_local_block_io" "cl_intel_64bit_global_atomics_placeholder"
@@ -471,7 +459,7 @@ igc_bif_build_bc(
       SOURCES              ${IGC_OPTION__BIF_SRC_OCL_DIR}/Languages/OpenCL/PreRelease/IBIF_PreRelease_Impl.cl
       FORCE_INCLUDE        ${IGC_BUILD__BIF_OCL_INCLUDES}
       INCLUDE_DIRECTORIES  ${IGC_BUILD__BIF_OCL_COMMON_INC_DIRS} ${BIF_BINARY_DIR}/Languages/OpenCL/PreRelease/Matrix
-      DEFINES              "__EXECUTION_MODEL_DEBUG=1" "__OPENCL_C_VERSION__=200" "__IGC_BUILD__" ${KHR_DEFINES} "cl_intel_device_side_avc_vme_enable" "cl_intel_device_side_avc_motion_estimation" ${FLAG}
+      DEFINES              "__EXECUTION_MODEL_DEBUG=1" "__OPENCL_C_VERSION__=200" "__IGC_BUILD__" ${KHR_DEFINES} ${FLAG}
       OPTIONS CL           ${CL_OPTIONS} -cl-std=CL2.0
      )
  endif()

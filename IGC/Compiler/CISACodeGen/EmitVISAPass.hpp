@@ -28,6 +28,7 @@ SPDX-License-Identifier: MIT
 #include <llvm/Analysis/CallGraph.h>
 #include "common/LLVMWarningsPop.hpp"
 
+#include "llvmWrapper/IR/Instructions.h"
 #include <functional>
 #include <optional>
 #include <type_traits>
@@ -387,8 +388,9 @@ public:
   void emitPtrToInt(llvm::PtrToIntInst *p2iCst);
   void emitIntToPtr(llvm::IntToPtrInst *i2pCst);
   void emitAddrSpaceCast(llvm::AddrSpaceCastInst *addrSpaceCast);
-  void emitBranch(llvm::BranchInst *br, const SSource &cond, e_predMode predMode);
-  void emitDiscardBranch(llvm::BranchInst *br, const SSource &cond);
+  void emitCondBrInst(IGCLLVM::CondBrInst *br, const SSource &cond, e_predMode predMode);
+  void emitUncondBrInst(IGCLLVM::UncondBrInst *br);
+  void emitDiscardBranch(IGCLLVM::CondBrInst *br, const SSource &cond);
   void emitAluNoModifier(llvm::GenIntrinsicInst *inst);
 
   CVariable *GetVMaskPred(CVariable *&predicate);
@@ -525,17 +527,7 @@ public:
 
   static PreemptionEncoding getEncoderPreemptionMode(EPreemptionMode preemptionMode);
 
-  void emitBTD(CVariable *GlobalBufferPtr, CVariable *StackID, CVariable *ShaderRecord, CVariable *Flag,
-               bool releaseStackID);
 
-  void emitBTDEff64(CVariable *globalBufferPtr, CVariable *stackID, CVariable *shaderRecord, CVariable *flag,
-                    bool releaseStackID
-  );
-
-  void emitBindlessThreadDispatch(llvm::BTDIntrinsic *I);
-
-
-  void emitStackIDRelease(llvm::StackIDReleaseIntrinsic *I);
   void emitExtendedCacheControl(llvm::ExtendedCacheControl *I);
   void emitPostProcessRayQueryReturn(llvm::PostProcessRayQueryReturn *I);
   void emitGetShaderRecordPtr(llvm::GetShaderRecordPtrIntrinsic *I);
@@ -728,6 +720,7 @@ public:
   CVariable *UniformCopy(CVariable *var, bool doSub = false);
   CVariable *UniformCopy(CVariable *var, CVariable *&LaneOffset, CVariable *eMask = nullptr, bool doSub = false,
                          bool safeGuard = false, CVariable *predicate = nullptr);
+  CVariable *MaterializeImmToGRF(CVariable *immSrc, const char *name);
 
   // generate loop header to process sample instruction with varying resource/sampler
   bool ResourceLoopHeader(const CVariable *destination, ResourceDescriptor &resource, SamplerDescriptor &sampler,

@@ -119,6 +119,7 @@ class Optimizer {
   void cselPeepHoleOpt();
   void forceAssignRegs();
   void forceSpillVars();
+  void computeDynamicSpillThreshold();
   void preRegAlloc();
   void regAlloc();
   void insertFallThroughJump();
@@ -266,6 +267,9 @@ private:
   void insertPageFaultWA();
   void insertPageFaultWAforLSC(G4_BB *bb, INST_LIST_ITER it);
   void insertPageFaultWAforHDC(G4_BB *bb, INST_LIST_ITER it);
+  // Insert the page-fault WA data-return wait (dummy mov) before the write.
+  void insertPageFaultWAWait(G4_BB *bb, INST_LIST_ITER it,
+                             G4_Declare *probeDstDcl, G4_InstSend *sendInst);
   // Compute the response-GRF count for a no-return LSC atomic.
   unsigned getLscUntypedAtomicRspLen(G4_ExecSize execSize,
                                      const G4_SendDescRaw *msgDesc) const;
@@ -284,6 +288,7 @@ private:
   void insertFenceAtEntry();
   void expandMulPostSchedule();
   void expandMadwPostSchedule();
+  void expandPseudoInstPostSchedule();
   void fixReadSuppressioninFPU0();
   void prepareDPASFuseRSWA();
   void applyBarrierWA(INST_LIST_ITER it, G4_BB *bb);
@@ -385,6 +390,7 @@ public:
     PI_HWConformityChk,     // always
     PI_preRA_HWWorkaround,  // always, each WA under specific control
     PI_postRA_HWWorkaround, // always, each WA under specific control
+    PI_computeDynamicSpillThreshold, // always
     PI_preRA_Schedule,
     PI_preRegAlloc,           // always
     PI_regAlloc,              // always
@@ -440,6 +446,7 @@ public:
     PI_zeroSomeARF,
     PI_addSWSBInfo,
     PI_expandMadwPostSchedule,
+    PI_expandPseudoInstPostSchedule,
     PI_ACCSchedule,
     PI_staticProfiling,
     PI_sinkBarrierWait,

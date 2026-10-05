@@ -17,6 +17,8 @@ SPDX-License-Identifier: MIT
 #include "common/LLVMWarningsPush.hpp"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/GlobalVariable.h>
 #include "common/LLVMWarningsPop.hpp"
 
 #include "Probe/Assertion.h"
@@ -330,8 +332,16 @@ VISAVariableLocation ScalarVisaModule::GetVariableLocation(const DbgVarInstEntry
     return VISAVariableLocation(this);
   }
 
+  bool slm = isa<GlobalVariable>(pVal) || isa<ConstantExpr>(pVal);
+
+  if (isDbgDclInst && pVal->use_empty() && !isa<Argument>(pVal) && !slm) {
+    // Don't drop unused Globals and constant expressions declare addresses. We rewrite their uses
+    // to a resolved SLM offset, which leaves the address use-empty while it still names valid loc.
+    return VISAVariableLocation(this);
+  }
+
   if (const Constant *pConstVal = dyn_cast<Constant>(pVal)) {
-    if (!isa<GlobalVariable>(pVal) && !isa<ConstantExpr>(pVal)) {
+    if (!slm) {
       return VISAVariableLocation(pConstVal, this);
     }
   }
@@ -441,8 +451,10 @@ VISAVariableLocation ScalarVisaModule::GetVariableLocation(const DbgVarInstEntry
     }
   }
 
-  // SLM global variable
-  if (isa<GlobalVariable>(pVal)) {
+  // SLM global variable.
+  // Only variables in local address space are SLM-mapped;
+  // constant/global address-space globals are also GlobalVariables but are not in the locals map.
+  if (isa<GlobalVariable>(pVal) && pType->isPointerTy() && pType->getPointerAddressSpace() == ADDRESS_SPACE_LOCAL) {
     unsigned int offset = m_pShader->GetSLMMappingValue(pVal);
     offset |= VALID_LOCAL_HIGH_BITS;
     return VISAVariableLocation(offset, true, this);
@@ -511,11 +523,19 @@ std::optional<uint32_t> ScalarVisaModule::getStorageOffset(DbgVarStorageKey dbgK
   return std::nullopt;
 }
 
-std::optional<uint32_t> ScalarVisaModule::getStorageSize(DbgVarStorageKey dbgKey) const {
+std::optional<uint32_t> ScalarVisaModule::getStorageStride(DbgVarStorageKey dbgKey) const {
   const auto &storageMap = m_pShader->GetContext()->m_DbgVarStorageMap;
   auto it = storageMap.find(dbgKey);
   if (it != storageMap.end())
-    return it->second.size;
+    return it->second.stride;
+  return std::nullopt;
+}
+
+std::optional<bool> ScalarVisaModule::getStorageIsStackBased(DbgVarStorageKey dbgKey) const {
+  const auto &storageMap = m_pShader->GetContext()->m_DbgVarStorageMap;
+  auto it = storageMap.find(dbgKey);
+  if (it != storageMap.end())
+    return it->second.isStackBased;
   return std::nullopt;
 }
 

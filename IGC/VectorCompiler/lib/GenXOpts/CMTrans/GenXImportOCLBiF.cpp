@@ -47,6 +47,7 @@ SPDX-License-Identifier: MIT
 
 #include "llvmWrapper/IR/Intrinsics.h"
 #include "llvmWrapper/IR/Instructions.h"
+#include "llvmWrapper/IR/Module.h"
 #include "llvmWrapper/Transforms/Utils/Cloning.h"
 
 #include <algorithm>
@@ -519,7 +520,7 @@ bool GenXImportOCLBiF::runOnModule(Module &M) {
   {
     IGC::BiFManager::BiFManagerHandler bifLinker(M.getContext());
 
-    bifLinker.SetTargetTriple(M.getTargetTriple());
+    bifLinker.SetTargetTriple(IGCLLVM::getTargetTriple(M));
     bifLinker.SetDataLayout(M.getDataLayout());
     bifLinker.SetCallbackLinker([](Module &M, const StringSet<> &GVS) {
       internalizeModule(M, [&GVS](const GlobalValue &GV) {

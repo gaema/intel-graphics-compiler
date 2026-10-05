@@ -12,6 +12,7 @@ SPDX-License-Identifier: MIT
 #include <llvm/IR/Instructions.h>
 #include "common/LLVMWarningsPop.hpp"
 #include "llvmWrapper/IR/DerivedTypes.h"
+#include "llvmWrapper/IR/Instructions.h"
 #include "common/LLVMUtils.h"
 #include "LLVMWarningsPush.hpp"
 #include "llvm/IR/Instruction.h"
@@ -425,8 +426,8 @@ bool PushAnalysis::IsSafeToPushNonStaticBufferLoad(llvm::Instruction *inst) {
   if (searchForRetBBBeforeDiscard) {
     for (auto it = pred_begin(retBB), ie = pred_end(retBB); it != ie; ++it) {
       BasicBlock *predBB = *it;
-      BranchInst *br = cast<BranchInst>(predBB->getTerminator());
-      if (br->isUnconditional()) {
+      IGCLLVM::UncondBrInst *uncondBr = dyn_cast<IGCLLVM::UncondBrInst>(predBB->getTerminator());
+      if (uncondBr) {
         retBB = predBB;
         break;
       }
@@ -795,9 +796,10 @@ void PushAnalysis::BlockPushConstants() {
                                       [](inputPairType a, inputPairType b) { return a.second.index < b.second.index; });
   largestIndex = largestPair != inputs.end() ? largestPair->second.index : 0;
 
-  uint32_t maxPushedGRFs = m_context->getNumGRFPerThread(false) ? (3 * m_context->getNumGRFPerThread(false)) / 4
-                           : m_context->platform.supportsVRT()  ? ((3 * 256) / 4)
-                                                                : ((3 * 128) / 4);
+  uint32_t maxPushedGRFs = m_context->getNumGRFPerThread(false, m_pFunction)
+                               ? (3 * m_context->getNumGRFPerThread(false, m_pFunction)) / 4
+                           : m_context->platform.supportsVRT() ? ((3 * 256) / 4)
+                                                               : ((3 * 128) / 4);
 
   if (largestIndex >= maxPushedGRFs) {
     return;

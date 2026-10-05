@@ -18,6 +18,8 @@ using namespace vISA;
 
 // #define DEBUG_LVN_ON
 
+bool isNonUniformSrcRegion(G4_SrcRegRegion *srcRgn);
+
 #define DUMMY_HSTRIDE_2_2_0 0x8000
 #define DUMMY_HSTRIDE_4_4_0 0x4000
 #define DUMMY_HSTRIDE_8_8_0 0xc000
@@ -259,6 +261,17 @@ bool LVN::canReplaceUses(INST_LIST_ITER inst_it, UseList &uses,
 
     if (useInst->isSend()) {
       // send operand doesn't take subreg, so the operand has to be GRF-aligned
+      if (!builder.tryToAlignOperand(lvnDst, builder.numEltPerGRF<Type_UB>())) {
+        canReplace = false;
+        break;
+      }
+    }
+
+    if (use->isAccRegValid()) {
+      // IEEE math macros (invm/rsqtm) and madm encode an mme channel select
+      // on their operands, which requires the operand to remain
+      // GRF-aligned. Since lvnDst would replace use while keeping its mme
+      // channel select (see replaceAllUses), it must be GRF-aligned too.
       if (!builder.tryToAlignOperand(lvnDst, builder.numEltPerGRF<Type_UB>())) {
         canReplace = false;
         break;
@@ -1061,6 +1074,21 @@ template <class T, class K> bool LVN::opndsMatch(T *opnd1, K *opnd2) {
 
           if (op1lb != op2lb || op1rb != op2rb || op1hs != op2hs) {
             match = false;
+          }
+
+          // Left/right bound and hstride fully characterize a uniform
+          // (single-stride) src region, but not a non-uniform one. Regions
+          // such as A<2;2,2> and A<2;4,2> share the same lb/rb/hstride yet map
+          // lanes to different elements ({0,2,2,4,...} vs {0,2,4,6,...}), so
+          // treating them as equal is wrong. For non-uniform src regions
+          // require an exact region-description match.
+          if (match && opnd1->isSrcRegRegion() && opnd2->isSrcRegRegion()) {
+            G4_SrcRegRegion *src1 = opnd1->asSrcRegRegion();
+            G4_SrcRegRegion *src2 = opnd2->asSrcRegRegion();
+            if ((isNonUniformSrcRegion(src1) || isNonUniformSrcRegion(src2)) &&
+                !src1->getRegion()->isEqual(src2->getRegion())) {
+              match = false;
+            }
           }
         }
       }

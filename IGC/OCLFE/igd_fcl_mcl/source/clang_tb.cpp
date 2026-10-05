@@ -141,11 +141,17 @@ bool CClangTranslationBlock::Create(const STB_CreateArgs *pCreateArgs, STB_Trans
 
 #if defined(IGC_DEBUG_VARIABLES)
   debugString overrideNameBuffer = {0};
-  const char *overrideName = "";
   // Reading igc_opts in ::Create() is not possible without IGC <-> NEO CIF interface modification
   // For now, read IGC env/registry directly.
   ReadIGCRegistry("LibClangOverride", overrideNameBuffer, sizeof(overrideNameBuffer), IGCFlagType_debugString);
-  overrideName = overrideNameBuffer;
+  const char *overrideName = overrideNameBuffer;
+  if (strcmp(overrideName, "igc-clang") == 0) {
+#ifdef _WIN32
+    overrideName = "igc-clang64.dll";
+#else
+    overrideName = "libigc-clang.so";
+#endif
+  }
 #endif
 
   bool success = pTranslationBlock->Initialize(pCreateArgs);
@@ -167,6 +173,7 @@ bool CClangTranslationBlock::Create(const STB_CreateArgs *pCreateArgs, STB_Trans
 #ifdef _WIN32
       moduleName = overrideName;
 #else
+      CCModule.isDynamicallyLoaded = true;
       CCModule.pModule = dlopen(overrideName, RTLD_LAZY | RTLD_LOCAL);
       if (CCModule.pModule) {
         CCModule.pCompile = (CCModuleStruct::PFcnCCCompile)dlsym(CCModule.pModule, "Compile");
@@ -190,6 +197,7 @@ bool CClangTranslationBlock::Create(const STB_CreateArgs *pCreateArgs, STB_Trans
       // Load the Common Clang library
       // Both Win32 and Win64
       // load dependency only on RS
+      CCModule.isDynamicallyLoaded = true;
       if (GetWinVer() >= OS_WIN_RS) {
         CCModule.pModule = LoadDependency(moduleName);
       } else {
@@ -341,18 +349,6 @@ static bool IsBuildingFor32bit(const char *pInternalOptions) {
   }
 
   return !is64bit;
-}
-
-// Returns true if CommonClang used on current OS has VME types defined.
-static bool AreVMETypesDefined() {
-#ifdef VME_TYPES_DEFINED
-#if VME_TYPES_DEFINED
-  return true;
-#else
-  return false;
-#endif
-#endif
-  return true;
 }
 
 // Returns true if the input is SYCL source, indicated by the '-x sycl' option.
@@ -519,6 +515,9 @@ struct ExtensionsRequiringManualFeatureMacros {
   // Dependency flags - control which macros are enabled
   bool fp16 = false; // cl_khr_fp16 (dependency for atomic macros)
   bool fp64 = false; // cl_khr_fp64 (dependency for atomic macros)
+
+  // Whether image support (__IMAGE_SUPPORT__) is enabled for this compilation
+  bool imageSupport = false;
 };
 
 static std::string GetFeatureMacrosForExtensions(const ExtensionsRequiringManualFeatureMacros &enabledExtensions,
@@ -527,6 +526,28 @@ static std::string GetFeatureMacrosForExtensions(const ExtensionsRequiringManual
   std::string featureMacros;
 
   IGC_ASSERT_MESSAGE(oclStd < 300, "This function should only be called for OpenCL C versions older than 3.0");
+
+  // The standard OpenCL header gates the image support built-ins behind the __opencl_c_images
+  // feature macro (and, for OpenCL C 2.0, a few more OpenCL C 3.0 optional-feature macros that
+  // OpenCL C 2.0 already provides equivalent core functionality for), so define them manually.
+  if (enabledExtensions.imageSupport) {
+    featureMacros += " -D__opencl_c_images";
+    if (oclStd >= 200) {
+      featureMacros += " -D__opencl_c_3d_image_writes";
+      featureMacros += " -D__opencl_c_read_write_images";
+    }
+  }
+
+  if (oclStd >= 200) {
+    featureMacros += " -D__opencl_c_atomic_order_acq_rel";
+    featureMacros += " -D__opencl_c_atomic_order_seq_cst";
+    featureMacros += " -D__opencl_c_atomic_scope_device";
+    featureMacros += " -D__opencl_c_atomic_scope_all_devices";
+    featureMacros += " -D__opencl_c_generic_address_space";
+    featureMacros += " -D__opencl_c_program_scope_global_variables";
+    featureMacros += " -D__opencl_c_subgroups";
+    featureMacros += " -D__opencl_c_work_group_collective_functions";
+  }
 
   // Integer dot product macros (OpenCL C 1.2+)
   if (enabledExtensions.integerDotProduct && oclStd >= 120) {
@@ -570,54 +591,47 @@ static std::string GetFeatureMacrosForExtensions(const ExtensionsRequiringManual
 // The expected extensions input string is in a form:
 // -cl-ext=-all,+supported_ext_name,+second_supported_ext_name
 // -cl-feature=+__opencl_c_3d_image_writes,+__opencl_c_atomic_order_acq_rel
-static std::string GetCDefinesForEnableList(llvm::StringRef enableListStr, unsigned int oclStd,
-                                            const StringRef prefix) {
+static std::string GetCDefinesForEnableList(llvm::StringRef enableListStr, unsigned int oclStd, const StringRef prefix,
+                                            bool imageSupport) {
 
   std::string definesStr;
+  ExtensionsRequiringManualFeatureMacros enabledExtensions;
+  enabledExtensions.imageSupport = imageSupport;
 
   // check for the last occurence of prefix, as it invalidates previous occurances.
   size_t pos = enableListStr.rfind(prefix);
-  if (pos == llvm::StringRef::npos) {
-    // If this string does not exist the input string does not contain valid extension list
-    // or it has all extensions disabled (-all without colon afterwards).
-    return definesStr;
-  }
+  if (pos != llvm::StringRef::npos) {
+    llvm::StringRef enabledExtList = enableListStr.substr(pos + prefix.size());
 
-  enableListStr = enableListStr.substr(pos + prefix.size());
+    // string with defines should be similar in size, ",+" will change to "-D".
+    definesStr.reserve(enabledExtList.size());
 
-  // string with defines should be similar in size, ",+" will change to "-D".
-  definesStr.reserve(enableListStr.size());
+    llvm::SmallVector<StringRef, 0> v;
+    enabledExtList.split(v, ',');
 
-  llvm::SmallVector<StringRef, 0> v;
-  enableListStr.split(v, ',');
+    for (auto ext : v) {
+      if (ext.consume_front("+")) {
+        ext = ext.trim();
+        // Only collect extensions needed for manual feature macro generation
+        if (ext == "cl_khr_integer_dot_product") {
+          enabledExtensions.integerDotProduct = true;
+        } else if (ext == "cl_ext_float_atomics") {
+          enabledExtensions.extFloatAtomics = true;
+        } else if (ext == "cl_khr_fp16") {
+          enabledExtensions.fp16 = true;
+        } else if (ext == "cl_khr_fp64") {
+          enabledExtensions.fp64 = true;
+        } else if (ext == "cl_khr_kernel_clock") {
+          enabledExtensions.kernelClock = true;
+        }
 
-  ExtensionsRequiringManualFeatureMacros enabledExtensions;
-  for (auto ext : v) {
-    if (ext.consume_front("+")) {
-      ext = ext.trim();
-      if (ext == "cl_intel_device_side_avc_motion_estimation") {
-        // If the user provided -cl-std option we need to add the define only if it's 1.2 and above.
-        // This is because clang will not allow declarations of extension's functions which use avc types otherwise.
-        if (!(oclStd >= 120 || oclStd == 0))
-          continue;
+        definesStr.append(" -D").append(ext.str());
       }
-
-      // Only collect extensions needed for manual feature macro generation
-      if (ext == "cl_khr_integer_dot_product") {
-        enabledExtensions.integerDotProduct = true;
-      } else if (ext == "cl_ext_float_atomics") {
-        enabledExtensions.extFloatAtomics = true;
-      } else if (ext == "cl_khr_fp16") {
-        enabledExtensions.fp16 = true;
-      } else if (ext == "cl_khr_fp64") {
-        enabledExtensions.fp64 = true;
-      } else if (ext == "cl_khr_kernel_clock") {
-        enabledExtensions.kernelClock = true;
-      }
-
-      definesStr.append(" -D").append(ext.str());
     }
   }
+  // If the prefix was not found, the input string does not contain a valid extension list
+  // (or it has all extensions disabled, "-all" without a colon afterwards); the feature
+  // macros below don't depend on the per-extension enable list, so still generate them.
 
   // For OpenCL C versions older than 3.0, manually enable feature macros for specific extensions.
   // This is required because some extensions (like cl_khr_integer_dot_product) were implemented
@@ -800,6 +814,7 @@ static int BuildOptionsAreValid(const std::string &options, std::string &exceptS
               (strcmp(pParam, "-Werror") == 0) || (strcmp(pParam, "-cl-std=CL1.1") == 0) ||
               (strcmp(pParam, "-cl-std=CL1.2") == 0) || (strcmp(pParam, "-cl-std=CL2.0") == 0) ||
               (strcmp(pParam, "-cl-std=CL2.1") == 0) || (strcmp(pParam, "-cl-std=CL3.0") == 0) ||
+              (strcmp(pParam, "-cl-std=CL3.1") == 0) ||
               (strcmp(pParam, "-cl-uniform-work-group-size") == 0) || // it's work only for OCL version greater than 1.2
               (strcmp(pParam, "-cl-kernel-arg-info") == 0) || (strncmp(pParam, "-x", 2) == 0) ||
               (strncmp(pParam, "-D", 2) == 0) || (strncmp(pParam, "-I", 2) == 0) ||
@@ -864,8 +879,11 @@ static int BuildOptionsAreValid(const std::string &options, std::string &exceptS
               (strcmp(pParam, "-cl-intel-disable-sendwarwa") == 0) ||
               (strcmp(pParam, "-ze-opt-disable-sendwarwa") == 0) ||
               (strcmp(pParam, "-cl-intel-static-profile-guided-trimming") ==
-               0) ||                                                           // used to enable profile-guided trimming
-              (strcmp(pParam, "-ze-opt-static-profile-guided-trimming") == 0); // used to enable profile-guided trimming
+               0) || // used to enable profile-guided trimming
+              (strcmp(pParam, "-ze-opt-static-profile-guided-trimming") ==
+               0) ||                                            // used to enable profile-guided trimming
+              (strcmp(pParam, "-library-compilation") == 0) ||  // used by LEO
+              (strcmp(pParam, "-ze-take-global-address") == 0); // used by LEO
 
           if (isCommonOption) {
             // check to see if they used a space immediately after
@@ -960,17 +978,16 @@ std::string CClangTranslationBlock::GetOpenCLOptions(const TranslateClangArgs *p
 
   // get additional -D flags from internal options
   optionsEx += " " + GetCDefinesFromInternalOptions(pInternalOptions);
-  optionsEx += " " + GetCDefinesForEnableList(extensions, oclStd, "-cl-ext=-all,");
 
-  // Workaround for Clang issue.
-  // Clang always defines __IMAGE_SUPPORT__ macro for SPIR target, even if device doesn't support it.
-  if (optionsEx.find("__IMAGE_SUPPORT__") == std::string::npos) {
+  // Clang always defines __IMAGE_SUPPORT__ macro for SPIR target, even if device doesn't support it, so the
+  // presence of __IMAGE_SUPPORT__ in optionsEx at this point (from internal options) is what tells us whether
+  // image support should actually be enabled.
+  bool imageSupport = optionsEx.find("__IMAGE_SUPPORT__") != std::string::npos;
+  optionsEx += " " + GetCDefinesForEnableList(extensions, oclStd, "-cl-ext=-all,", imageSupport);
+
+  // Workaround for Clang issue: undefine __IMAGE_SUPPORT__ if the device doesn't support images.
+  if (!imageSupport) {
     optionsEx += " -U__IMAGE_SUPPORT__";
-  }
-
-  // FIXME: do we still support VME?
-  if (AreVMETypesDefined()) {
-    optionsEx += " -D__VME_TYPES_DEFINED__";
   }
 
   optionsEx += " -D__LLVM_VERSION_MAJOR__=" + to_string(LLVM_VERSION_MAJOR);
@@ -1004,6 +1021,11 @@ static std::string GetSpirvExtensionsOption() {
 // Translates from CL to LL/BC
 bool CClangTranslationBlock::TranslateClang(const TranslateClangArgs *pInputArgs, STB_TranslateOutputArgs *pOutputArgs,
                                             std::string &exceptString, const char *pInternalOptions) {
+  if (m_CCModule.isDynamicallyLoaded && !m_CCModule.pCompile) {
+    SetErrorString("Error: TranslateClang is called after dynamic load of compile function failed.", pOutputArgs);
+    return false;
+  }
+
   // additional clang options
   std::string optionsEx = pInputArgs->optionsEx;
   std::string options = pInputArgs->options;
@@ -1048,11 +1070,15 @@ bool CClangTranslationBlock::TranslateClang(const TranslateClangArgs *pInputArgs
   }
 #endif
 
+  // FIXME: remove this line when downstream apps have fixed this error.
+  // This is workaround for an error on clang 22+, temporarily allow it.
+  optionsEx += " -Wno-error=incompatible-pointer-types";
+
   // SYCL input is compiled without the OpenCL-specific options
   // (extension list, feature/extension macro defines, the custom OpenCL
   // header, etc.), which only apply to OpenCL C source.
   if (!IsSYCL)
-    optionsEx += GetOpenCLOptions(pInputArgs, pInternalOptions, exceptString);
+    optionsEx += " " + GetOpenCLOptions(pInputArgs, pInternalOptions, exceptString);
 
   // Pass the list of supported SPIR-V extensions from IGC to opencl-clang.
   optionsEx += GetSpirvExtensionsOption();
@@ -1075,6 +1101,12 @@ bool CClangTranslationBlock::TranslateClang(const TranslateClangArgs *pInputArgs
   // because SYCL compilation requires a different set of options.
   if (!IsSYCL && 0 != BuildOptionsAreValid(options, exceptString))
     res = -43;
+
+  // For some failure cases a clang library can exit before pResultPtr is allocated.
+  if (pResultPtr == nullptr) {
+    SetErrorString("Error: frontend returned no result (compilation failed).", pOutputArgs);
+    return false;
+  }
 
   Utils::FillOutputArgs(pResultPtr, pOutputArgs, exceptString);
   if (!exceptString.empty()) // str != "" => there was an exception. skip further code and return.

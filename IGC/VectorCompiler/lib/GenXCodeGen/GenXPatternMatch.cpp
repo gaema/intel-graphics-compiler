@@ -76,6 +76,7 @@ SPDX-License-Identifier: MIT
 #include "llvm/Transforms/Utils/Local.h"
 
 #include "llvmWrapper/ADT/APInt.h"
+#include "llvmWrapper/IR/CmpPredicate.h"
 #include "llvmWrapper/IR/Constants.h"
 #include "llvmWrapper/IR/DerivedTypes.h"
 #include "llvmWrapper/IR/Intrinsics.h"
@@ -101,6 +102,8 @@ using namespace llvm;
 using namespace llvm::PatternMatch;
 using namespace genx;
 using namespace vc;
+
+using MatchCmpPredicate = IGCLLVM::ICmpInstPredicate;
 
 #define DEBUG_TYPE "genx-pattern-match"
 
@@ -925,7 +928,7 @@ void GenXPatternMatch::visitICmpInst(ICmpInst &I) {
   Value *V0 = nullptr;
   Constant *C1 = nullptr;
   Constant *C2 = nullptr;
-  ICmpInst::Predicate Pred = CmpInst::BAD_ICMP_PREDICATE;
+  MatchCmpPredicate Pred = CmpInst::BAD_ICMP_PREDICATE;
 
   // Transform icmp (V0 & 65535), C2 ==> icmp (trunc V0 to i16), C2.
   // TODO: Only consider unsigned comparisons so do not inspect the sign bit.
@@ -1104,7 +1107,7 @@ void GenXPatternMatch::visitICmpInst(ICmpInst &I) {
 // (cmp.eq (and v, 1), 0) with a narrow vector length with the assumption that
 // the reduced part will be always TRUE.
 CmpInst *GenXPatternMatch::reduceCmpWidth(CmpInst *Cmp) {
-  ICmpInst::Predicate Pred = CmpInst::BAD_ICMP_PREDICATE;
+  MatchCmpPredicate Pred = CmpInst::BAD_ICMP_PREDICATE;
   Value *V0 = nullptr;
   if (!Cmp->hasOneUse() || !Cmp->getType()->isVectorTy() ||
       !match(Cmp, m_ICmp(Pred, m_And(m_Value(V0), m_One()), m_Zero())) ||
@@ -1141,8 +1144,8 @@ CmpInst *GenXPatternMatch::reduceCmpWidth(CmpInst *Cmp) {
 
 // Simplify the sequence of (cmp (and (select (cmp ...) 1, 0), 1), 0)
 bool GenXPatternMatch::simplifyCmp(CmpInst *Cmp) {
-  ICmpInst::Predicate P0 = ICmpInst::BAD_ICMP_PREDICATE;
-  ICmpInst::Predicate P1 = ICmpInst::BAD_ICMP_PREDICATE;
+  MatchCmpPredicate P0 = ICmpInst::BAD_ICMP_PREDICATE;
+  MatchCmpPredicate P1 = ICmpInst::BAD_ICMP_PREDICATE;
   Value *LHS = nullptr;
   Value *RHS = nullptr;
   if (!match(Cmp, m_ICmp(P0,
@@ -1253,6 +1256,55 @@ static Value *createInverseSqrt(Value *Op, Instruction *InsertBefore) {
   return RSqrt;
 }
 
+// Match (splat (sqrt x)) -- the result of a scalar/narrow sqrt broadcast to a
+// wider vector -- and rewrite it in place to (splat (rsqrt x)), reusing the
+// broadcast. LLVM 20+ sinks the splat below the sqrt, turning a broadcast rsqrt
+// into a scalar sqrt + a wide reciprocal; folding the sqrt and the reciprocal
+// back into a scalar rsqrt keeps a single math-box op. The broadcast is a
+// shufflevector before GenXLowering and a genx.rdregion broadcast after it.
+// The caller must have checked that the reciprocal is the splat's only user.
+// Returns the broadcast rsqrt on success, nullptr otherwise.
+static Value *foldBroadcastInverseSqrt(Value *MaybeSplat, bool RequireApprox) {
+  auto *Splat = dyn_cast<Instruction>(MaybeSplat);
+  if (!Splat || !Splat->hasOneUse())
+    return nullptr;
+
+  // The broadcast reads element 0 of its source across all lanes; identify the
+  // operand that carries that source so it can be redirected to the rsqrt.
+  unsigned SrcOpNo = 0;
+  if (auto *SV = dyn_cast<ShuffleVectorInst>(Splat)) {
+    auto Mask = SV->getShuffleMask();
+    if (any_of(Mask,
+               [](int M) { return M != 0 && M != IGCLLVM::PoisonMaskElem; }))
+      return nullptr;
+    if (none_of(Mask, [](int M) { return M == 0; }))
+      return nullptr;
+    SrcOpNo = 0;
+  } else if (GenXIntrinsic::isRdRegion(Splat)) {
+    auto R = makeRegionFromBaleInfo(Splat, BaleInfo());
+    if (R.Indirect || R.Offset || R.Stride || R.VStride)
+      return nullptr;
+    SrcOpNo = GenXIntrinsic::GenXRegion::OldValueOperandNum;
+  } else {
+    return nullptr;
+  }
+
+  auto *Sqrt = dyn_cast<CallInst>(Splat->getOperand(SrcOpNo));
+  if (!Sqrt || !Sqrt->hasOneUse())
+    return nullptr;
+  auto IID = vc::getAnyIntrinsicID(Sqrt);
+  if (IID != GenXIntrinsic::genx_sqrt && IID != Intrinsic::sqrt)
+    return nullptr;
+  // genx_sqrt is already the approximate variant; llvm.sqrt must opt in.
+  if (RequireApprox && IID == Intrinsic::sqrt && !Sqrt->hasApproxFunc())
+    return nullptr;
+
+  auto *Rsqrt = createInverseSqrt(Sqrt->getOperand(0), Sqrt);
+  Splat->setOperand(SrcOpNo, Rsqrt);
+  Sqrt->eraseFromParent();
+  return Splat;
+}
+
 /***********************************************************************
  * GenXPatternMatch::flipBoolNot : attempt to flip (vector) bool not
  *
@@ -1336,6 +1388,13 @@ bool GenXPatternMatch::matchInverseSqrt(CallInst *I) {
     IGC_ASSERT_MESSAGE(0, "Unexpected intrinsic");
     return false;
   case GenXIntrinsic::genx_inv:
+    // (inv (splat (sqrt x))) -> (splat (rsqrt x))
+    if (auto *Splat = foldBroadcastInverseSqrt(I->getOperand(0),
+                                               /*RequireApprox=*/false)) {
+      I->replaceAllUsesWith(Splat);
+      I->eraseFromParent();
+      return true;
+    }
     if (NextIID != GenXIntrinsic::genx_sqrt && NextIID != Intrinsic::sqrt)
       return false;
 
@@ -2635,6 +2694,16 @@ void GenXPatternMatch::visitFDiv(BinaryOperator &I) {
       I.eraseFromParent();
       Divisor->eraseFromParent();
 
+      Changed |= true;
+      return;
+    }
+  }
+
+  // (fdiv 1., (splat (sqrt x))) -> (splat (rsqrt x))
+  if (match(Op0, m_FPOne())) {
+    if (auto *Splat = foldBroadcastInverseSqrt(Op1, /*RequireApprox=*/true)) {
+      I.replaceAllUsesWith(Splat);
+      I.eraseFromParent();
       Changed |= true;
       return;
     }
@@ -4193,6 +4262,20 @@ static Instruction *insertConstantLoad(Constant *C, Instruction *InsertBefore) {
 
 bool GenXPatternMatch::placeConstants(Function *F) {
   bool Changed = false;
+
+#if LLVM_VERSION_MAJOR >= 22
+  // LLVM 22 no longer maintains a use list for ConstantData. Rescanning every
+  // instruction for each constant is O(constants * instructions) and can be
+  // very slow on large kernels, so build an operand-constant use map once and
+  // reuse it below.
+  DenseMap<Constant *, SmallVector<Use *, 8>> ConstantUseMap;
+  for (auto &ScanBB : *F)
+    for (auto &ScanInst : ScanBB)
+      for (Use &U : ScanInst.operands())
+        if (auto *C = dyn_cast<Constant>(U.get()))
+          ConstantUseMap[C].push_back(&U);
+#endif
+
   for (auto &BB : *F) {
     for (auto I = BB.begin(); I != BB.end();) {
       Instruction *Inst = &*I++;
@@ -4240,6 +4323,15 @@ bool GenXPatternMatch::placeConstants(Function *F) {
         SmallVector<Use *, 8> ConstantUses;
         std::set<Instruction *> ConstantUsers;
 
+#if LLVM_VERSION_MAJOR >= 22
+        // Look up the precomputed uses of this constant in the function.
+        if (auto It = ConstantUseMap.find(C); It != ConstantUseMap.end()) {
+          for (Use *U : It->second) {
+            ConstantUses.push_back(U);
+            ConstantUsers.insert(cast<Instruction>(U->getUser()));
+          }
+        }
+#else
         for (auto &U : C->uses()) {
           auto I = dyn_cast<Instruction>(U.getUser());
           if (!I || I->getFunction() != F)
@@ -4247,6 +4339,7 @@ bool GenXPatternMatch::placeConstants(Function *F) {
           ConstantUses.push_back(&U);
           ConstantUsers.insert(I);
         }
+#endif
         if (ConstantUsers.empty())
           continue;
 

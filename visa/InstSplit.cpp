@@ -99,7 +99,12 @@ INST_LIST_ITER InstSplitPass::splitInstruction(INST_LIST_ITER it,
     }
     uint32_t leftBound = 0, rightBound = 0;
     computeSrcBounds(src, leftBound, rightBound);
-    return (rightBound - leftBound) > (m_builder->getGRFSize() * 2u);
+    uint32_t grfSize = m_builder->getGRFSize();
+    // Compare the GRF indices touched by [leftBound, rightBound] rather than
+    // the raw span size: a region whose leftBound is not itself GRF-aligned
+    // (e.g. a sub-register offset within a GRF-aligned declare) can touch 3
+    // GRFs even when rightBound - leftBound <= 2 * grfSize.
+    return (rightBound / grfSize) - (leftBound / grfSize) + 1 > 2u;
   };
 
   auto cross2GRFDst = [inst, this](G4_DstRegRegion *dst) {
@@ -112,7 +117,12 @@ INST_LIST_ITER InstSplitPass::splitInstruction(INST_LIST_ITER it,
     }
     uint32_t leftBound = 0, rightBound = 0;
     computeDstBounds(dst, leftBound, rightBound);
-    return (rightBound - leftBound) > (m_builder->getGRFSize() * 2u);
+    uint32_t grfSize = m_builder->getGRFSize();
+    // Compare the GRF indices touched by [leftBound, rightBound] rather than
+    // the raw span size: a region whose leftBound is not itself GRF-aligned
+    // (e.g. a sub-register offset within a GRF-aligned declare) can touch 3
+    // GRFs even when rightBound - leftBound <= 2 * grfSize.
+    return (rightBound / grfSize) - (leftBound / grfSize) + 1 > 2u;
   };
 
   auto useTmpForSrc = [&](G4_SrcRegRegion *src) -> G4_SrcRegRegion * {
@@ -121,9 +131,15 @@ INST_LIST_ITER InstSplitPass::splitInstruction(INST_LIST_ITER it,
     G4_SrcModifier modifier = src->getModifier();
     src->setModifier(Mod_src_undef);
 
+    // The mov copies the source into a fresh temp that is read back by the
+    // (possibly further-split) parent instruction. It must be NoMask: it has
+    // to populate every lane the parent may read regardless of the parent's
+    // execution mask, and it lets the temp mov be split to any execution size
+    // -- including below SIMD4, where no legal emask offset exists (see the
+    // offsetToMask() based mask handling in the split loop below).
     G4_INST *movInst =
         m_builder->createMov(execSize, m_builder->createDstRegRegion(dcl, 1),
-                             src, inst->getOption(), false);
+                             src, InstOpt_WriteEnable, false);
     movInst->inheritDIFrom(inst);
 
     INST_LIST_ITER newMovIter = instList.insert(it, movInst);
@@ -217,7 +233,24 @@ INST_LIST_ITER InstSplitPass::splitInstruction(INST_LIST_ITER it,
         // Try splitting the inst if it's a mov. Otherwise, legalize
         // the inst by inserting a mov for the src, and split the new
         // mov if needed.
-        if (inst->opcode() == G4_mov) {
+        //
+        // Splitting halves the execution size. A sub-instruction that needs
+        // an execution-mask offset must not be halved below SIMD4: the upper
+        // half (e.g. the SIMD2 at mask offset 2) has no legal emask offset.
+        // Halve a mov in place only when the halves stay at least SIMD4, or
+        // when they carry no emask offset anyway. Otherwise fall through and
+        // legalize by copying the source into a NoMask temp, which can be
+        // split to any size, while the masked parent keeps its execution size
+        // and is left to fixUnalignedRegions in HWConformity.
+        bool isCMKernel = m_builder->kernel.getInt32KernelAttr(
+                              Attributes::ATTR_Target) == VISA_CM;
+        bool halvesNeedMaskOffset =
+            inst->getCondMod() || inst->getPredicate() ||
+            (!isCMKernel && !inst->isWriteEnableInst());
+        bool canHalveMovInPlace =
+            inst->opcode() == G4_mov &&
+            (execSize > g4::SIMD4 || !halvesNeedMaskOffset);
+        if (canHalveMovInPlace) {
           doSplit = true;
           break;
         }
@@ -225,6 +258,20 @@ INST_LIST_ITER InstSplitPass::splitInstruction(INST_LIST_ITER it,
         auto tmpSrc = useTmpForSrc(src);
         vASSERT(tmpSrc->getRegion()->isSingleStride(execSize));
         inst->setSrc(tmpSrc, i);
+
+        // The packed temp can span more GRFs than the 2D region it replaces,
+        // so split the parent until every operand is back within 2 GRFs.
+        // For example:
+        //   (W) rol (32) v15th(0,0)<2>:uw 0xa1c5:w v12th(0,2)<8;16,0>:uq
+        //   =>
+        //   (W) mov (16) TV(0,0)<1>:uq v12th(0,2)<8;16,0>:uq
+        //   (W) mov (16) TV(2,0)<1>:uq v12th(1,2)<8;16,0>:uq  // temp: 4 GRFs
+        //   (W) rol (32) v15th(0,0)<2>:uw 0xa1c5:w TV(0,0)<1;1,0>:uq
+        // Need to split rol as the src1 operand spans more than 2 GRFs.
+        if (cross2GRF(tmpSrc)) {
+          doSplit = true;
+          break;
+        }
       }
     }
   }
@@ -381,7 +428,11 @@ INST_LIST_ITER InstSplitPass::splitInstruction(INST_LIST_ITER it,
                                       TypeSize(inst->getExecType()) == 8);
       G4_InstOption newMask =
           G4_INST::offsetToMask(newExecSize, newMaskOffset, nibOk);
-      newInst->setMaskOption(newMask);
+      if (newMask == InstOpt_NoOpt) {
+        vISA_ASSERT(false, "no legal emask found for the split instruction");
+      } else {
+        newInst->setMaskOption(newMask);
+      }
     }
 
     if (accDstRegion)

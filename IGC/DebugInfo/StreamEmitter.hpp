@@ -37,6 +37,9 @@ namespace llvm {
 class MCStreamer;
 class SourceMgr;
 class MCAsmInfo;
+class MCRegisterInfo;
+class MCSubtargetInfo;
+class MCTargetOptions;
 } // namespace llvm
 
 namespace IGC {
@@ -161,12 +164,6 @@ public:
   ///        labels.  This implicitly uses .set if it is available.
   void EmitLabelDifference(const llvm::MCSymbol *pHi, const llvm::MCSymbol *pLo, unsigned size) const;
 
-  /// @brief Emit something like ".long pHi+offset-pLo" where the size in bytes
-  ///        of the directive is specified by size and pHi/pLo specify the
-  ///        labels.  This implicitly uses .set if it is available.
-  void EmitLabelOffsetDifference(const llvm::MCSymbol *pHi, uint64_t offset, const llvm::MCSymbol *pLo,
-                                 unsigned size) const;
-
   /// @brief Emit something like ".long pLabel+offset" where the size in bytes
   ///        of the directive is specified by size and pLabel specifies the
   ///        label.  This implicitly uses .set if it is available.
@@ -195,9 +192,6 @@ public:
   /// @brief Emit a unit length field.
   llvm::MCSymbol *EmitDwarfUnitLength(const llvm::Twine &Prefix, const llvm::Twine &Comment) const;
 
-  /// @brief Emit dwarf register operation.
-  void EmitDwarfRegOp(unsigned reg, unsigned offset = 0, bool indirect = 0) const;
-
   /// @brief Associate a filename with a specified logical file number.
   ///        This implements the DWARF2 '.file 4 "foo.c"' assembler directive.
   bool EmitDwarfFileDirective(unsigned fileNo, llvm::StringRef directory, llvm::StringRef filename,
@@ -213,9 +207,6 @@ public:
   /// directive.
   void EmitDwarfLocDirective(unsigned fileNo, unsigned line, unsigned column, unsigned flags, unsigned isa,
                              unsigned discriminator, llvm::StringRef fileName) const;
-
-  /// @brief Maps given line table symbol to given ID
-  void SetMCLineTableSymbol(llvm::MCSymbol *pSym, unsigned id) const;
 
   /// @brief Finalize the streamer, flush all written bytes.
   void Finalize() const;
@@ -251,6 +242,9 @@ private:
   llvm::MCContext *m_pContext;
   llvm::SourceMgr *m_pSrcMgr;
   llvm::MCAsmInfo *m_pAsmInfo;
+  llvm::MCRegisterInfo *m_pRegInfo = nullptr;
+  llvm::MCSubtargetInfo *m_pSubtargetInfo = nullptr;
+  llvm::MCTargetOptions *m_pTargetOptions = nullptr;
   IGCLLVM::MCObjectFileInfo *m_pObjFileInfo;
   const llvm::DataLayout *m_pDataLayout;
   const std::string &m_targetTriple;

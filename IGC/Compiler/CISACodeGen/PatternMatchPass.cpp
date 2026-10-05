@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2024 Intel Corporation
+Copyright (C) 2017-2026 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -152,7 +152,7 @@ inline Value *SkipCanonicalize(Value *v) {
 }
 
 bool CodeGenPatternMatch::IsDbgInst(llvm::Instruction &inst) const {
-  if (llvm::isa<llvm::DbgInfoIntrinsic>(&inst)) {
+  if (isDebugInst(&inst)) {
     // FIXME: We probably don't need that.
     return true;
   }
@@ -1121,7 +1121,9 @@ void CodeGenPatternMatch::visitCmpInst(llvm::CmpInst &I) {
   IGC_ASSERT(match);
 }
 
-void CodeGenPatternMatch::visitBranchInst(llvm::BranchInst &I) { MatchBranch(I); }
+void CodeGenPatternMatch::visitCondBrInst(IGCLLVM::CondBrInst &I) { MatchBranch(I); }
+
+void CodeGenPatternMatch::visitUncondBrInst(IGCLLVM::UncondBrInst &I) { MatchBranch(I); }
 
 void CodeGenPatternMatch::visitCallInst(CallInst &I) {
   [[maybe_unused]] bool match = false;
@@ -2261,8 +2263,9 @@ bool CodeGenPatternMatch::CanMatchMad(llvm::BinaryOperator &I) const {
     return false;
   }
 
-  if (m_ctx->type == ShaderType::VERTEX_SHADER && m_ctx->m_DriverInfo.PreventZFighting() &&
-      !(m_ctx->getModuleMetaData()->allowMatchMadOptimizationforVS ||
+  if ((m_ctx->type == ShaderType::VERTEX_SHADER || m_ctx->type == ShaderType::MESH_SHADER) &&
+      m_ctx->m_DriverInfo.PreventZFighting() &&
+      !(m_ctx->getModuleMetaData()->allowMatchMadOptimizationforPosition ||
         IGC_IS_FLAG_ENABLED(WaAllowMatchMadOptimizationforVS))) {
     if (m_PosDep->PositionDependsOnInst(&I)) {
       return false;
@@ -4196,7 +4199,7 @@ bool CodeGenPatternMatch::MatchBinaryUnpack4i8(Instruction &I) {
         if (isUnpack) {
           pattern->sources[i].region_set = true;
           pattern->sources[i].elementOffset = subreg;
-          pattern->sources[i].region[0] = 4;
+          pattern->sources[i].region[0] = (m_WI->isUniform(source) ? 0 : 4);
           pattern->sources[i].region[1] = 1;
           pattern->sources[i].region[2] = 0;
           pattern->sources[i].type = isUnsigned ? ISA_TYPE_UB : ISA_TYPE_B;
@@ -4590,28 +4593,32 @@ bool CodeGenPatternMatch::MatchCanonicalizeInstruction(llvm::Instruction &I) {
   return true;
 }
 
-bool CodeGenPatternMatch::MatchBranch(llvm::BranchInst &I) {
+bool CodeGenPatternMatch::MatchBranch(llvm::Instruction &I) {
   using namespace llvm::PatternMatch;
   struct CondBrInstPattern : Pattern {
     SSource cond;
-    llvm::BranchInst *inst;
+    llvm::Instruction *inst;
     e_predMode predMode = EPRED_NORMAL;
     bool isDiscardBranch = false;
     virtual void Emit(EmitPass *pass, const DstModifier &modifier) {
-      if (isDiscardBranch) {
-        pass->emitDiscardBranch(inst, cond);
+      if (IGCLLVM::CondBrInst *condBr = dyn_cast<IGCLLVM::CondBrInst>(inst)) {
+        if (isDiscardBranch) {
+          pass->emitDiscardBranch(condBr, cond);
+        } else {
+          pass->emitCondBrInst(condBr, cond, predMode);
+        }
       } else {
-        pass->emitBranch(inst, cond, predMode);
+        pass->emitUncondBrInst(cast<IGCLLVM::UncondBrInst>(inst));
       }
     }
   };
   CondBrInstPattern *pattern = new (m_allocator) CondBrInstPattern();
   pattern->inst = &I;
 
-  if (!I.isUnconditional()) {
+  if (auto CBI = dyn_cast<IGCLLVM::CondBrInst>(&I)) {
     Value *orSrc0 = nullptr;
     Value *orSrc1 = nullptr;
-    Value *cond = I.getCondition();
+    Value *cond = CBI->getCondition();
     if (dyn_cast<GenIntrinsicInst>(cond, GenISAIntrinsic::GenISA_UpdateDiscardMask)) {
       pattern->isDiscardBranch = true;
     } else if (match(cond, m_Or(m_Value(orSrc0), m_Value(orSrc1)))) {
@@ -4628,7 +4635,7 @@ bool CodeGenPatternMatch::MatchBranch(llvm::BranchInst &I) {
         }
       }
     }
-    pattern->cond = GetSource(I.getCondition(), false, false, IsSourceOfSample(&I));
+    pattern->cond = GetSource(cast<IGCLLVM::CondBrInst>(&I)->getCondition(), false, false, IsSourceOfSample(&I));
   }
   AddPattern(pattern);
   return true;
@@ -5974,7 +5981,7 @@ bool CodeGenPatternMatch::MatchDp4a(GenIntrinsicInst &I) {
       wavesrc2 = llvm::dyn_cast<llvm::Constant>(waveInst[0]->getOperand(2));
     }
 
-    if (wavesrc1 && wavesrc2 && wavesrc1->isZeroValue() && wavesrc2->isZeroValue()) {
+    if (wavesrc1 && wavesrc2 && IGCLLVM::Constant::isNullValue(wavesrc1) && IGCLLVM::Constant::isNullValue(wavesrc2)) {
       if (llvm::isa<llvm::ExtractElementInst>(waveInst[0]->getOperand(0))) {
         llvm::ExtractElementInst *extractInst[4];
 
@@ -6877,7 +6884,8 @@ inline bool isMinOrMax(llvm::Value *inst, llvm::Value *&source0, llvm::Value *&s
         ConstantInt *c1 = dyn_cast<ConstantInt>(max->getOperand(1));
         ConstantInt *c2 = dyn_cast<ConstantInt>(max->getOperand(2));
         Instruction *op = dyn_cast<Instruction>(max->getOperand(idx));
-        if (((c1 && c1->isZeroValue()) || (c2 && c2->isZeroValue())) && (op && op->getOpcode() == Instruction::AShr)) {
+        if (((c1 && IGCLLVM::Constant::isNullValue(c1)) || (c2 && IGCLLVM::Constant::isNullValue(c2))) &&
+            (op && op->getOpcode() == Instruction::AShr)) {
           return op->getOperand(0);
         }
         return max->getOperand(idx);

@@ -71,6 +71,7 @@ public:
   void visitFCmpInstUndorderedPredicate(llvm::FCmpInst &FC);
   void visitFCmpInstUndorderedFlushNan(llvm::FCmpInst &FC);
   void visitInsertElementInst(llvm::InsertElementInst &I);
+  void visitExtractElementInst(llvm::ExtractElementInst &I);
   void visitShuffleVectorInst(llvm::ShuffleVectorInst &I);
   void visitStoreInst(llvm::StoreInst &I);
   void visitLoadInst(llvm::LoadInst &I);
@@ -93,6 +94,7 @@ protected:
   void RecursivelyChangePointerType(llvm::Instruction *oldPtr, llvm::Type *Ty, llvm::Instruction *newPtr);
   void PromoteFp16ToFp32OnGenSampleCall(llvm::CallInst &I);
   void PromoteInsertElement(llvm::Value *I, llvm::Value *newVec);
+  void PromoteTruncToI1(llvm::TruncInst &I);
 
   /// \brief Ensure a function have a unique return instruction.
   void unifyReturnInsts(llvm::Function &F);

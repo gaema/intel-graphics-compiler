@@ -334,6 +334,7 @@ struct SInstrTypes {
   bool hasSLM{};
   bool hasWorkgroupBarrier{};
   bool hasSplitBarrier{};
+  bool hasDPAS{};
   unsigned int numCall{};
   unsigned int numBarrier{};
   unsigned int numLoadStore{};
@@ -436,6 +437,11 @@ enum SIMDInfoBit {
   SIMD_INFO_RESERVED   // 11: *** If new entry is added, make sure it still
                        // fits in m_SIMDInfo ***
 };
+
+// SIMDInfo bits describing a hint about the shader itself, not the outcome of one
+// codegen attempt. Set only in the input translation stage, which is not re-run
+// on a retry, so ClearSIMDInfo must preserve them.
+constexpr uint32_t g_cStickySIMDInfoBits = (1U << SIMD_FORCE_CONTENT) | (1U << SIMD_FORCE_HINT);
 
 struct SKernelProgram {
   SProgramOutput simd1;
@@ -981,11 +987,13 @@ public:
   bool m_hasLegacyDebugInfo = false;
   bool m_hasEmu64BitInsts = false;
 
-  // Side-map for debug variable storage info (offset + size) computed by
-  // PrivateMemoryResolution and consumed by DwarfCompileUnit.
+  // Side-map for debug variable storage info (buffer offset + per-lane stride)
+  // computed by PrivateMemoryResolution and consumed by DwarfCompileUnit.
   struct DbgVarStorageInfo {
     uint32_t offset = 0;
-    std::optional<uint32_t> size;
+    uint32_t stride = 0;
+    // True for FP-relative stack-call locations, false for private-base locations.
+    bool isStackBased = false;
   };
   llvm::DenseMap<DbgVarStorageKey, DbgVarStorageInfo> m_DbgVarStorageMap;
   bool m_hasDPEmu = false;
@@ -1150,9 +1158,9 @@ public:
   virtual void resetOnRetry(bool isSubmodule = false);
   virtual int32_t getNumThreadsPerEU() const;
   virtual uint32_t getExpGRFSize() const;
-  virtual uint32_t getNumGRFPerThread(bool returnDefault = true);
+  virtual uint32_t getNumGRFPerThread(bool returnDefault = true, const llvm::Function *F = nullptr);
   virtual void setNumGRFPerThread(uint32_t value) { m_NumGRFPerThread = value; }
-  virtual bool isAutoGRFSelectionEnabled() const { return false; };
+  virtual bool isAutoGRFSelectionEnabled(const llvm::Function *F = nullptr) const { return false; };
   virtual bool forceGlobalMemoryAllocation() const;
   virtual bool allocatePrivateAsGlobalBuffer() const;
   virtual bool noLocalToGenericOptionEnabled() const;
@@ -1188,17 +1196,19 @@ public:
   void ModifySIMDInfo(SIMDMode simd, ShaderDispatchMode mode, Action action, SIMDInfoBit bit = SIMD_INFO_RESERVED) {
     uint32_t bit_value = 1UL << bit;
     bool clear = action == Action::Clear ? true : false;
+    // Clear drops the per-attempt bits only: see g_cStickySIMDInfoBits.
+    auto apply = [&](uint32_t current) { return clear ? (current & g_cStickySIMDInfoBits) : (current | bit_value); };
     switch (mode) {
     case ShaderDispatchMode::NOT_APPLICABLE:
       switch (simd) {
       case SIMDMode::SIMD8:
-        m_SIMDInfo.simd8 = clear ? 0 : m_SIMDInfo.simd8 | bit_value;
+        m_SIMDInfo.simd8 = apply(m_SIMDInfo.simd8);
         break;
       case SIMDMode::SIMD16:
-        m_SIMDInfo.simd16 = clear ? 0 : m_SIMDInfo.simd16 | bit_value;
+        m_SIMDInfo.simd16 = apply(m_SIMDInfo.simd16);
         break;
       case SIMDMode::SIMD32:
-        m_SIMDInfo.simd32 = clear ? 0 : m_SIMDInfo.simd32 | bit_value;
+        m_SIMDInfo.simd32 = apply(m_SIMDInfo.simd32);
         break;
       default:
         IGC_ASSERT_MESSAGE(0, "Unknown SIMD Mode");
@@ -1207,10 +1217,10 @@ public:
       break;
 
     case ShaderDispatchMode::DUAL_SIMD8:
-      m_SIMDInfo.dual_simd8 = clear ? 0 : m_SIMDInfo.dual_simd8 | bit_value;
+      m_SIMDInfo.dual_simd8 = apply(m_SIMDInfo.dual_simd8);
       break;
     case ShaderDispatchMode::QUAD_SIMD8_DYNAMIC:
-      m_SIMDInfo.quad_simd8_dynamic = clear ? 0 : m_SIMDInfo.quad_simd8_dynamic | bit_value;
+      m_SIMDInfo.quad_simd8_dynamic = apply(m_SIMDInfo.quad_simd8_dynamic);
       break;
 
     default:
@@ -1222,6 +1232,26 @@ public:
   void SetSIMDInfo(SIMDInfoBit bit, SIMDMode simd, ShaderDispatchMode mode) {
     IGC_ASSERT(bit < SIMD_INFO_RESERVED);
     ModifySIMDInfo(simd, mode, Action::Set, bit);
+  }
+
+  // Record a hint-forced wave size. Convert lanes to SIMDMode type
+  void SetForcedWaveSizeSIMDInfo(unsigned waveSizeInLanes) {
+    if (waveSizeInLanes == 8 || waveSizeInLanes == 16 || waveSizeInLanes == 32) {
+      SetSIMDInfo(SIMD_FORCE_HINT, lanesToSIMDMode(waveSizeInLanes), ShaderDispatchMode::NOT_APPLICABLE);
+    }
+  }
+
+  // Record a hint-forced wave size for PS.
+  void SetForcedPSSIMDModeSIMDInfo(unsigned psSIMDModeMask) {
+    if (psSIMDModeMask & FLAG_PS_SIMD_MODE_FORCE_SIMD8) {
+      SetSIMDInfo(SIMD_FORCE_HINT, SIMDMode::SIMD8, ShaderDispatchMode::NOT_APPLICABLE);
+    }
+    if (psSIMDModeMask & FLAG_PS_SIMD_MODE_FORCE_SIMD16) {
+      SetSIMDInfo(SIMD_FORCE_HINT, SIMDMode::SIMD16, ShaderDispatchMode::NOT_APPLICABLE);
+    }
+    if (psSIMDModeMask & FLAG_PS_SIMD_MODE_FORCE_SIMD32) {
+      SetSIMDInfo(SIMD_FORCE_HINT, SIMDMode::SIMD32, ShaderDispatchMode::NOT_APPLICABLE);
+    }
   }
 
   void ClearSIMDInfo(SIMDMode simd, ShaderDispatchMode mode) { ModifySIMDInfo(simd, mode, Action::Clear); }

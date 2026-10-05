@@ -26,6 +26,7 @@ SPDX-License-Identifier: MIT
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/ModuleSlotTracker.h>
 #include "common/LLVMWarningsPop.hpp"
+#include "llvmWrapper/IR/Instructions.h"
 
 #include <functional>
 #include <string>
@@ -1474,6 +1475,8 @@ WIAnalysis::WIDependancy WIAnalysisRunner::calculate_dep(const CallInst *inst) {
       intrinsic_name == llvm_ptr_to_pair || intrinsic_name == llvm_pair_to_ptr || intrinsic_name == llvm_fma ||
       intrinsic_name == llvm_canonicalize || GII_id == GenISAIntrinsic::GenISA_uitof_rtz ||
       GII_id == GenISAIntrinsic::GenISA_ftobf || GII_id == GenISAIntrinsic::GenISA_bftof ||
+      GII_id == GenISAIntrinsic::GenISA_ftof_rte || GII_id == GenISAIntrinsic::GenISA_ftof_rtz ||
+      GII_id == GenISAIntrinsic::GenISA_ftof_rtp || GII_id == GenISAIntrinsic::GenISA_ftof_rtn ||
       GII_id == GenISAIntrinsic::GenISA_2fto2bf || GII_id == GenISAIntrinsic::GenISA_dual_subslice_id ||
       GII_id == GenISAIntrinsic::GenISA_hftobf8 || GII_id == GenISAIntrinsic::GenISA_bf8tohf ||
       GII_id == GenISAIntrinsic::GenISA_srnd_ftohf || GII_id == GenISAIntrinsic::GenISA_srnd_hftobf8 ||
@@ -1495,6 +1498,7 @@ WIAnalysis::WIDependancy WIAnalysisRunner::calculate_dep(const CallInst *inst) {
       GII_id == GenISAIntrinsic::GenISA_dual_subslice_id || GII_id == GenISAIntrinsic::GenISA_eu_id ||
       GII_id == GenISAIntrinsic::GenISA_eu_thread_id || GII_id == GenISAIntrinsic::GenISA_movcr ||
       GII_id == GenISAIntrinsic::GenISA_hw_thread_id || GII_id == GenISAIntrinsic::GenISA_hw_thread_id_alloca ||
+      GII_id == GenISAIntrinsic::GenISA_hw_tile_id || GII_id == GenISAIntrinsic::GenISA_hw_engine_id ||
       GII_id == GenISAIntrinsic::GenISA_StackAlloca || GII_id == GenISAIntrinsic::GenISA_vectorUniform ||
       GII_id == GenISAIntrinsic::GenISA_getR0 || GII_id == GenISAIntrinsic::GenISA_getPayloadHeader ||
       GII_id == GenISAIntrinsic::GenISA_getGlobalOffset || GII_id == GenISAIntrinsic::GenISA_getWorkDim ||
@@ -1526,7 +1530,12 @@ WIAnalysis::WIDependancy WIAnalysisRunner::calculate_dep(const CallInst *inst) {
     case GenISAIntrinsic::GenISA_getSR0:
     case GenISAIntrinsic::GenISA_getSR0_0:
     case GenISAIntrinsic::GenISA_eu_id:
+    case GenISAIntrinsic::GenISA_eu_thread_id:
     case GenISAIntrinsic::GenISA_hw_thread_id:
+    case GenISAIntrinsic::GenISA_hw_thread_id_alloca:
+    case GenISAIntrinsic::GenISA_hw_tile_id:
+    case GenISAIntrinsic::GenISA_hw_engine_id:
+    case GenISAIntrinsic::GenISA_movcr:
       return WIAnalysis::UNIFORM_THREAD;
     case GenISAIntrinsic::GenISA_slice_id:
     case GenISAIntrinsic::GenISA_subslice_id:
@@ -1829,9 +1838,14 @@ WIAnalysis::WIDependancy WIAnalysisRunner::calculate_dep_terminator(const IGCLLV
   // because we may want to avoid predication if the control flows
   // in the function are uniform...
   switch (inst->getOpcode()) {
-  case Instruction::Br: {
-    const BranchInst *brInst = cast<BranchInst>(inst);
-    if (brInst->isConditional()) {
+#if LLVM_VERSION_MAJOR >= 23
+  case llvm::Instruction::UncondBr:
+  case llvm::Instruction::CondBr:
+#else
+  case llvm::Instruction::Br:
+#endif
+  {
+    if (const IGCLLVM::CondBrInst *brInst = llvm::dyn_cast<IGCLLVM::CondBrInst>(inst)) {
       // Conditional branch is uniform, if its condition is uniform
       Value *op = brInst->getCondition();
       WIAnalysis::WIDependancy dep = getDependency(op);

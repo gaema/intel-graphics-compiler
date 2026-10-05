@@ -74,8 +74,27 @@ uint32_t OpenCLProgramContext::getExpGRFSize() const {
   return 0;
 }
 
-uint32_t OpenCLProgramContext::getNumGRFPerThread(bool returnDefault) {
-  if (platform.supportsStaticRegSharing()) {
+int32_t OpenCLProgramContext::getRequestedNumGRF(const llvm::Function *F) const {
+  // The TotalGRFNum debug registry key forces a register budget and overrides
+  // every other source, this one included.
+  if (IGC_GET_FLAG_VALUE(TotalGRFNum) != 0)
+    return -1;
+
+  if (!F || !F->hasFnAttribute("num-grf-per-thread"))
+    return -1;
+
+  uint32_t numGRF = 0;
+  if (F->getFnAttribute("num-grf-per-thread").getValueAsString().getAsInteger(10, numGRF))
+    return -1;
+  return static_cast<int32_t>(numGRF);
+}
+
+uint32_t OpenCLProgramContext::getNumGRFPerThread(bool ReturnDefault, const llvm::Function *F) {
+  int32_t RequestedNumGRF = getRequestedNumGRF(F);
+  if (RequestedNumGRF > 0)
+    return static_cast<uint32_t>(RequestedNumGRF);
+
+  if (RequestedNumGRF < 0 && platform.supportsStaticRegSharing()) {
     if (m_InternalOptions.Intel128GRFPerThread || m_Options.Intel128GRFPerThread) {
       return 128;
     } else if (m_InternalOptions.Intel256GRFPerThread || m_Options.Intel256GRFPerThread ||
@@ -100,10 +119,47 @@ uint32_t OpenCLProgramContext::getNumGRFPerThread(bool returnDefault) {
       return 256;
     }
   }
-  return CodeGenContext::getNumGRFPerThread(returnDefault);
+
+  // On recompilation, report the lifted 512 budget so RP optimizations plan for it.
+  if (F && m_retryManager && !m_retryManager->IsFirstTry()) {
+    unsigned ForcedSIMD = getModuleMetaData()->csInfo.forcedSIMDSize;
+    SIMDMode Simd = ForcedSIMD ? lanesToSIMDMode(ForcedSIMD) : IGC::bestGuessSIMDSize(this, F);
+    const auto &FuncMD = getModuleMetaData()->FuncMD;
+    auto It = FuncMD.find(const_cast<llvm::Function *>(F));
+    bool HasDPAS = It != FuncMD.end() && It->second.hasDPAS;
+    if (kernelQualifiesFor512(HasDPAS, Simd, F))
+      return 512;
+  }
+
+  return CodeGenContext::getNumGRFPerThread(ReturnDefault, F);
 }
 
-bool OpenCLProgramContext::isAutoGRFSelectionEnabled() const {
+bool OpenCLProgramContext::kernelQualifiesFor512(bool hasDPAS, SIMDMode simd, const llvm::Function *F) const {
+  if (!platform.supports512GRFPerThread())
+    return false;
+
+  if (!isAutoGRFSelectionEnabled(F) || m_Options.IntelLargeRegisterFile || getExpGRFSize() != 0 ||
+      getModuleMetaData()->compOpt.forceTotalGRFNum != 0)
+    return false;
+
+  if (!m_retryManager || m_retryManager->IsFirstTry())
+    return false;
+
+  // Only SIMD16 for now as for SIMD32 we should first try lower SIMD
+  if (simd != SIMDMode::SIMD16)
+    return false;
+
+  return (IGC_IS_FLAG_ENABLED(EnableOCL512GRFForDPAS) && hasDPAS) || IGC_IS_FLAG_ENABLED(EnableOCL512GRFForSIMD16);
+}
+
+bool OpenCLProgramContext::isAutoGRFSelectionEnabled(const llvm::Function *F) const {
+  // A per-kernel budget from SPV_INTEL_maximum_registers is authoritative:
+  // AutoINTEL asks for the heuristics, an explicit count must not be replaced by
+  // them even when a module-wide option enables auto mode.
+  int32_t requestedNumGRF = getRequestedNumGRF(F);
+  if (requestedNumGRF >= 0)
+    return requestedNumGRF == 0;
+
   if (getNumThreadsPerEU() == 0)
     return true;
 
@@ -116,6 +172,13 @@ bool OpenCLProgramContext::isAutoGRFSelectionEnabled() const {
       !m_InternalOptions.Intel512GRFPerThread && !m_Options.Intel512GRFPerThread) {
     return true;
   }
+
+  // Per-kernel "num-thread-per-eu 0" annotation requests auto (large) GRF
+  // selection independently of any module-level option, provided the platform
+  // supports auto GRF selection.
+  if (platform.supportsAutoGRFSelection() && F && F->hasFnAttribute("num-thread-per-eu") &&
+      F->getFnAttribute("num-thread-per-eu").getValueAsString() == "0")
+    return true;
 
   return false;
 }
@@ -507,19 +570,26 @@ COpenCLKernel::SIMDSizeRequirement COpenCLKernel::getEffectiveRequiredSIMDSize(l
   return {};
 }
 
-uint32_t COpenCLKernel::getMaxPressure(llvm::Function &F) const {
+uint32_t COpenCLKernel::getMaxPressure(llvm::Function &F, unsigned int SIMD) const {
   const auto *modMD = m_Context->getModuleMetaData();
   auto it = modMD->FuncMD.find(&F);
-  unsigned int maxPressure = (it != modMD->FuncMD.end()) ? it->second.maxRegPressure : 0;
+  unsigned int maxPressure =
+      (it != modMD->FuncMD.end()) ? (it->second.maxRegUniformPressure + it->second.maxRegNonUniformPressure * SIMD) : 0;
 
   if (m_FGA) {
     llvm::Function *Kernel = &F;
     auto FG = m_FGA->getGroup(&F);
     Kernel = FG->getHead();
     auto kit = modMD->FuncMD.find(Kernel);
-    maxPressure = (kit != modMD->FuncMD.end()) ? kit->second.maxRegPressure : 0;
+    maxPressure = (kit != modMD->FuncMD.end())
+                      ? (kit->second.maxRegUniformPressure + kit->second.maxRegNonUniformPressure * SIMD)
+                      : 0;
   }
-  return maxPressure;
+
+  // now we store in bytes and convert to register pressure
+  unsigned regSize = GetContext()->platform.getGRFSize();
+  unsigned pressureInRegs = llvm::divideCeil(maxPressure, regSize);
+  return pressureInRegs;
 }
 
 uint32_t COpenCLKernel::getMaxPressureForSIMD(llvm::Function &F, unsigned SimdLanes) const {
@@ -531,7 +601,7 @@ uint32_t COpenCLKernel::getMaxPressureForSIMD(llvm::Function &F, unsigned SimdLa
     case 32:
       return funcMD.maxRegPressureSimd32;
     default:
-      return funcMD.maxRegPressure;
+      return (unsigned)0;
     }
   };
   auto it = modMD->FuncMD.find(&F);
@@ -1466,7 +1536,7 @@ void COpenCLKernel::AllocatePayload() {
           CVariable *var = GetSymbol(const_cast<Argument *>(A));
           for (int i = 0; i < numAllocInstances; ++i) {
             uint totalOffset = offset + (allocSize * i);
-            if ((totalOffset / getGRFSize()) >= m_Context->getNumGRFPerThread()) {
+            if ((totalOffset / getGRFSize()) >= m_Context->getNumGRFPerThread(true, entry)) {
               m_Context->EmitError("Kernel inputs exceed total register size!", A);
               return;
             }
@@ -2152,10 +2222,19 @@ RetryType NeedsRetry(OpenCLProgramContext *ctx, COpenCLKernel *pShader, CShaderP
     return RetryType::YES_Retry;
   } else if (isWorstThanPrv) {
     return RetryType::NO_Retry_Pick_Prv;
-  } else if (!ctx->hasSpills(pOutput->m_scratchSpaceUsedBySpills, pOutput->m_numGRFTotal, pOutput->m_spillThreshold) ||
-             ctx->getModuleMetaData()->compOpt.OptDisable || ctx->m_retryManager->IsLastTry() ||
-             (!ctx->m_retryManager->kernelSkip.empty() &&
-              ctx->m_retryManager->kernelSkip.count(pFunc->getName().str()))) {
+  }
+
+  // Keep retry sensitive to heavy spilling even if vISA raised per-kernel
+  // dynamic spill threshold (m_spillThreshold).
+  uint baseSpillBudget = (pOutput->m_numGRFTotal == 256 && ctx->m_spillAllowedFor256GRF) ? ctx->m_spillAllowedFor256GRF
+                                                                                         : ctx->m_spillAllowed;
+  bool exceedsBaseSpillBudget = pOutput->m_scratchSpaceUsedBySpills > baseSpillBudget;
+  bool hasRetryRelevantSpills =
+      ctx->hasSpills(pOutput->m_scratchSpaceUsedBySpills, pOutput->m_numGRFTotal, pOutput->m_spillThreshold) ||
+      exceedsBaseSpillBudget;
+
+  if (!hasRetryRelevantSpills || ctx->getModuleMetaData()->compOpt.OptDisable || ctx->m_retryManager->IsLastTry() ||
+      (!ctx->m_retryManager->kernelSkip.empty() && ctx->m_retryManager->kernelSkip.count(pFunc->getName().str()))) {
     return RetryType::NO_Retry;
   } else {
     return RetryType::YES_Retry;
@@ -2557,20 +2636,20 @@ static bool shouldDropToSIMD16(uint32_t maxPressure, uint32_t simd16Pressure, ui
     return false;
   }
 
-  bool autoGRF = pCtx->isAutoGRFSelectionEnabled();
+  bool autoGRF = pCtx->isAutoGRFSelectionEnabled(F);
 
   // Non-VRT platforms have no VRT GRF step-up: SIMD32 is only profitable when
   // its register pressure fits the GRF budget. Drop to SIMD16 when SIMD32
   // pressure exceeds the budget -- the forced GRF count, otherwise 128 (256 in
   // auto large-GRF mode).
   if (pCtx->platform.isCoreXE2()) {
-    uint32_t grfBudget = pCtx->getNumGRFPerThread(false);
+    uint32_t grfBudget = pCtx->getNumGRFPerThread(false, F);
     if (grfBudget == 0)
       grfBudget = autoGRF ? 256 : 128;
     return simd32Pressure > grfBudget;
   }
 
-  if (!autoGRF || pCtx->getNumGRFPerThread(false) != 0) {
+  if (!autoGRF || pCtx->getNumGRFPerThread(false, F) != 0) {
     return false;
   }
 
@@ -2619,7 +2698,7 @@ SIMDStatus COpenCLKernel::checkSIMDCompileCondsForMin16(SIMDMode simdMode, EmitP
     EP.m_canAbortOnSpill = false;
   }
   bool hasSubGroupForce = hasSubGroupIntrinsicPVC(F);
-  uint32_t maxPressure = getMaxPressure(F);
+  uint32_t maxPressure = getMaxPressure(F, numLanes(simdMode));
 
   auto FG = m_FGA ? m_FGA->getGroup(&F) : nullptr;
   bool hasStackCall = FG && FG->hasStackCall();
@@ -2762,7 +2841,7 @@ SIMDStatus COpenCLKernel::checkSIMDCompileConds(SIMDMode simdMode, EmitPass &EP,
   ModuleMetaData *modMD = pCtx->getModuleMetaData();
   auto simdReq = getEffectiveRequiredSIMDSize(F);
   uint32_t requiredSimdSize = simdReq.Size;
-  uint32_t maxPressure = getMaxPressure(F);
+  uint32_t maxPressure = getMaxPressure(F, numLanes(simdMode));
 
   // For simd variant functions, detect which SIMD sizes are needed
   if (compileFunctionVariants && F.hasFnAttribute("variant-function-def")) {

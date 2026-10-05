@@ -206,6 +206,65 @@ void Optimizer::preRegAlloc() {
   forceSpillVars();
 }
 
+// Estimate how much spilling this kernel can tolerate without hurting
+// performance and record it as the dynamic spill threshold (in bytes) consumed
+// by GRFMode::getSpillThreshold() when vISA_DynamicSpillThreshold is set.
+//
+// The intuition: spill/fill sends compete with the kernel's real memory
+// traffic for LSC/data-port bandwidth, so the more memory-bound a kernel
+// already is, the fewer spills it can afford. We model that with a single
+// weighted tally, weightedLSCOps:
+//   - each LSC send  -> +1  (consumes memory bandwidth; shrinks the budget)
+//   - each sampler   -> samplerWeight (default -1) (frees the memory path;
+//                       grows the budget)
+//
+// samplerWeight (vISA_DynamicSpillSamplerWeight) is negative by default because
+// a sampler-heavy kernel exercises the sampler pipeline rather than the
+// LSC/data-port path, so it has spare memory bandwidth to absorb the spill/fill
+// traffic. Counting each sampler op against the LSC op tally therefore *raises*
+// the spill budget instead of lowering it.
+void Optimizer::computeDynamicSpillThreshold() {
+  const int32_t samplerWeight = static_cast<int32_t>(
+      builder.getOptions()->getuInt32Option(vISA_DynamicSpillSamplerWeight));
+  // Percentage of the kernel's instructions allowed to be spill/fill traffic.
+  const int32_t thresholdPercent = static_cast<int32_t>(
+      builder.getOptions()->getuInt32Option(vISA_DynamicSpillThresholdPercent));
+
+  uint32_t totalInst = 0;
+  int32_t weightedLSCOps = 0;
+  for (auto *bb : kernel.fg) {
+    for (auto *inst : *bb) {
+      if (inst->isLabel())
+        continue;
+      ++totalInst;
+      if (!inst->isSend())
+        continue;
+      auto *desc = inst->getMsgDesc();
+      if (!desc)
+        continue;
+      if (desc->isLSC()) {
+        ++weightedLSCOps;
+      } else if (desc->isSampler()) {
+        weightedLSCOps = weightedLSCOps + samplerWeight;
+      }
+    }
+  }
+  // Budget in spill instructions: allow spill traffic up to ~thresholdPercent%
+  // of the kernel's instructions, then discount the memory pressure already
+  // present (weightedLSCOps). Convert that to spilled GRFs assuming each spilled
+  // GRF costs ~2 instructions (1 spill store + 1 fill load), so
+  //   allowed spilled GRFs = (totalInst * thresholdPercent% - weightedLSCOps) / 2.
+  float allowedSpiilledGRF =
+      (totalInst * (thresholdPercent / 100.0f) -
+       static_cast<float>(weightedLSCOps)) /
+      2;
+  // The threshold is expressed in bytes, so scale the GRF count by the GRF size
+  // (clamped at 0 for kernels that can afford no spills).
+  unsigned char grfSize = kernel.getGRFSize();
+  kernel.grfMode.setDynamicSpillThreshold(static_cast<unsigned>(
+      allowedSpiilledGRF > 0.0f ? allowedSpiilledGRF * grfSize : 0.0f));
+}
+
 void Optimizer::regAlloc() {
 
   fg.prepareTraversal();
@@ -682,6 +741,8 @@ void Optimizer::initOptimizations() {
                       TimerID::HW_CONFORMITY);
   OPT_INITIALIZE_PASS(HWConformityChk, vISA_EnableAlways,
                       TimerID::HW_CONFORMITY);
+  OPT_INITIALIZE_PASS(computeDynamicSpillThreshold, vISA_DynamicSpillThreshold,
+                      TimerID::MISC_OPTS);
   OPT_INITIALIZE_PASS(preRA_Schedule, vISA_preRA_Schedule,
                       TimerID::PRERA_SCHEDULING);
   OPT_INITIALIZE_PASS(preRA_HWWorkaround, vISA_EnableAlways,
@@ -759,6 +820,9 @@ void Optimizer::initOptimizations() {
   OPT_INITIALIZE_PASS(zeroSomeARF, vISA_zeroSomeARF, TimerID::MISC_OPTS);
   OPT_INITIALIZE_PASS(addSWSBInfo, vISA_addSWSBInfo, TimerID::SWSB);
   OPT_INITIALIZE_PASS(expandMadwPostSchedule, vISA_expandMadwPostSchedule,
+                      TimerID::MISC_OPTS);
+  // A generic pass to expand any pseudo instructions after RA/postSchedule.
+  OPT_INITIALIZE_PASS(expandPseudoInstPostSchedule, vISA_EnableAlways,
                       TimerID::MISC_OPTS);
   OPT_INITIALIZE_PASS(ACCSchedule, vISA_PreSchedForAcc,
                       TimerID::PRERA_SCHEDULING);
@@ -851,6 +915,30 @@ void Optimizer::accSubPostSchedule() {
 
   AccSubPass accSub(builder, kernel);
   accSub.run();
+}
+
+
+//
+// Expand the pseudo instructions that must survive scheduling intact, i.e. the
+// ones standing for a group of real instructions that nothing earlier may break
+// up or reorder. Each expansion emits HW-legal instructions as written: HW
+// conformity has already run and will not revisit them.
+//
+// Only the individual expansions are platform specific, so keep this dispatcher
+// unconditional and guard each case instead.
+//
+void Optimizer::expandPseudoInstPostSchedule() {
+  for (auto bb : kernel.fg) {
+    for (auto it = bb->begin(), ie = bb->end(); it != ie;) {
+      // Assume 'it' would be invalid after expansion, advance before expanding
+      auto next = std::next(it);
+      switch ((*it)->opcode()) {
+      default:
+        break;
+      }
+      it = next;
+    }
+  }
 }
 
 void Optimizer::s0SubAfterRA() {
@@ -975,6 +1063,14 @@ int Optimizer::optimization() {
 
   runPass(PI_insertFenceBeforeEOT);
 
+  // Pre-compute dynamic spill threshold for GRFMode::getSpillThreshold.
+  // Only runs when vISA_DynamicSpillThreshold is set (the pass is the sole
+  // producer of the value consumed by getSpillThreshold under that option;
+  // computing it otherwise would be wasted work). Must run before
+  // preRA_Schedule (consumes it via setModeByRegPressure) and regAlloc
+  // (consumes it via GraphColor).
+  runPass(PI_computeDynamicSpillThreshold);
+
   // PreRA scheduling
   runPass(PI_preRA_Schedule);
 
@@ -1048,6 +1144,8 @@ int Optimizer::optimization() {
 
     runPass(PI_accSubPostSchedule);
   }
+
+  runPass(PI_expandPseudoInstPostSchedule);
 
   runPass(PI_legalizeType);
 
@@ -2193,10 +2291,20 @@ static void doHoisting(FlowGraph &fg, G4_BB *bb, INST_LIST_RITER revIter) {
       // defInst[opnd_pred].
       inst->transferDef(defInst, Opnd_pred, Opnd_pred);
     }
-    if (inst->getSrc(0)->asSrcRegRegion()->isScalar() &&
-        inst->getExecSize() > g4::SIMD1) {
-      defInst->setExecSize(
-          G4_ExecSize(defInst->getExecSize() * inst->getExecSize()));
+    // If every lane of the use reads the same single source element (a
+    // broadcast), the def, which produces one element, must be expanded to
+    // write all of the use's lanes. A stride of 0 over the use's exec size
+    // identifies a broadcast for both the canonical scalar region <0;1,0> and
+    // effectively-scalar regions like <1;N,0>; isScalar() only recognizes the
+    // former.
+    G4_ExecSize useExecSize = inst->getExecSize();
+    uint16_t useSrcStride = 0;
+    bool useSrcIsBroadcast =
+        inst->getSrc(0)->asSrcRegRegion()->getRegion()->isSingleStride(
+            useExecSize, useSrcStride) &&
+        useSrcStride == 0;
+    if (useSrcIsBroadcast && useExecSize > g4::SIMD1) {
+      defInst->setExecSize(G4_ExecSize(defInst->getExecSize() * useExecSize));
     }
     defInst->setSaturate(inst->getSaturate() || defInst->getSaturate());
     if (!bb->isAllLaneActive()) {
@@ -2238,6 +2346,94 @@ void Optimizer::localDefHoisting() {
         << "             === Local Definition Hoisting Optimization ===\n";
     std::cout << "Number of defs hoisted: " << numDefHoisted << "\n";
   });
+}
+
+// reassociateConst() folds
+//    def: add D, S, K1
+//    use: add U, D, K2
+// into
+//    use: add U, S, K1 + K2
+// by substituting def's src0 (S) into the use. S keeps its region but is now
+// evaluated at the use's lane indices, so the fold only preserves values if
+// use lane k reads exactly the element that def lane k wrote.
+static bool preservesLaneMapping(G4_INST *def, G4_INST *use) {
+  // A uniform def src0 yields the same value in every lane, so it may be
+  // substituted no matter how use's lanes map onto def's lanes. This keeps the
+  // scalar-broadcast fold working, e.g.
+  //    add (1)  D<1>:d  S<0;1,0>:d  K1
+  //    add (16) U<1>:d  D<0;1,0>:d  K2
+  if (def->getSrc(0)->isScalarSrc())
+    return true;
+
+  // If use has a larger execSize than def (no need to consider the case that
+  // def has a larger execSize as it has been excluded by footprint check),
+  // substituting def's src0 region into use may create an illegal source region
+  // that HWConformity can't resolve or can only resolve by generating
+  // inefficient code.
+  // For example:
+  //   add (4)  v14<1>:ud  v6<4;2,4>:ud  0x73
+  //   add (16) v15<1>:ub  v14<1;4,0>:ud 0xf8a24a6b
+  // Folding would produce:
+  //   add (16) v15<1>:ub  v6<4;2,4>:ud  0xF8A24ADE
+  // <4;2,4>:ud is illegal for execSize=16 as it violates the HW restriction
+  // that elements within a width cannot cross register boundaries (row 7's
+  // width elements span two GRFs).
+  //
+  // For another example:
+  //   (W) add (2)  v5th<4>:uw    v4th<8;1,0>:d    0x34bdc424:d
+  //   add (32) v9th<4>:b     v5th<4;16,0>:uw  0xce61:w
+  // Folding would produce:
+  //   add (32) v9th<4>:b     v4th<8;1,0>:d    0x34bd9285:d
+  // <8;1,0> region at execSize 32 is illegal as it spans far more than 2 GRFs.
+  // HWConformity can't fix it as it needs to keep halving the exec size until
+  // it needs a SIMD4 emask that platforms without NibCtrl cannot encode.
+  if (def->getExecSize() != use->getExecSize())
+    return false;
+
+  // Matching execSizes still do not imply an identity mapping, so the per-lane
+  // walk is required. For example:
+  //   add (4) v14th<1>:ud  v6th<1;1,0>:ud  0x73
+  //   add (4) v15th<1>:ud  v14th<1;2,2>:ud  0x100:ud
+  // Folding would produce:
+  //   add (4) v9th<1>:ud  v4th<1;1,0>:ud  0x173:w
+  // lane      original reads       folded reads    result
+  //  0      v14th[0] → v6th[0]        v6th[0]      correct
+  //  1      v14th[2] → v6th[2]        v6th[1]      wrong
+  //  2      v14th[1] → v6th[1]        v6th[2]      wrong
+  //  3      v14th[3] → v6th[3]        v6th[3]      correct
+  G4_DstRegRegion *defDst = def->getDst();
+  G4_SrcRegRegion *useSrc = use->getSrc(0)->asSrcRegRegion();
+  if (defDst->isIndirect() || useSrc->isIndirect())
+    return false;
+
+  // Element indices are only comparable if both operands start at the same
+  // address. The caller's Rel_eq normally guarantees this, but not on the
+  // ARF path, which can report Rel_eq from the register kind alone.
+  if (defDst->getLeftBound() != useSrc->getLeftBound())
+    return false;
+
+  // Only <v;w,h> regions have a closed-form lane->element mapping; bail out on
+  // VxH/Vx1 and other special forms. These aren't limited to the indirect
+  // operands excluded above: RegionV/RegionWH are also used for direct
+  // Align16 operands (see G4_SrcRegRegion::getMaxExecSize(), which checks
+  // isRegionV() as a case separate from acc != Direct), so this check must
+  // stay independent of the isIndirect() check.
+  const RegionDesc *rd = useSrc->getRegion();
+  if (rd->vertStride == UNDEFINED_SHORT || rd->width == UNDEFINED_SHORT ||
+      rd->horzStride == UNDEFINED_SHORT)
+    return false;
+
+  // def's dst and use's src0 have the same type size (checked by the caller),
+  // so comparing element indices is equivalent to comparing byte offsets.
+  const uint16_t dstHS = defDst->getHorzStride();
+  for (uint16_t k = 0, e = use->getExecSize(); k < e; ++k) {
+    unsigned defElt = k * dstHS;
+    unsigned useElt =
+        (k / rd->width) * rd->vertStride + (k % rd->width) * rd->horzStride;
+    if (defElt != useElt)
+      return false;
+  }
+  return true;
 }
 
 //
@@ -2314,31 +2510,12 @@ void Optimizer::reassociateConst() {
           return false;
         }
 
-        // When use has a larger execSize than def, substituting def's src0
-        // region into use may create an illegal source region: a 2D source
-        // region valid for def's smaller execSize can access more rows under
-        // use's larger execSize and produce a region that violates the
-        // restriction "elements within a width cannot cross register
-        // boundaries". Skip reassociation if def's src0 is not single-stride
-        // when evaluated under use's execSize.
-        //
-        // Example (would be incorrectly folded without this guard):
-        //   add (4)  v14<1>:ud  v6<4;2,4>:ud  0x73      // def, execSize=4
-        //   add (16) v15<1>:ub  v14<1;4,0>:ud 0xf8a24a6b // use, execSize=16
-        // Folding would produce:
-        //   add (16) v15<1>:ub  v6<4;2,4>:ud  0xF8A24ADE
-        // <4;2,4>:ud is legal for execSize=4 but causes GRF boundary crossing
-        // for execSize=16 (row 7's width elements span two GRFs).
-        // If leaving this illegal region to be fixed by HWConformity, there
-        // will be more instructions generated which is very inefficient.
-        if (def->getExecSize() < use->getExecSize()) {
-          auto *srcToSub = def->getSrc(0);
-          if (srcToSub->isSrcRegRegion()) {
-            uint16_t stride;
-            if (!srcToSub->asSrcRegRegion()->getRegion()->isSingleStride(
-                    use->getExecSize().value, stride))
-              return false;
-          }
+        // The Rel_eq check above only proves that def's dst and use's src0
+        // cover the same byte footprint, not that use lane k reads what def
+        // lane k wrote. Substituting def's src0 is only value-preserving when
+        // that per-lane correspondence holds.
+        if (!preservesLaneMapping(def, use)) {
+          return false;
         }
 
         return true;
@@ -4215,8 +4392,21 @@ bool Optimizer::foldCmpSel(G4_BB *BB, G4_INST *selInst,
     // C = (+P) sel A, B  => C = sel.ne A, B
     //
     if (IsEqual(sel_src0, cmp_src0, builder) &&
-        IsEqual(sel_src1, cmp_src1, builder))
-      return true;
+        IsEqual(sel_src1, cmp_src1, builder)) {
+        // A sel with an (lt) or (ge) cond mod has special NaN handling: if
+        // exactly one source is NaN, the non-NaN source (which may be src0) is
+        // selected. In contrast, cmp performs an ordered compare (false when any
+        // operand is NaN), so cmp + predicated sel selects src1 when a NaN is
+        // present. The two therefore disagree for float operands that may be
+        // NaN, so don't fold cmp.lt/cmp.ge into sel in that case.
+        // (Other cond mods select src1 on NaN for both forms, so they are safe.)
+        G4_CondModifier mod = condMod->getMod();
+        if (!builder.getOption(vISA_finiteMathOnly) &&
+            IS_TYPE_FLOAT_ALL(cmp_src0->getType()) &&
+            (mod == Mod_l || mod == Mod_ge))
+            return false;
+        return true;
+    }
 
     // Sel operands are reversed.
     // P = cmp.gt A, B
@@ -9590,8 +9780,8 @@ void Optimizer::insertPageFaultWAforLSC(G4_BB *bb, INST_LIST_ITER it) {
     return;
   }
 
-  // Pure store: insert probe load + sync.allrd before the write to
-  // force address translation.
+  // Pure store: insert probe load + data-return wait before the write
+  // to force address translation.
   unsigned dataSrcLen = (unsigned)msgDesc->getSrc1LenRegs();
   if (dataSrcLen == 0)
     return;
@@ -9611,8 +9801,8 @@ void Optimizer::insertPageFaultWAforLSC(G4_BB *bb, INST_LIST_ITER it) {
       sfid, probeDescVal, probeExtDescVal, 0, SendAccess::READ_ONLY,
       const_cast<G4_Operand *>(msgDesc->getBti()), LdStAttrs::NONE);
 
-  // Probe destination: a fresh temporary; its value is never read,
-  // only the SBID completion (sync.allrd) matters.
+  // Probe destination: a fresh temporary; its loaded value is unused -
+  // the wait mov reads it only to create the data-return dependency.
   G4_Declare *probeDstDcl = builder.createTempVar(
       dataSrcLen * builder.getGRFSize() / TypeSize(Type_UD), Type_UD,
       builder.getGRFAlign());
@@ -9645,8 +9835,7 @@ void Optimizer::insertPageFaultWAforLSC(G4_BB *bb, INST_LIST_ITER it) {
     probeExDescOp = builder.duplicateOperand(writeExDescOp);
   }
 
-  // Propagate the write's predicate so the probe fires only when the
-  // write would execute (avoids spurious faults when pred is false).
+  // Predicate the probe like the write (no probe when it is masked off).
   G4_Predicate *writePred = sendInst->getPredicate();
   G4_Predicate *probePred =
       writePred ? builder.duplicateOperand(writePred) : nullptr;
@@ -9655,15 +9844,30 @@ void Optimizer::insertPageFaultWAforLSC(G4_BB *bb, INST_LIST_ITER it) {
       probePred, G4_sends, execSize, probeDst, probeAddrSrc,
       builder.createNullSrc(Type_UD), builder.createImm(probeDescVal, Type_UD),
       opts, probeDesc, probeExDescOp, false);
-  // Probe load and sync are generated on behalf of the store; give
-  // them the same VISA ID so debuggers map them to the same source.
+  // Give the probe the store's VISA ID so debuggers map it to the same
+  // source line.
   probeLoad->setVISAId(sendInst->getVISAId());
   bb->insertBefore(it, probeLoad);
 
-  G4_INST *syncInst =
-      builder.createSync(G4_sync_allrd, builder.createNullSrc(Type_UD));
-  syncInst->setVISAId(sendInst->getVISAId());
-  bb->insertBefore(it, syncInst);
+  insertPageFaultWAWait(bb, it, probeDstDcl, sendInst);
+}
+
+// Insert the data-return wait before the write at `it`: a dummy
+// "mov null, probeDst" whose RAW on probeDst makes SWSB emit a precise
+// {$probe.dst} wait (a null-dst mov survives DCE/removeRedundMov).  Record
+// the wait and write so the local scheduler bundles them adjacently.
+void Optimizer::insertPageFaultWAWait(G4_BB *bb, INST_LIST_ITER it,
+                                      G4_Declare *probeDstDcl,
+                                      G4_InstSend *sendInst) {
+  G4_SrcRegRegion *probeDstSrc =
+      builder.createSrcRegRegion(probeDstDcl, builder.getRegionScalar());
+  G4_INST *waitInst =
+      builder.createMov(g4::SIMD1, builder.createNullDst(Type_UD), probeDstSrc,
+                        InstOpt_WriteEnable, false);
+  waitInst->setVISAId(sendInst->getVISAId());
+  kernel.addPageFaultWAInst(waitInst);
+  bb->insertBefore(it, waitInst);
+  kernel.addPageFaultWAInst(sendInst);
 }
 
 void Optimizer::insertPageFaultWAforHDC(G4_BB *bb, INST_LIST_ITER it) {
@@ -9751,7 +9955,7 @@ void Optimizer::insertPageFaultWAforHDC(G4_BB *bb, INST_LIST_ITER it) {
   }
   // HDC non-atomic write: build a probe-load descriptor by converting
   // the write opcode to its read counterpart, then insert probe load
-  // + sync.allrd before the write.
+  // + data-return wait before the write.
   unsigned dataSrcLen = msgDesc->getWriteDataLenRegs();
   if (dataSrcLen == 0)
     return;
@@ -9838,8 +10042,8 @@ void Optimizer::insertPageFaultWAforHDC(G4_BB *bb, INST_LIST_ITER it) {
   //       (W) add (1) a0.0<1>:ud  r0.0<0;1,0>:ud  0x20a0000:ud
   //       (W) add (1) a0.0<1>:ud  a0.0<0;1,0>:ud  0xe0000:ud
   //       (W) sends.dc0 (4) TV5(0,0):ud M2(0,0) null 0xa:ud a0.0<0;1,0>:ud
-  //       sync_allrd (1) null:ud
   //       (W) add (1) a0.0<1>:ud  a0.0<0;1,0>:ud  0xfff20000:ud
+  //       (W) mov (1) null:ud  TV5(0,0)<0;1,0>:ud
   //       (W) sends.dc0 (4) null:ud M2(0,0) r1 0x4a:ud a0.0<0;1,0>:ud
   //
   //   (b) Regular BTI folded into an immediate descriptor:
@@ -9853,7 +10057,7 @@ void Optimizer::insertPageFaultWAforHDC(G4_BB *bb, INST_LIST_ITER it) {
   //       (W) sends.dc0 (4) null:ud M2(0,0) r0 0x4a:ud 0x20a0006:ud
   //       =>
   //       (W) sends.dc0 (4) TV12(0,0):ud M2(0,0) null 0xa:ud 0x2180006:ud
-  //       sync_allrd (1) null:ud
+  //       (W) mov (1) null:ud  TV12(0,0)<0;1,0>:ud
   //       (W) sends.dc0 (4) null:ud M2(0,0) r0 0x4a:ud 0x20a0006:ud
   //
   //   (c) T252/scratch ExBSO (PVC+ extended-descriptor format):
@@ -9871,7 +10075,7 @@ void Optimizer::insertPageFaultWAforHDC(G4_BB *bb, INST_LIST_ITER it) {
   //       (W) mov (1) ExDesc3(0,0)<1>:ud  %bss(0,0)<0;1,0>:ud
   //       (W) sends.dc0 (4) TV6(0,0):ud M3(0,0) null ExDesc3(0,0)<0;1,0>:ud
   //                         0x21800fc:ud
-  //       sync_allrd (1) null:ud
+  //       (W) mov (1) null:ud  TV6(0,0)<0;1,0>:ud
   //       (W) sends.dc0 (4) null:ud M3(0,0) r3 ExDesc3(0,0)<0;1,0>:ud
   //       0x20a00fc:ud
   const G4_Operand *origBti = msgDesc->getBti();
@@ -9918,12 +10122,12 @@ void Optimizer::insertPageFaultWAforHDC(G4_BB *bb, INST_LIST_ITER it) {
   // Instead, derive the probe descriptor by adding a delta:
   //   probe_a0 = a0.0 + delta,  delta = probeDescVal - writeDescVal
   //   => probe_a0 = BTI + writeDescVal + delta = BTI + probeDescVal ✓
-  // After sync.allrd restore a0.0 = probe_a0 - delta = BTI +
+  // After the wait, restore a0.0 = probe_a0 - delta = BTI +
   // writeDescVal so the original write send sees the correct
   // descriptor. ✓
   //
   // restoreDescInst is set here when a restore is needed and inserted
-  // after the sync below.
+  // after the wait below.
   G4_INST *restoreDescInst = nullptr;
 
   // Helper: insert "add a0.0, a0.0, imm" with the given immediate and
@@ -9941,8 +10145,7 @@ void Optimizer::insertPageFaultWAforHDC(G4_BB *bb, INST_LIST_ITER it) {
                                       builder.getRegionScalar());
   };
 
-  // Propagate the write's predicate so the probe fires only when the
-  // write would execute (avoids spurious faults when pred is false).
+  // Predicate the probe like the write (no probe when it is masked off).
   G4_Predicate *writePred = sendInst->getPredicate();
   G4_Predicate *probePred =
       writePred ? builder.duplicateOperand(writePred) : nullptr;
@@ -9960,7 +10163,7 @@ void Optimizer::insertPageFaultWAforHDC(G4_BB *bb, INST_LIST_ITER it) {
           false);
       probeLoad->setVISAId(sendInst->getVISAId());
       bb->insertBefore(it, probeLoad);
-      // Restore a0.0 to write descriptor after sync.
+      // Restore a0.0 to write descriptor after the wait.
       restoreDescInst = builder.createBinOp(
           G4_add, g4::SIMD1,
           builder.createDstRegRegion(builder.getBuiltinA0(), 1),
@@ -10023,24 +10226,20 @@ void Optimizer::insertPageFaultWAforHDC(G4_BB *bb, INST_LIST_ITER it) {
     bb->insertBefore(it, probeLoad);
   }
 
-  G4_INST *syncInst =
-      builder.createSync(G4_sync_allrd, builder.createNullSrc(Type_UD));
-  syncInst->setVISAId(sendInst->getVISAId());
-  bb->insertBefore(it, syncInst);
-
-  // Insert the a0 restore instruction (if needed) between sync and the
-  // original write so the write sees the correct descriptor value.
+  // Restore a0 to the write descriptor (if needed) BEFORE the wait mov, so
+  // the wait stays immediately before the store even when local scheduling
+  // is disabled (the restore only touches a0, which the wait does not).
   if (restoreDescInst) {
     restoreDescInst->setVISAId(sendInst->getVISAId());
     bb->insertBefore(it, restoreDescInst);
   }
+
+  insertPageFaultWAWait(bb, it, probeDstDcl, sendInst);
 }
 
 void Optimizer::insertPageFaultWA() {
   if (!(builder.needBarrierWA() &&
         (builder.getPlatform() == Xe_PVC || builder.getPlatform() == Xe_PVCXT)))
-    return;
-  if (!kernel.fg.builder->getIsKernel())
     return;
 
   for (auto bb : kernel.fg) {

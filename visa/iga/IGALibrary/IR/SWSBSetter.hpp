@@ -54,10 +54,12 @@ public:
   // Blocks have already been created
   SWSBAnalyzer(Kernel &k, ErrorHandler &errHandler,
                SWSB_ENCODE_MODE encode_mode, int sbid_count,
-               bool enableSBIDCounterAutoSet = false)
+               bool enableSBIDCounterAutoSet = false,
+               bool preserveInsts = false)
       : m_kernel(k), m_errorHandler(errHandler), m_SBIDRRCounter(0),
         m_initPoint(false),
         m_enableSBIDCounter(enableSBIDCounterAutoSet),
+        m_preserveInsts(preserveInsts),
         MAX_VALID_DISTANCE(k.getModel().getSWSBMaxValidDistance()) {
     // Set SWSB_ENCODE_MODE
     if (encode_mode != SWSB_ENCODE_MODE::SWSBInvalidMode)
@@ -204,6 +206,15 @@ private:
     return false;
   }
 
+  // Per HSD-16031253986/BSpec, a fence's src0 registers can't be reused
+  // before its src dependency clears, on platforms selecting this encode
+  // mode. IGA has no dedicated Platform enum value for those platforms
+  // (they share XE3P_XPC with other 3pv2+ platforms), so this checks the
+  // encode mode instead.
+  bool needsFenceSrcSync() const {
+    return false;
+  }
+
   /// ------------ HW Workaround Information ------------ ///
   // MathWAInfo: For a math instruction, when the following instruction has
   // different predication to the math, should assume the math taking the entire
@@ -274,6 +285,9 @@ private:
   const int MAX_VALID_DISTANCE;
 
   bool m_enableSBIDCounter = false;
+
+  // Set from EncoderOpts::autoDepPreserveInsts
+  bool m_preserveInsts = false;
 };
 } // namespace iga
 #endif

@@ -12,9 +12,14 @@ SPDX-License-Identifier: MIT
 #include <llvm/IR/Instructions.h>
 #include <llvm/Pass.h>
 #include "common/LLVMWarningsPop.hpp"
+#include "common/igc_regkeys.hpp"
 
 #include <vector>
 #include <memory>
+
+namespace llvm {
+class PredicatedLoadIntrinsic;
+}
 
 namespace IGC {
 enum StatusPrivArr2Reg {
@@ -49,6 +54,7 @@ struct SOALayoutInfo {
   bool allUsesAreVector;
   // Partition size for new algorithm
   uint32_t SOAPartitionBytes;
+  bool useNewAlgoTranspose = false;
 
   SOALayoutInfo() : canUseSOALayout(false), baseType(nullptr), allUsesAreVector(false), SOAPartitionBytes(4) {}
   SOALayoutInfo(bool canUseSOALayout, llvm::Type *baseType, bool allUsesAreVector, uint32_t Size)
@@ -86,7 +92,23 @@ public:
 
   // for new algo
   bool useNewAlgo(llvm::Type *baseTy) const {
-    return (newAlgoControl > 1 || (newAlgoControl == 1 && baseTy->isStructTy()));
+    if (newAlgoControl > 1)
+      return true;
+    if (newAlgoControl == 1) {
+      if (baseTy->isStructTy())
+        return true;
+      // Scalar float/int arrays (non-vector base type): enable SoA via
+      // TransposePrivMem on the stateless OCL private-memory path so that
+      // e.g. In some workloads float stack[255] gets element-stride SoA instead of
+      // per-lane AoS scratch.  Vector base types (e.g. <4 x float>) are
+      // handled by the existing struct/vector legacy path to preserve the
+      // partition-level granularity that those tests expect.
+      if (IGC_IS_FLAG_ENABLED(EnablePrivMemNewSOAForScalarArrays) && !baseTy->isVectorTy()) {
+        llvm::Type *scalarTy = baseTy->getScalarType();
+        return scalarTy->isFloatingPointTy() || scalarTy->isIntegerTy();
+      }
+    }
+    return false;
   }
 
 private:
@@ -108,7 +130,7 @@ private:
   //   the new algo : array of DW{xn], array of QW[xn],
   //                  array of structs.
   //    0 : disable new algorithm
-  //    1 : enable new algorithm for array of simple struct
+  //    1 : enable new algo for structs and scalar (float/int) arrays
   //    2 : enable new algorithm for array of simple struct
   //        array of dw[xn], array of qw[xn]
   //        (not splitting vector, intend to replace the old algo)
@@ -135,17 +157,23 @@ private:
   bool visitInstruction(llvm::Instruction &I) { return false; }
 
   bool visitBitCastInst(llvm::BitCastInst &);
+  bool visitAddrSpaceCastInst(llvm::AddrSpaceCastInst &);
   bool visitGetElementPtrInst(llvm::GetElementPtrInst &);
   bool visitIntrinsicInst(llvm::IntrinsicInst &);
+  bool visitCallInst(llvm::CallInst &);
   bool visitLoadInst(llvm::LoadInst &);
   bool MismatchDetected(llvm::Instruction &LI);
   bool visitStoreInst(llvm::StoreInst &);
+
+  /// Divisor handleGEPInst will apply to a byte-offset ("ptradd") GEP's offset.
+  /// 0 until a base type has been determined.
+  uint64_t getByteGEPIndexUnit() const;
 };
 
 class TransposeHelper {
 public:
   TransposeHelper(const llvm::DataLayout &DL, bool vectorIndex)
-      : m_vectorIndex(vectorIndex), m_DL(DL), m_promotedLaneBytes(0) {}
+      : m_vectorIndex(vectorIndex), m_DL(DL), m_promotedLaneBytes(0), m_idxUnitBytes(0) {}
   void HandleAllocaSources(llvm::Instruction *v, llvm::Value *idx);
   void handleGEPInst(llvm::GetElementPtrInst *pGEP, llvm::Value *idx);
   // Temporary, this is to replace HandleGEPInst
@@ -153,6 +181,7 @@ public:
   virtual void handleLoadInst(llvm::LoadInst *pLoad, llvm::Value *pScalarizedIdx) = 0;
   virtual void handleStoreInst(llvm::StoreInst *pStore, llvm::Value *pScalarizedIdx) = 0;
   virtual void handleLifetimeMark(llvm::IntrinsicInst *inst) = 0;
+  virtual void handlePredicatedLoadInst(llvm::PredicatedLoadIntrinsic *pPredLoad, llvm::Value *pScalarizedIdx);
   // For select handleGEPinstNew
   virtual bool useNewAlgo() { return false; }
   void EraseDeadCode();
@@ -164,6 +193,10 @@ protected:
   // Used to correctly scale indices when a use reinterprets memory as a vector
   // of smaller element size (e.g. <8 x i32> over double lanes).
   uint32_t m_promotedLaneBytes;
+  // Size of one unit of the scalarized index. Sub-classes, which uses
+  // different stride for GEP indexing, must set this in their constructor.
+  // e.g. TransposeHelperPrivateMem strides by simdSize * sizeof(SOAInfo::baseType)
+  uint32_t m_idxUnitBytes;
 
 private:
   bool m_vectorIndex;

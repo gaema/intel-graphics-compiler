@@ -330,6 +330,8 @@ public:
   void moveDeps(Node *fromNode, Node *toNode);
   void pairTypedWriteOrURBWriteNodes(G4_BB *bb);
   void pair2xDpasNodes();
+  // Bundle each page-fault WA wait (mov) with its write into one node.
+  void bundlePageFaultWANodes();
   bool hasMultipleDpasNodes() const { return NumDpasNodes > 1; }
 
   bool hasReadSuppression(G4_INST *curInst, G4_INST *nextInst, BitSet &liveDst,
@@ -363,8 +365,8 @@ public:
                                     std::vector<BucketDescr> &BDvec);
   void getBucketDescrs(Node *inst, std::vector<BucketDescr> &bucketDescrs);
 
-  uint32_t getEdgeLatency_old(Node *node, DepType depT) const;
-  uint32_t getEdgeLatency(Node *node, DepType depT) const;
+  uint32_t getEdgeLatency_old(Node *node, Node *succNode, DepType depT) const;
+  uint32_t getEdgeLatency(Node *node, Node *succNode, DepType depT) const;
   Mem_Manager *get_mem() { return &DDDMem; }
   IR_Builder *getBuilder() const { return kernel->fg.builder; }
   const Options *getOptions() const { return kernel->getOptions(); }

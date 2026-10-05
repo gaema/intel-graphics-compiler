@@ -146,12 +146,12 @@ void Legalization::unifyReturnInsts(llvm::Function &F) {
       PN->addIncoming(BB->getTerminator()->getOperand(0), BB);
 
     IGCLLVM::popBackInstruction(BB); // Remove the return inst.
-    BranchInst::Create(NewRetBlock, BB);
+    IGCLLVM::UncondBrInst::Create(NewRetBlock, BB);
   }
 }
 
 void Legalization::visitInstruction(llvm::Instruction &I) {
-  if (!llvm::isa<llvm::DbgInfoIntrinsic>(&I))
+  if (!isDebugInst(&I))
     m_ctx->m_instrTypes.numInsts++;
 
   BasicBlock *dBB = I.getParent();
@@ -286,7 +286,7 @@ void Legalization::visitBinaryOperator(llvm::BinaryOperator &I) {
       // check all uses are select or branch
       bool flippable = true;
       for (auto U = I.user_begin(), E = I.user_end(); U != E; ++U) {
-        if (!isa<SelectInst>(*U) && !isa<BranchInst>(*U)) {
+        if (!isa<SelectInst, IGCLLVM::CondBrInst, IGCLLVM::UncondBrInst>(*U)) {
           flippable = false;
           break;
         }
@@ -319,10 +319,11 @@ void Legalization::visitBinaryOperator(llvm::BinaryOperator &I) {
             s->setOperand(1, falseValue);
             s->setOperand(2, trueValue);
             s->setOperand(0, invert);
-          } else if (BranchInst *br = dyn_cast<BranchInst>(U)) {
-            IGC_ASSERT(br->isConditional());
+          } else if (IGCLLVM::CondBrInst *br = dyn_cast<IGCLLVM::CondBrInst>(U)) {
             br->swapSuccessors();
             br->setCondition(invert);
+          } else if (dyn_cast<IGCLLVM::UncondBrInst>(U)) {
+            IGC_ASSERT(0);
           }
         }
         IGC_ASSERT(I.user_empty() && "Instruction should have no remaining uses after transformation");
@@ -693,6 +694,54 @@ static bool LegalizeGVNBitCastPattern(IRBuilder<> *Builder, const DataLayout *DL
   }
 
   return true;
+}
+
+// InstCombine can fold a trunc-to-i1 of an extracted element into a bitcast to
+// a bool vector followed by an extractelement:
+//   %bc = bitcast <8 x i32> %v to <256 x i1>
+//   %b  = extractelement <256 x i1> %bc, i64 65
+// IGC represents i1 as a HW flag and cannot alias a wide vector as a i1 vector.
+// Rewrite each constant-index extractelement back into:
+//   %extract = extractelement <8 x i32> %v, i32 2
+//   %shift   = lshr i32 %extract, 1 ; optional, here index is 65 and not divisible by 32
+//   %and     = and i32 %shift, 1
+//   %trunc   = trunc i32 %and to i1
+void Legalization::visitExtractElementInst(ExtractElementInst &I) {
+  auto *BC = dyn_cast<BitCastInst>(I.getVectorOperand());
+  ConstantInt *CIdx = dyn_cast<ConstantInt>(I.getIndexOperand());
+  if (!BC || !CIdx || !I.getType()->isIntegerTy(1))
+    return;
+
+  auto *SrcVecTy = dyn_cast<IGCLLVM::FixedVectorType>(BC->getSrcTy());
+  Type *SrcEltTy = SrcVecTy ? SrcVecTy->getElementType() : nullptr;
+  if (!SrcEltTy || !(SrcEltTy->isIntegerTy() || SrcEltTy->isFloatingPointTy()))
+    return;
+
+  unsigned SrcEltBits = (unsigned)SrcEltTy->getPrimitiveSizeInBits();
+  IntegerType *SrcEltIntTy = Type::getIntNTy(I.getContext(), SrcEltBits);
+  uint64_t bitIdx = CIdx->getZExtValue();
+  unsigned srcIdx = (unsigned)(bitIdx / SrcEltBits);
+  unsigned bitPos = (unsigned)(bitIdx % SrcEltBits);
+
+  m_builder->SetInsertPoint(&I);
+  Value *elt = m_builder->CreateExtractElement(BC->getOperand(0), m_builder->getInt32(srcIdx));
+  if (elt->getType() != SrcEltIntTy)
+    elt = m_builder->CreateBitCast(elt, SrcEltIntTy);
+  if (bitPos)
+    elt = m_builder->CreateLShr(elt, ConstantInt::get(SrcEltIntTy, bitPos));
+  // Codegen lowers trunc-to-i1 as "!= 0", testing every bit, so isolate the
+  // wanted bit first; otherwise higher bits of the element leak into the flag.
+  elt = m_builder->CreateAnd(elt, ConstantInt::get(SrcEltIntTy, 1));
+  Value *bit = m_builder->CreateTrunc(elt, I.getType());
+  I.replaceAllUsesWith(bit);
+  m_instructionsToRemove.insert(&I);
+
+  // Drop only once all its extractelement users are scheduled for removal.
+  if (llvm::all_of(BC->users(), [&](User *U) {
+        auto *Inst = dyn_cast<Instruction>(U);
+        return Inst && m_instructionsToRemove.count(Inst);
+      }))
+    m_instructionsToRemove.insert(BC);
 }
 
 void Legalization::visitBitCastInst(llvm::BitCastInst &I) {
@@ -1067,10 +1116,11 @@ void Legalization::visitFCmpInstUndorderedPredicate(FCmpInst &FC) {
         } else {
           break;
         }
-      } else if (BranchInst *br = dyn_cast<BranchInst>(*I)) {
-        IGC_ASSERT(br->isConditional());
+      } else if (IGCLLVM::CondBrInst *br = dyn_cast<IGCLLVM::CondBrInst>(*I)) {
         br->swapSuccessors();
         br->setCondition(invertedOrderedInst);
+      } else if (dyn_cast<IGCLLVM::UncondBrInst>(*I)) {
+        IGC_ASSERT(0);
       } else {
         break;
       }
@@ -1336,6 +1386,7 @@ void Legalization::PromoteInsertElement(Value *I, Value *newVec) {
                                                                             "", IGCLLVM::insertPosition(EEinst));
         pSrc1ZExt->setDebugLoc(EEinst->getDebugLoc());
         I->replaceAllUsesWith(pSrc1ZExt);
+        PromoteTruncToI1(*cast<TruncInst>(pSrc1ZExt));
       }
     }
   }
@@ -1660,9 +1711,9 @@ void Legalization::visitIntrinsicInst(llvm::IntrinsicInst &I) {
     Type *ScalarType = OpType->getScalarType();
     int BitWidth = ScalarType->getIntegerBitWidth();
 
-    auto OverFlowIntrin =
-        Builder.CreateIntrinsic(OverflowIntrinID, {I.getArgOperand(0)->getType(), I.getArgOperand(1)->getType()},
-                                {I.getArgOperand(0), I.getArgOperand(1)});
+    auto *OverFlowIntrin = Builder.CreateIntrinsicWithoutFolding(
+        OverflowIntrinID, {I.getArgOperand(0)->getType(), I.getArgOperand(1)->getType()},
+        {I.getArgOperand(0), I.getArgOperand(1)});
     Value *Result = Builder.CreateExtractValue(OverFlowIntrin, (uint64_t)0);
     Value *Overflow = Builder.CreateExtractValue(OverFlowIntrin, (uint64_t)1);
 
@@ -1875,6 +1926,27 @@ void Legalization::visitIntrinsicInst(llvm::IntrinsicInst &I) {
   case Intrinsic::assume:
     m_instructionsToRemove.insert(&I);
     break;
+  case Intrinsic::minnum:
+  case Intrinsic::maxnum: {
+    // bfloat has no native min/max ALU op ("BF opnd is not allowed on this
+    // instruction"), so promote to FP32 and demote back. half min/max is
+    // supported natively and is left unchanged. InstCombine can narrow an
+    // fptrunc(minnum.f32(fpext, fpext)) idiom into a bfloat minnum, which
+    // this undoes before emit.
+    if (IGCLLVM::isBFloatTy(I.getType()->getScalarType())) {
+      Type *promotedTy = Builder.getFloatTy();
+      if (auto *vecTy = dyn_cast<IGCLLVM::FixedVectorType>(I.getType())) {
+        promotedTy = IGCLLVM::FixedVectorType::get(promotedTy, (unsigned)vecTy->getNumElements());
+      }
+      Value *arg0 = Builder.CreateFPExt(I.getOperand(0), promotedTy);
+      Value *arg1 = Builder.CreateFPExt(I.getOperand(1), promotedTy);
+      Value *Callee = IGCLLVM::getOrInsertDeclaration(I.getParent()->getParent()->getParent(), intrinsicID, promotedTy);
+      Value *Val = Builder.CreateCall(Callee, {arg0, arg1});
+      Val = Builder.CreateFPTrunc(Val, I.getType());
+      I.replaceAllUsesWith(Val);
+      I.eraseFromParent();
+    }
+  } break;
   case Intrinsic::floor:
   case Intrinsic::ceil:
   case Intrinsic::trunc: {
@@ -1938,7 +2010,8 @@ void Legalization::visitIntrinsicInst(llvm::IntrinsicInst &I) {
       Value *const src0Int = Builder.CreateBitCast(src0, Builder.getIntNTy(srcTypeSize));
       Value *const src1Int = Builder.CreateBitCast(src1, Builder.getIntNTy(srcTypeSize));
 
-      Value *const src0NoSign = Builder.CreateAnd(src0Int, Builder.getIntN(srcTypeSize, ~signMask));
+      Value *const src0NoSign =
+          Builder.CreateAnd(src0Int, Builder.getIntN(srcTypeSize, ~signMask & llvm::maxUIntN(srcTypeSize)));
       Value *const src1Sign = Builder.CreateAnd(src1Int, Builder.getIntN(srcTypeSize, signMask));
 
       Value *newValue = static_cast<Value *>(Builder.CreateOr(src0NoSign, src1Sign));
@@ -2140,7 +2213,28 @@ void Legalization::PromoteFp16ToFp32OnGenSampleCall(llvm::CallInst &I) {
   llvm::ReplaceInstWithInst(&I, I0);
 }
 
+void Legalization::PromoteTruncToI1(llvm::TruncInst &I) {
+  IGC_ASSERT(I.getDestTy()->isIntegerTy(1));
+  Value *Src = I.getOperand(0);
+  if (Src->getType()->isIntegerTy() && Src->getType()->getIntegerBitWidth() > 1) {
+    m_builder->SetInsertPoint(&I);
+    Value *Masked = m_builder->CreateAnd(Src, ConstantInt::get(Src->getType(), 1));
+    Value *Cmp = m_builder->CreateICmpNE(Masked, ConstantInt::get(Src->getType(), 0));
+    I.replaceAllUsesWith(Cmp);
+    m_instructionsToRemove.insert(&I);
+  }
+  return;
+}
+
 void Legalization::visitTruncInst(llvm::TruncInst &I) {
+  // A (trunc iN X to i1) selects bit 0 of X. IGC lowers an i1 predicate as
+  // "X != 0", which only matches bit 0 for a canonical boolean; for an arbitrary
+  // integer a bare trunc-to-i1 miscompiles.
+  if (I.getDestTy()->isIntegerTy(1)) {
+    PromoteTruncToI1(I);
+    return;
+  }
+
   // Legalize
   //
   //  (trunc (bitcast <3 x i16> to i48) i32)

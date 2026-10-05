@@ -50,6 +50,16 @@ def IGFX_XE3P_CORE      : CoreFamily<"IGFX_XE3P_CORE">;
 // Define Platform Groups for common use cases
 def CUSTOM_GROUP : PlatformGroup<[IGFX_DG2, IGFX_PVC]>;
 
+// Platforms with FP64 HW support. Mirrors Platform::hasNoFP64Inst().
+def AllPlatformsWithFP64Support : AllOf<[Not<ExactPlatform<IGFX_TIGERLAKE_LP>>,
+                                         Not<ExactPlatform<IGFX_DG1>>,
+                                         Not<ExactPlatform<IGFX_ROCKETLAKE>>,
+                                         Not<ExactPlatform<IGFX_ALDERLAKE_S>>,
+                                         Not<ExactPlatform<IGFX_ALDERLAKE_P>>,
+                                         Not<ExactPlatform<IGFX_ALDERLAKE_N>>,
+                                         Not<ExactPlatform<IGFX_XE_HP_SDV>>,
+                                         Not<ExactPlatform<IGFX_DG2>>]>;
+
 // NOTE: The list of extensions below is INCOMPLETE and will be expanded
 // incrementally in future commits. Current entries may have provisional or
 // incorrect PlatformSupport assignments; they are included now to demonstrate
@@ -61,6 +71,16 @@ def SPV_EXT_optnone : Extension<
   "SPV_EXT_optnone",
   [ Capability<"OptNoneEXT"> ],
   "https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_optnone.html"
+>;
+
+// Relaxes the address space of the printf format string. Format strings that
+// resolve to a compile-time global use the existing relocation path; others are
+// emitted inline into the printf buffer at runtime. No new capability.
+// Experimental: accepted by the SPIR-V reader but not advertised.
+def SPV_EXT_relaxed_printf_string_address_space : ExperimentalExtension<
+  "SPV_EXT_relaxed_printf_string_address_space",
+  [],
+  "https://github.com/KhronosGroup/SPIRV-Registry/blob/main/extensions/EXT/SPV_EXT_relaxed_printf_string_address_space.asciidoc"
 >;
 
 // SPV_INTEL_optnone is an old name for the same extension as SPV_EXT_optnone.
@@ -79,7 +99,7 @@ def SPV_INTEL_cache_controls : Extension<
   "https://github.com/KhronosGroup/SPIRV-Registry/blob/main/extensions/INTEL/SPV_INTEL_cache_controls.asciidoc"
 >;
 
-def SPV_INTEL_fp_fast_math_mode : ExperimentalExtension<
+def SPV_INTEL_fp_fast_math_mode : Extension<
   "SPV_INTEL_fp_fast_math_mode",
   [ Capability<"FPFastMathModeINTEL"> ],
   "https://github.khronos.org/SPIRV-Registry/extensions/INTEL/SPV_INTEL_fp_fast_math_mode.html"
@@ -116,7 +136,7 @@ def SPV_INTEL_global_variable_decorations : ExperimentalExtension<
   "https://github.khronos.org/SPIRV-Registry/extensions/INTEL/SPV_INTEL_global_variable_host_access.html"
 >;
 
-def SPV_INTEL_inline_assembly : ExperimentalExtension<
+def SPV_INTEL_inline_assembly : Extension<
   "SPV_INTEL_inline_assembly",
   [ Capability<"AsmINTEL"> ],
   "https://github.com/intel/llvm/blob/sycl/sycl/doc/design/spirv-extensions/SPV_INTEL_inline_assembly.asciidoc"
@@ -193,10 +213,10 @@ def SPV_INTEL_unstructured_loop_controls : Extension<
 
 def SPV_KHR_integer_dot_product : Extension<
   "SPV_KHR_integer_dot_product",
-  [ Capability<"DotProductKHR", AllPlatformSupport>,
+  [ Capability<"DotProductKHR", Not<ExactPlatform<IGFX_ALDERLAKE_N>>>,
     Capability<"DotProductInputAllKHR", NotSupported>,
-    Capability<"DotProductInput4x8BitKHR", AllPlatformSupport>,
-    Capability<"DotProductInput4x8BitPackedKHR", AllPlatformSupport> ],
+    Capability<"DotProductInput4x8BitKHR", Not<ExactPlatform<IGFX_ALDERLAKE_N>>>,
+    Capability<"DotProductInput4x8BitPackedKHR", Not<ExactPlatform<IGFX_ALDERLAKE_N>>> ],
   "https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_integer_dot_product.html",
   InheritFromCapabilities
 >;
@@ -225,10 +245,10 @@ def SPV_INTEL_memory_access_aliasing : ExperimentalExtension<
   "https://github.com/intel/llvm/pull/3426/files"
 >;
 
-def SPV_INTEL_predicated_io : ExperimentalExtension<
+def SPV_INTEL_predicated_io : Extension<
   "SPV_INTEL_predicated_io",
   [ Capability<"PredicatedIOINTEL"> ],
-  "https://github.com/intel/llvm/blob/sycl/sycl/doc/design/spirv-extensions/SPV_INTEL_predicated_io.asciidoc"
+  "https://github.khronos.org/SPIRV-Registry/extensions/INTEL/SPV_INTEL_predicated_io.html"
 >;
 
 // Some SPIR-V producers may emit arbitrary precision integer types, often as a result of LLVM optimizations in frontends.
@@ -244,7 +264,7 @@ def SPV_INTEL_arbitrary_precision_integers : ExperimentalExtension<
 
 // This extension is supported to allow SPIR-V modules containing non-semantic debug info to be compiled successfully.
 // (https://github.khronos.org/SPIRV-Registry/nonsemantic/NonSemantic.Shader.DebugInfo.100.html)
-def SPV_KHR_non_semantic_info : ExperimentalExtension<
+def SPV_KHR_non_semantic_info : Extension<
   "SPV_KHR_non_semantic_info",
   [],
   "https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_non_semantic_info.html"
@@ -261,11 +281,27 @@ def SPV_INTEL_vector_compute : ExperimentalExtension<
   "https://github.com/intel/llvm/pull/1612"
 >;
 
+// Ultimately meant to replace SPV_INTEL_vector_compute (above), which should never be
+// supported on the scalar compilation path.
+def SPV_EXT_long_vector : ExperimentalExtension<
+  "SPV_EXT_long_vector",
+  [ Capability<"LongVectorEXT"> ],
+  "https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_long_vector.html"
+>;
+
 // This extension adds a new instruction that enables rotating values across invocations within a subgroup.
-def SPV_KHR_subgroup_rotate : ExperimentalExtension<
+def SPV_KHR_subgroup_rotate : Extension<
   "SPV_KHR_subgroup_rotate",
   [ Capability<"GroupNonUniformRotateKHR"> ],
   "https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_subgroup_rotate.html"
+>;
+
+// Platforms without native bfloat16 conversion HW (pre-XE_HPG cores and
+// METEORLAKE) emulate the conversions in the BiF.
+def SPV_INTEL_bfloat16_conversion : Extension<
+  "SPV_INTEL_bfloat16_conversion",
+  [ Capability<"BFloat16ConversionINTEL"> ],
+  "https://github.khronos.org/SPIRV-Registry/extensions/INTEL/SPV_INTEL_bfloat16_conversion.html"
 >;
 
 // ---------------------------------------------
@@ -285,7 +321,7 @@ def SPV_INTEL_media_block_io : Extension<
   "SPV_INTEL_media_block_io",
   [ Capability<"SubgroupImageMediaBlockIOINTEL"> ],
   "https://github.khronos.org/SPIRV-Registry/extensions/INTEL/SPV_INTEL_media_block_io.html",
-  AnyOf<[ExactCoreFamily<IGFX_GEN12LP_CORE>, ExactCoreFamily<IGFX_XE_HPG_CORE>]>
+  Not<isCoreChildOf<IGFX_XE_HPC_CORE>>
 >;
 
 def SPV_INTEL_kernel_attributes : ExperimentalExtension<
@@ -307,7 +343,7 @@ def SPV_INTEL_tensor_float32_conversion : Extension<
 def SPV_EXT_shader_atomic_float_add : Extension<
   "SPV_EXT_shader_atomic_float_add",
   [ Capability<"AtomicFloat32AddEXT", AllPlatformSupport>,
-    Capability<"AtomicFloat64AddEXT", isProductChildOf<IGFX_METEORLAKE>> ],
+    Capability<"AtomicFloat64AddEXT", AllPlatformsWithFP64Support> ],
   "https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_shader_atomic_float_add.html",
   InheritFromCapabilities
 >;
@@ -379,36 +415,44 @@ def SPV_EXT_shader_atomic_float16_add : Extension<
 
 def SPV_EXT_shader_atomic_float_min_max : Extension<
   "SPV_EXT_shader_atomic_float_min_max",
-  [ Capability<"AtomicFloat16MinMaxEXT", isCoreChildOf<IGFX_XE3P_CORE>>,
+  [ Capability<"AtomicFloat16MinMaxEXT", AllPlatformSupport>,
     Capability<"AtomicFloat32MinMaxEXT", AllPlatformSupport>,
-    Capability<"AtomicFloat64MinMaxEXT", isProductChildOf<IGFX_METEORLAKE>> ],
+    Capability<"AtomicFloat64MinMaxEXT", AllPlatformsWithFP64Support> ],
   "https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_shader_atomic_float_min_max.html",
   InheritFromCapabilities
 >;
 
-def SPV_INTEL_bfloat16_arithmetic : Extension<
-  "SPV_INTEL_bfloat16_arithmetic",
-  [ CapabilityWithManualId<"BFloat16ArithmeticINTEL", 6226> ],
-  "https://github.com/intel/llvm/blob/sycl/sycl/doc/design/spirv-extensions/SPV_INTEL_bfloat16_arithmetic.asciidoc",
-  isCoreChildOf<IGFX_XE3P_CORE>
->;
-
+// NOTE: SPV_INTEL_bfloat16_arithmetic will be generalized into
+// SPV_EXT_bfloat16_arithmetic. Until that transition is complete, we retain
+// SPV_INTEL_bfloat16_arithmetic as an experimental extension to preserve
+// compatibility with SPIR-V producers that still emit it; it is not
+// advertised in the list of supported extensions.
+//
+// TODO: Uncomment the SPV_EXT_bfloat16_arithmetic definition below once
+// support for it is integrated into the SPIR-V LLVM Translator.
 def SPV_INTEL_bfloat16_arithmetic_experimental : ExperimentalExtension<
   "SPV_INTEL_bfloat16_arithmetic",
   [ CapabilityWithManualId<"BFloat16ArithmeticINTEL", 6226> ],
   "https://github.com/intel/llvm/blob/sycl/sycl/doc/design/spirv-extensions/SPV_INTEL_bfloat16_arithmetic.asciidoc",
-  // XE3P platforms are officially supported via the Extension definition above. This ExperimentalExtension covers
-  // older platforms (XE_HPG_CORE and newer, excluding METEORLAKE) to maintain compatibility with existing LIT tests
-  // for PVC and DG2. We may consider promoting those platforms to full support in the future.
   AllOf<[isCoreChildOf<IGFX_XE_HPG_CORE>, Not<ExactPlatform<IGFX_METEORLAKE>>]>
 >;
 
-def SPV_INTEL_bfloat16_conversion : Extension<
-  "SPV_INTEL_bfloat16_conversion",
-  [ Capability<"BFloat16ConversionINTEL"> ],
-  "https://github.khronos.org/SPIRV-Registry/extensions/INTEL/SPV_INTEL_bfloat16_conversion.html",
-  AllOf<[isCoreChildOf<IGFX_XE_HPG_CORE>, Not<ExactPlatform<IGFX_METEORLAKE>>]>
->;
+// def SPV_EXT_bfloat16_arithmetic : Extension<
+//   "SPV_EXT_bfloat16_arithmetic",
+//   [ CapabilityWithManualId<"BFloat16ArithmeticEXT", 6226> ],
+//   "https://github.com/KhronosGroup/SPIRV-Registry/pull/444",
+//   isCoreChildOf<IGFX_XE3P_CORE>
+// >;
+//
+// def SPV_EXT_bfloat16_arithmetic_experimental : ExperimentalExtension<
+//   "SPV_EXT_bfloat16_arithmetic",
+//   [ CapabilityWithManualId<"BFloat16ArithmeticEXT", 6226> ],
+//   "https://github.com/KhronosGroup/SPIRV-Registry/pull/444",
+//   // XE3P platforms are officially supported via the Extension definition above. This ExperimentalExtension covers
+//   // older platforms (XE_HPG_CORE and newer, excluding METEORLAKE) to maintain compatibility with existing LIT tests
+//   // for PVC and DG2. We may consider promoting those platforms to full support in the future.
+//   AllOf<[isCoreChildOf<IGFX_XE_HPG_CORE>, Not<ExactPlatform<IGFX_METEORLAKE>>]>
+// >;
 
 def SPV_INTEL_int4 : ExperimentalExtension<
   "SPV_INTEL_int4",
@@ -420,8 +464,9 @@ def SPV_INTEL_int4 : ExperimentalExtension<
 
 def SPV_INTEL_fp_conversions : ExperimentalExtension<
   "SPV_INTEL_fp_conversions",
-  [ Capability<"FloatConversionsINTEL"> ],
-  "https://github.com/intel/llvm/pull/20467",
+  [ Capability<"FloatConversionsFtoFINTEL">,
+    Capability<"FloatConversionsFtoSINTEL"> ],
+  "https://github.com/intel/llvm/blob/sycl/sycl/doc/design/spirv-extensions/SPV_INTEL_fp_conversions.asciidoc",
   isCoreChildOf<IGFX_XE3P_CORE>
 >;
 
@@ -429,7 +474,7 @@ def SPV_INTEL_float4 : ExperimentalExtension<
   "SPV_INTEL_float4",
   [ Capability<"Float4TypeINTEL">,
     Capability<"Float4CooperativeMatrixINTEL"> ],
-  "https://github.com/intel/llvm/pull/20467",
+  "https://github.com/intel/llvm/blob/sycl/sycl/doc/design/spirv-extensions/SPV_INTEL_float4.asciidoc",
   isCoreChildOf<IGFX_XE3P_CORE>
 >;
 
@@ -444,19 +489,21 @@ def SPV_INTEL_16bit_atomics : Extension<
   InheritFromCapabilities
 >;
 
-// Pure support only for isCoreChildOf<IGFX_XE3P_CORE>>, other platforms have partial native support which requires emulation
-def SPV_KHR_bfloat16 : ExperimentalExtension<
+def SPV_KHR_bfloat16 : Extension<
   "SPV_KHR_bfloat16",
-  [ Capability<"BFloat16TypeKHR">,
-    Capability<"BFloat16DotProductKHR">,
-    Capability<"BFloat16CooperativeMatrixKHR"> ],
+  [ Capability<"BFloat16TypeKHR",       isCoreChildOf<IGFX_XE3P_CORE>>,
+    Capability<"BFloat16DotProductKHR", isCoreChildOf<IGFX_XE3P_CORE>> ],
   "https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_bfloat16.html",
-  // isCoreChildOf<IGFX_XE3P_CORE>
-  // This extension has been mainly implemented for XE3P, but there are existing LIT tests for some functionality from
-  // this extension for PVC and DG2. We may consider supporting those platforms fully in the future. Since the support
-  // for this extension is still experimental, we define support for broader set of platforms for now to avoid fails
-  // on existing PVC and DG2 tests.
-  AllOf<[isCoreChildOf<IGFX_XE_HPG_CORE>, Not<ExactPlatform<IGFX_METEORLAKE>>]>
+  InheritFromCapabilities
+>;
+
+def SPV_KHR_bfloat16_experimental : ExperimentalExtension<
+  "SPV_KHR_bfloat16",
+  [ Capability<"BFloat16TypeKHR",              AllOf<[isCoreChildOf<IGFX_XE_HPG_CORE>, Not<ExactPlatform<IGFX_METEORLAKE>>]>>,
+    Capability<"BFloat16DotProductKHR",        AllOf<[isCoreChildOf<IGFX_XE_HPG_CORE>, Not<ExactPlatform<IGFX_METEORLAKE>>]>>,
+    Capability<"BFloat16CooperativeMatrixKHR", AllOf<[isCoreChildOf<IGFX_XE_HPG_CORE>, Not<ExactPlatform<IGFX_METEORLAKE>>]>> ],
+  "https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_bfloat16.html",
+  InheritFromCapabilities
 >;
 
 def SPV_INTEL_subgroup_scaled_matrix_multiply_accumulate : ExperimentalExtension<
@@ -477,6 +524,19 @@ def SPV_INTEL_rounded_divide_sqrt : ExperimentalExtension<
   [ Capability<"RoundedDivideSqrtINTEL"> ],
   "https://github.khronos.org/SPIRV-Registry/extensions/INTEL/SPV_INTEL_rounded_divide_sqrt.html",
   isCoreChildOf<IGFX_XE_HP_CORE>
+>;
+
+def SPV_EXT_ocp_microscaling_types : ExperimentalExtension<
+  "SPV_EXT_ocp_microscaling_types",
+  [ Capability<"Float4EXT"> ],
+  "https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_ocp_microscaling_types.html",
+  isCoreChildOf<IGFX_XE3P_CORE>
+>;
+
+def SPV_INTEL_maximum_registers : ExperimentalExtension<
+  "SPV_INTEL_maximum_registers",
+  [ Capability<"RegisterLimitsINTEL"> ],
+  "https://github.khronos.org/SPIRV-Registry/extensions/INTEL/SPV_INTEL_maximum_registers.html"
 >;
 
 // ----------------------------------------------

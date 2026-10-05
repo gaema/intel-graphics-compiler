@@ -142,6 +142,9 @@ static const WA_TABLE *CreateVisaWaTable(TARGET_PLATFORM platform,
     break;
   case Xe_PVC:
     VISA_WA_ENABLE(pWaTable, Wa_16013338947);
+    if (step == Step_A) {
+      VISA_WA_ENABLE(pWaTable, Wa_14013677893);
+    }
     break;
   case Xe_PVCXT:
     VISA_WA_ENABLE(pWaTable, Wa_16013338947);
@@ -3487,7 +3490,8 @@ bool CISA_IR_Builder::create3DLoadInstruction(
 
   VISA_Exec_Size executionSize = Get_VISA_Exec_Size_From_Raw_Size(exec_size);
   int status = m_kernel->AppendVISA3dLoad(
-      subOpcode, pixelNullMask, (VISA_PredOpnd *)pred, emask, executionSize,
+      subOpcode, pixelNullMask,
+      (VISA_PredOpnd *)pred, emask, executionSize,
       channels.getAPI(), (VISA_VectorOpnd *)aoffimmi, surface, surfaceIndex,
       (VISA_RawOpnd *)pairedSurface, (VISA_RawOpnd *)dst, numParameters,
       params);
@@ -4189,6 +4193,7 @@ bool CISA_IR_Builder::CISA_create_fcvt_instruction(
                     (VISA_VectorOpnd *)src0);
   return true;
 }
+
 
 bool CISA_IR_Builder::CISA_create_lsc_extended_cache_ctrl_inst(
     VISA_opnd *pred, LSC_OP opcode, LSC_SFID sfid, LSC_CACHE_CTRL_OPERATION ccop,

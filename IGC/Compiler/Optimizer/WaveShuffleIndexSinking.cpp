@@ -307,7 +307,7 @@ class WaveShuffleIndexSinkingImpl {
       }
 
       for (auto &instChain : InstChains) {
-        for (unsigned i = 0; i < HoistOrAnchorInstsIdx.size(); i++) {
+        for (int i = static_cast<int>(HoistOrAnchorInstsIdx.size()) - 1; i >= 0; i--) {
           if (HoistOrAnchorInstsIdx[i])
             instChain[i]->eraseFromParent();
         }
@@ -427,10 +427,11 @@ bool WaveShuffleIndexSinkingImpl::moveToCommonDominator() {
     auto instrInsertPtr = (&*bb.first->getFirstInsertionPt());
     // If shuffle's source (shuffled value) is not of the hoisted instruction,
     // and is defined in target basic block, then hoist after source.
+    // If source is a PHI node, then hoist after all PHI nodes.
     for (auto &inst : bb.second) {
       if (auto *waveShuffleInst = dyn_cast<WaveShuffleIndexIntrinsic>(inst)) {
         if (auto *srcInst = dyn_cast<Instruction>(waveShuffleInst->getSrc())) {
-          if (srcInst->getParent() == bb.first &&
+          if (srcInst->getParent() == bb.first && !isa<PHINode>(srcInst) &&
               std::find(bb.second.begin(), bb.second.end(), srcInst) == bb.second.end()) {
             instrInsertPtr = srcInst->getNextNode();
           }

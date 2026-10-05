@@ -12,14 +12,6 @@ set(IGC_BUILD__PROJ_LABEL__AdaptorOCL "AdaptorOCL")
 
 include_directories("${CMAKE_CURRENT_SOURCE_DIR}")
 
-# SPIRV-Headers is needed by igc_options_and_capabilities_impl.cpp to map
-# SPIR-V capability names to numeric opcodes for the YAML returned to NEO via
-# GetCompilerSupportedSPIRVExtensionsYAML (consumed by cl_khr_spirv_queries /
-# ze_khr_spirv_queries).
-if(DEFINED IGC_BUILD__SPIRV-Headers_DIR)
-  include_directories("${IGC_BUILD__SPIRV-Headers_DIR}/include")
-endif()
-
 #include_directories("${CMAKE_CURRENT_SOURCE_DIR}/ocl_igc_shared/executable_format")
 
 set(IGC_BUILD__SRC__AdaptorOCL
@@ -30,6 +22,7 @@ set(IGC_BUILD__SRC__AdaptorOCL
     "${CMAKE_CURRENT_SOURCE_DIR}/preprocess_spvir/PromoteSubByte.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/preprocess_spvir/HandleSPIRVDecorations/HandleSpirvDecorationMetadata.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/preprocess_spvir/ConvertUserSemanticDecoratorOnFunctions.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/preprocess_spvir/ConvertSPIRVExecutionModes.cpp"
 )
 
 
@@ -39,6 +32,7 @@ set(IGC_BUILD__SRC__IGC_AdaptorOCL
     "${CMAKE_CURRENT_SOURCE_DIR}/preprocess_spvir/PreprocessSPVIR.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/preprocess_spvir/PromoteSubByte.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/preprocess_spvir/ConvertUserSemanticDecoratorOnFunctions.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/preprocess_spvir/ConvertSPIRVExecutionModes.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/preprocess_spvir/HandleSPIRVDecorations/HandleSpirvDecorationMetadata.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ResolveConstExprCalls.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/LowerInvokeSIMD.cpp"
@@ -58,6 +52,7 @@ set(IGC_BUILD__SRC__IGC_AdaptorOCL
     "${CMAKE_CURRENT_SOURCE_DIR}/ocl_igc_interface/impl/platform_impl.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ocl_igc_interface/impl/igc_builtins_impl.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ocl_igc_interface/impl/igc_options_and_capabilities_impl.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ocl_igc_interface/extensions/SPIRVExtensionsSupport.cpp"
 
     "${CMAKE_CURRENT_SOURCE_DIR}/OCL/util/BinaryStream.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/OCL/Platform/cmd_media_caps_g8.cpp"
@@ -129,6 +124,7 @@ set(IGC_BUILD__HDR__AdaptorOCL
 
 list(APPEND IGC_BUILD__HDR__AdaptorOCL
     "${CMAKE_CURRENT_SOURCE_DIR}/preprocess_spvir/ConvertUserSemanticDecoratorOnFunctions.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/preprocess_spvir/ConvertSPIRVExecutionModes.h"
   )
 
 

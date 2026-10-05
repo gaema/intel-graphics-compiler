@@ -5561,7 +5561,8 @@ int VISAKernelImpl::AppendVISA3dSamplerMsgGeneric(
       if (m_options->getOption(vISA_enableEfficient64b)) {
         // check if sampler and surface are VISA_VectorOpnd
         status = m_builder->translateVISALoad3DInstUnified(
-            subOpcode, pixelNullMask, g4Pred, executionSize, emask, srcChannel,
+            subOpcode, pixelNullMask,
+            g4Pred, executionSize, emask, srcChannel,
             aoffimmi->g4opnd, nullptr, 0, surface->g4opnd, surfaceIdx,
             pairedSurface->g4opnd, dst->g4opnd->asDstRegRegion(),
             (uint8_t)numMsgSpecificOpnds, g4params);
@@ -5743,13 +5744,15 @@ int VISAKernelImpl::AppendVISA3dLoad(
     VISAChannelMask srcChannel, VISA_VectorOpnd *aoffimmi,
     VISA_StateOpndHandle *surface, VISA_RawOpnd *pairedSurface,
     VISA_RawOpnd *dst, int numMsgSpecificOpnds, VISA_RawOpnd **opndArray) {
-  return AppendVISA3dLoad(subOpcode, pixelNullMask, pred, emask, executionSize,
+  return AppendVISA3dLoad(subOpcode, pixelNullMask,
+                          pred, emask, executionSize,
                           srcChannel, aoffimmi, surface, 0, pairedSurface, dst,
                           numMsgSpecificOpnds, opndArray);
 }
 
 int VISAKernelImpl::AppendVISA3dLoad(
-    VISASampler3DSubOpCode subOpcode, bool pixelNullMask, VISA_PredOpnd *pred,
+    VISASampler3DSubOpCode subOpcode, bool pixelNullMask,
+    VISA_PredOpnd *pred,
     VISA_EMask_Ctrl emask, VISA_Exec_Size executionSize,
     VISAChannelMask srcChannel, VISA_VectorOpnd *aoffimmi,
     VISA_StateOpndHandle *surface, unsigned int surfaceIndex,
@@ -9871,6 +9874,66 @@ bool enableSrcLine(void *buf) {
   auto gtpin_init_data = (gtpin::igc::igc_init_t *)buf;
   return gtpin_init_data->srcline_mapping != 0;
 }
+int VISAKernelImpl::AppendVISATraceRay(
+    VISA_PredOpnd *pred, VISA_EMask_Ctrl emask, VISA_Exec_Size executionSize,
+    TRACE_RAY_OPCODE subOp, VISA_VectorOpnd *globalBufferPointer,
+    uint8_t stackAddressMode, VISA_RawOpnd *payload, VISA_RawOpnd *dstData) {
+
+  // This is a wrapper around AppendVISARawSendg
+  // Prepare the operands and send it to AppendVISARawSendg
+  // TODO: Subsequent changes will introduce a dedicated vISA instruction and
+  // translate function for trace ray
+
+  // [46:14] MBZ
+  // [13:12] Spawn type (not exercised)
+  // [11:6] MBZ
+  // [5:4] Message family -- 1 for BTD_SPAWN ray
+  // [3:0] Message type
+
+  // create descriptor
+  uint64_t desc = 0;
+  // message type
+  desc |= static_cast<int>(subOp);
+
+  VISA_VectorOpnd* ind0 = globalBufferPointer;
+
+  VISA_RawOpnd* dst = nullptr;
+  unsigned int dstLengthInBytes = 0;
+  unsigned int srcLengthInBytes = 0;
+
+  if (payload != nullptr)
+  {
+      srcLengthInBytes = (executionSize == EXEC_SIZE_16) ?
+          getIRBuilder()->getGRFSize() : 2 * getIRBuilder()->getGRFSize();
+  }
+  else
+  {
+      srcLengthInBytes = getIRBuilder()->getGRFSize();
+  }
+
+  if (subOp == TRACE_RAY_OPCODE::OP_TRACE_RAY_SYNC || subOp == TRACE_RAY_OPCODE::OP_TRACE_BOX_SYNC) {
+    // only these subops allow for destination
+    dst = dstData;
+    // the return data is a single GRF
+    dstLengthInBytes = getIRBuilder()->getGRFSize();
+  }
+
+  // 0x8 is the sfid RTHW
+  const unsigned sfid = SFIDtoInt(SFID::RTHW);
+
+  return AppendVISAMiscRawSendg(
+    sfid,
+    pred,
+    emask,
+    executionSize,
+    dst, dstLengthInBytes,
+    payload, srcLengthInBytes,
+    nullptr, 0,
+    ind0,
+    nullptr,
+    desc, false, false);
+}
+
 int VISAKernelImpl::AppendVISAShflIdx4Inst(
     ISA_Opcode opcode, VISA_PredOpnd *pred, VISA_EMask_Ctrl emask,
     VISA_Exec_Size executionSize, VISA_RawOpnd *dst, VISA_VectorOpnd *src0,

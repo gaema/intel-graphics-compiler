@@ -1,6 +1,6 @@
 ;=========================== begin_copyright_notice ============================
 ;
-; Copyright (C) 2024-2025 Intel Corporation
+; Copyright (C) 2024-2026 Intel Corporation
 ;
 ; SPDX-License-Identifier: MIT
 ;
@@ -15,11 +15,17 @@
 
 
 
+; Src3/Src4 (block-scale) base decls must be GRF-aligned even though the
+; scale value used by the instruction (SCALE2 at a non-zero sub-offset here)
+; only needs qword granularity: the base itself must still land on a GRF
+; boundary, and baling must not insert an extra mov to achieve that.
 ; CHECK: .decl [[ACC:V[0-9]+]] v_type=G type=f num_elts=128 align=GRF
+; CHECK: .decl [[SCALE1BASE:V[0-9]+]] v_type=G type=b num_elts=64 align=GRF
+; CHECK: .decl [[SCALE2BASE:V[0-9]+]] v_type=G type=b num_elts=64 align=GRF
 ; CHECK: .decl [[SRC1:V[0-9]+]] v_type=G type=ud num_elts=128 align=wordx32
 ; CHECK: .decl [[SRC2:V[0-9]+]] v_type=G type=ud num_elts=64
-; CHECK: .decl [[SCALE1:V[0-9]+]] v_type=G type=ub num_elts=64
-; CHECK: .decl [[SCALE2:V[0-9]+]] v_type=G type=ub num_elts=64
+; CHECK: .decl [[SCALE1:V[0-9]+]] v_type=G type=ub num_elts=64 alias=<[[SCALE1BASE]], 0>
+; CHECK: .decl [[SCALE2:V[0-9]+]] v_type=G type=ub num_elts=64 alias=<[[SCALE2BASE]], 0>
 
 ; CHECK: bdpas.e2m1.e2m1.8.8 (M1, 16) [[ACC]].0 [[ACC]].0 [[SRC1]].0 [[SRC2]].0 [[SCALE1]](0,0) [[SCALE2]](0,16)
 

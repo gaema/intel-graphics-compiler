@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2021-2024 Intel Corporation
+Copyright (C) 2021-2026 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -43,6 +43,7 @@ SPDX-License-Identifier: MIT
 #include "llvmWrapper/IR/Function.h"
 #include "llvmWrapper/IR/InstrTypes.h"
 #include "llvmWrapper/IR/Instructions.h"
+#include "llvmWrapper/IR/IntrinsicInst.h"
 #include "llvmWrapper/Support/Alignment.h"
 
 #include <llvm/ADT/SmallVector.h>
@@ -423,11 +424,15 @@ GatherScatterOperands getGatherScatterOperands(IntrinsicInst &I) {
     IGC_ASSERT_MESSAGE(0, "unsupported intrinsic");
     return {false, nullptr, nullptr, nullptr, nullptr};
   case Intrinsic::masked_gather:
-    return {true, I.getArgOperand(2), I.getArgOperand(0), I.getArgOperand(3),
-            cast<ConstantInt>(I.getArgOperand(1))};
+    return {true, IGCLLVM::getMaskedGatherScatterMask(&I), I.getArgOperand(0),
+            IGCLLVM::getMaskedGatherPassThru(&I),
+            ConstantInt::get(Type::getInt32Ty(I.getContext()),
+                             IGCLLVM::getMaskedGatherScatterAlign(&I).value())};
   case Intrinsic::masked_scatter:
-    return {false, I.getArgOperand(3), I.getArgOperand(1), I.getArgOperand(0),
-            cast<ConstantInt>(I.getArgOperand(2))};
+    return {false, IGCLLVM::getMaskedGatherScatterMask(&I), I.getArgOperand(1),
+            I.getArgOperand(0),
+            ConstantInt::get(Type::getInt32Ty(I.getContext()),
+                             IGCLLVM::getMaskedGatherScatterAlign(&I).value())};
   }
 }
 } // namespace

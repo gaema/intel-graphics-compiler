@@ -36,6 +36,8 @@ namespace llvm {
 template <> struct DenseMapInfo<IGC::AllocationLivenessAnalyzer::LivenessData::Edge> {
   using Edge = IGC::AllocationLivenessAnalyzer::LivenessData::Edge;
 
+// Removed in LLVM 23
+#if LLVM_VERSION_MAJOR < 23
   static inline Edge getEmptyKey() {
     return Edge{DenseMapInfo<BasicBlock *>::getEmptyKey(), DenseMapInfo<BasicBlock *>::getEmptyKey()};
   }
@@ -43,6 +45,7 @@ template <> struct DenseMapInfo<IGC::AllocationLivenessAnalyzer::LivenessData::E
   static inline Edge getTombstoneKey() {
     return Edge{DenseMapInfo<BasicBlock *>::getTombstoneKey(), DenseMapInfo<BasicBlock *>::getTombstoneKey()};
   }
+#endif
 
   static unsigned getHashValue(const Edge &E) { return (unsigned)hash_combine(E.from, E.to); }
 
@@ -319,16 +322,17 @@ static bool forceShortCurcuitingOR_CommittedGeomIdx(RTBuilder &builder, Instruct
   Instruction *lhs = nullptr;
   Instruction *rhs = nullptr;
   Instruction *orI = nullptr;
-  BranchInst *brI = nullptr;
+  Instruction *brI = nullptr;
   for (auto U1 : I->users()) {
     if (isa<ICmpInst>(U1)) { // found 2nd condition
       for (auto U2 : U1->users()) {
         if ((orI = dyn_cast<Instruction>(U2))) {
           if (orI->getOpcode() == Instruction::Or) {
-            brI = dyn_cast<llvm::BranchInst>(*orI->user_begin());
+            brI = dyn_cast<Instruction>(*orI->user_begin());
             lhs = dyn_cast<Instruction>(orI->getOperand(0));
             rhs = dyn_cast<Instruction>(orI->getOperand(1));
-            found = (orI->getOperand(1) == U1 && brI && lhs && rhs);
+            found =
+                (orI->getOperand(1) == U1 && brI && isa<IGCLLVM::CondBrInst, IGCLLVM::UncondBrInst>(brI) && lhs && rhs);
             if (found) {
               break;
             }

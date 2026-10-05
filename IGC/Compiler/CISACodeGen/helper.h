@@ -56,9 +56,15 @@ typedef unsigned int uint;
 
 namespace IGC {
 class CodeGenContext;
+class GenXFunctionGroupAnalysis;
 struct SProgramOutput;
 
 static const char *const INTEL_SYMBOL_TABLE_VOID_PROGRAM = "Intel_Symbol_Table_Void_Program";
+
+// Metadata marker set by InstructionHoistingOptimization on a sampler it hoisted
+// for latency; CodeSinking honors it to avoid sinking the sample back toward its
+// consumer, which would undo the hoist.
+static const char *const MD_LATENCY_HOISTED_SAMPLE = "igc.latencyHoisted";
 
 #ifdef _DEBUG
 template <typename T, size_t N> using smallvector = std::vector<T>;
@@ -178,10 +184,17 @@ bool IsSIMDBlockIntrinsic(const llvm::Instruction *inst);
 bool isSubGroupIntrinsic(const llvm::Instruction *I);
 bool isSubGroupIntrinsicPVC(const llvm::Instruction *I);
 bool isSubGroupShuffleVariant(const llvm::Instruction *I);
+// Decides whether EmitMoreMoviCases movi promotion is enabled for the shader.
+// Shared by EmitPass (which stores the result on the shader) and CustomSafeOptPass
+// (which skips its trunc demotion when movi is enabled) so both stay consistent.
+bool shouldEmitMoreMoviCases(CodeGenContext *ctx);
 bool subgroupIntrinsicHasHelperLanes(const llvm::Instruction &I);
 bool hasSubGroupIntrinsicPVC(llvm::Function &F);
 
 bool isBarrierIntrinsic(const llvm::Instruction *I);
+
+// Returns true if V is a DPAS GenISA intrinsic (dpas / sub_group_dpas / bdpas).
+bool isDPAS(const llvm::Value *V);
 
 bool isUserFunctionCall(const llvm::Instruction *I);
 
@@ -375,7 +388,13 @@ llvm::Function *getUniqueEntryFunc(const IGCMD::MetaDataUtils *pM, IGC::ModuleMe
 
 // Returns a SIMD size for given function from metadata.
 // Returns 0 if function is not in metadata or function has not defined SIMD size.
-int getSIMDSize(const IGC::ModuleMetaData *modMD, llvm::Function *F);
+int getSIMDSize(const IGC::ModuleMetaData *modMD, const llvm::Function *F);
+
+// Best-effort guess of the SIMD width a function will be compiled for, based on
+// required sub-group size metadata and the platform. Used by register-pressure
+// estimates before the backend fixes the final width.
+SIMDMode bestGuessSIMDSize(const CodeGenContext *CTX, const llvm::Function *F = nullptr,
+                           GenXFunctionGroupAnalysis *FGA = nullptr);
 
 // Resolves (and pins) the kernel sub-group/SIMD size for builtin-resolution passes that
 // lower builtins to intrinsics before the backend fixes the SIMD width. The generic
@@ -556,10 +575,20 @@ inline void updateDebugLoc(llvm::Instruction *pOrigin, llvm::Instruction *pNew) 
   pNew->setDebugLoc(pOrigin->getDebugLoc());
 }
 
+inline bool isDebugInst(const llvm::Instruction *I) {
+#if LLVM_VERSION_MAJOR < 22
+  return llvm::isa<llvm::DbgInfoIntrinsic>(I);
+#else
+  // On LLVM >= 22 debug variables are stored as DbgVariableRecord non-instruction
+  // objects; no instruction in the stream can be a debug intrinsic.
+  return false;
+#endif
+}
+
 inline bool isDbgIntrinsic(const llvm::Instruction *I) {
   if (auto *GXI = llvm::dyn_cast<llvm::GenIntrinsicInst>(I))
     return GXI->getIntrinsicID() == llvm::GenISAIntrinsic::GenISA_CatchAllDebugLine;
-  return llvm::isa<llvm::DbgInfoIntrinsic>(I);
+  return isDebugInst(I);
 }
 
 llvm::ConstantInt *getConstantSInt(llvm::IRBuilder<> &Builder, const int bitSize, int64_t val);

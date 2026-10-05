@@ -1382,6 +1382,10 @@ void BinaryEncodingIGA::Encode() {
 
     if (kernel.getOption(vISA_EnableIGASWSB)) {
       encoder.enableIGAAutoDeps();
+      // IGA must not erase any of the instructions during its AutoDeps set
+      // (which it may if the instruction is sync.nop with no swsb), so that
+      // each G4_INST can be mapped to an IGA instruction.
+      encoder.preserveIGAAutoDepsInsts();
     }
 
     encoder.encode(kernel.fg.builder->criticalMsgStream());
@@ -1394,7 +1398,11 @@ void BinaryEncodingIGA::Encode() {
 
   // encodedPC is available after encoding
   for (auto &&inst : encodedInsts) {
-    inst.second->setGenOffset(inst.first->getPC());
+    const PC pc = inst.first->getPC();
+    // vISA doesn't expect IGA to drop any instructions
+    vISA_ASSERT(pc != NO_PC,
+                "IGA dropped an instruction vISA maps by gen offset");
+    inst.second->setGenOffset(pc == NO_PC ? UNDEFINED_GEN_OFFSET : pc);
   }
   if (kernel.hasPerThreadPayloadBB()) {
     kernel.fg.builder->getJitInfo()->offsetToSkipPerThreadDataLoad =

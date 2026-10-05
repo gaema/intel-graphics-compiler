@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2023 Intel Corporation
+Copyright (C) 2023-2026 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -240,9 +240,9 @@ private:
 //   2. Estimates increase in register pressure.
 class Scorer {
 public:
-  Scorer(const DataLayout &DL, ModuleMetaData &MMD, IGCLivenessAnalysisRunner &RPE, WIAnalysisRunner &WI,
-         GenXFunctionGroupAnalysis *FGA)
-      : DL(DL), MMD(MMD), RPE(RPE), WI(WI), FGA(FGA) {}
+  Scorer(const DataLayout &DL, ModuleMetaData &MMD, CodeGenContext &CGC, IGCLivenessAnalysisRunner &RPE,
+         WIAnalysisRunner &WI, GenXFunctionGroupAnalysis *FGA)
+      : DL(DL), CGC(CGC), RPE(RPE), MMD(MMD), WI(WI), FGA(FGA) {}
 
   void score(SmallVectorImpl<ReductionCandidateGroup> &Candidates);
 
@@ -256,6 +256,7 @@ private:
   int estimatePointerAddition(ReductionCandidateGroup &Candidate);
 
   const DataLayout &DL;
+  CodeGenContext &CGC;
   IGCLivenessAnalysisRunner &RPE;
   ModuleMetaData &MMD;
   WIAnalysisRunner &WI;
@@ -304,6 +305,7 @@ private:
   unsigned MaxAllowedPressure;
   unsigned FunctionExternalPressure;
 
+  CodeGenContext &CGC;
   IGCLivenessAnalysisRunner &RPE;
   WIAnalysisRunner &WI;
   GenXFunctionGroupAnalysis *FGA;
@@ -431,6 +433,9 @@ bool ReductionCandidateGroup::addToGroup(ScalarEvolution &SE, GetElementPtrInst 
     return false;
 
   if (Base.GEP->getType() != GEP->getType())
+    return false;
+
+  if (Base.GEP->getSourceElementType() != GEP->getSourceElementType())
     return false;
 
   // Compare indices (except last one)
@@ -737,7 +742,7 @@ void Scorer::scoreRegisterPressure(ReductionCandidateGroup &Candidate) {
 
   auto *L = Candidate.getLoop();
   auto *F = Cheapest.GEP->getParent()->getParent();
-  uint SIMD = numLanes(RPE.bestGuessSIMDSize(F, FGA));
+  uint SIMD = numLanes(IGC::bestGuessSIMDSize(&CGC, F, FGA));
 
   ValueSet Instructions;
 
@@ -872,6 +877,14 @@ bool Analyzer::doInitialValidation(GetElementPtrInst *GEP) {
       return false;
   }
 
+  // 1st optimization kind applies to constant GEPs.
+  // Also avoids iterating over Constant's users(),
+  // on LLVM >= 22, it's not allowed
+  // on LLVM < 22, it introduces undeterministic results, constants are unique module-wide,
+  // which means they might contain completely unrelated instructions
+  if (isa<ConstantData>(Index))
+    return true;
+
   // Don't reduce if index is used outside of loop to access the same pointer.
   // TODO: These accesses could be modified to also use pointer induction variable
   // added by this pass.
@@ -922,9 +935,9 @@ bool Analyzer::isValidDeconstructedSCEV(const DeconstructedSCEV &Result) {
 RegisterPressureTracker::RegisterPressureTracker(Function &F, CodeGenContext &CGC, IGCLivenessAnalysisRunner &RPE,
                                                  IGCFunctionExternalRegPressureAnalysis &FRPE, WIAnalysisRunner &WI,
                                                  GenXFunctionGroupAnalysis *FGA)
-    : RPE(RPE), WI(WI), FGA(FGA) {
+    : CGC(CGC), RPE(RPE), WI(WI), FGA(FGA) {
   MaxAllowedPressure =
-      static_cast<unsigned>(CGC.getNumGRFPerThread() * IGC_GET_FLAG_VALUE(GEPLSRThresholdRatio) / 100.0f);
+      static_cast<unsigned>(CGC.getNumGRFPerThread(true, &F) * IGC_GET_FLAG_VALUE(GEPLSRThresholdRatio) / 100.0f);
 
   FunctionExternalPressure = FRPE.getExternalPressureForFunction(&F);
 }
@@ -947,7 +960,7 @@ void RegisterPressureTracker::trackDeletedInstruction(Value *V) {
 bool RegisterPressureTracker::fitsPressureThreshold(ReductionCandidateGroup &C) {
   BasicBlock *Preheader = C.getLoop()->getLoopPreheader();
   auto *F = Preheader->getParent();
-  uint SIMD = numLanes(RPE.bestGuessSIMDSize(F, FGA));
+  uint SIMD = numLanes(IGC::bestGuessSIMDSize(&CGC, F, FGA));
 
   unsigned MaxLoopPressure = RPE.getMaxRegCountForLoop(*C.getLoop(), SIMD, &WI);
   unsigned AdditionalPressure = C.getScore().RegisterPressure;
@@ -1158,7 +1171,7 @@ bool GEPLoopStrengthReduction::runOnFunction(llvm::Function &F) {
   if (Candidates.empty())
     return false;
 
-  Scorer(DL, MMD, RPE, *WI, FGA).score(Candidates);
+  Scorer(DL, MMD, CGC, RPE, *WI, FGA).score(Candidates);
 
   IGCLLVM::IRBuilder<> IRB(F.getContext());
 

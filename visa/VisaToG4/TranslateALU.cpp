@@ -292,6 +292,7 @@ int IR_Builder::translateVISALogicInst(
     G4_Operand *src0, G4_Operand *src1, G4_Operand *src2, G4_Operand *src3) {
   TIME_SCOPE(VISA_BUILDER_IR_CONSTRUCTION);
 
+
   G4_ExecSize exsize = toExecSize(executionSize);
   G4_InstOpts inst_opt = Get_Gen4_Emask(emask, exsize, hasNibCtrl());
   G4_Operand *g4Srcs[] = {src0, src1, src2, src3};
@@ -372,6 +373,7 @@ int IR_Builder::translateVISALogicInst(
   return VISA_SUCCESS;
 }
 
+
 int IR_Builder::translateVISADataMovementInst(
     ISA_Opcode opcode, CISA_MIN_MAX_SUB_OPCODE subOpcode,
     G4_Predicate *predOpnd, VISA_Exec_Size executionSize, VISA_EMask_Ctrl emask,
@@ -439,7 +441,29 @@ int IR_Builder::translateVISADataMovementInst(
       return VISA_FAILURE;
     }
   } else if (opcode == ISA_FCVT) {
-    (void)createInst(nullptr, G4_fcvt, nullptr, saturate, exsize, dstOpnd,
+    // Lower fcvt to mov with fcvt's types retyped as follows:
+    //   UD == TF32, UB == BF8, B == HF8.
+    // (fcvt is to be deprecated)
+    auto containerToReal = [](G4_Type ty) -> G4_Type {
+      switch (ty) {
+      case Type_UD:
+        return Type_TF32;
+      case Type_UB:
+        return Type_BF8;
+      case Type_B:
+        return Type_HF8;
+      default:
+        return ty; // not the container side
+      }
+    };
+    G4_Type dstReal = containerToReal(dstOpnd->getType());
+    dstOpnd->setType(*this, dstReal);
+    // Check SrfRegRegion operand for safety (Src0 should not be imm)
+    if (src0Opnd->isSrcRegRegion()) {
+      G4_Type srcReal = containerToReal(src0Opnd->getType());
+      src0Opnd->asSrcRegRegion()->setType(*this, srcReal);
+    }
+    (void)createInst(nullptr, G4_mov, nullptr, saturate, exsize, dstOpnd,
                      src0Opnd, nullptr, inst_opt, true);
   } else {
     if (opcode == ISA_FMINMAX) {

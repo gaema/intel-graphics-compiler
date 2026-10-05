@@ -336,6 +336,95 @@ static bool allowTrueRegionOnSrc0(G4_INST *inst) {
   return !(src2->isImm() || src2->asSrcRegRegion()->isScalar());
 }
 
+// Register region restrictions for MOV where one operand is an 8-bit float
+//   1. When doing down conversions to 9-bit float from fp16 && dst is
+//      packed (stride=1).
+//      1.1 Src0 restriction
+//          a. Src0 must be a packed GRF register.
+//          b. The subreg of fp16 Src0 should be either .0 or .16
+//          c. Src0 must not span more than 1 register.
+//      1.2 Dst restriction
+//          a. 8-bit Dst must use subreg .0, .16, .32 or .48.
+//      1.3 (dst.subreg%32) == src0.subreg;
+//   2. Otherwise, integer rules apply.
+void HWConformityPro::fixMovCvtByteFloat(INST_LIST_ITER it, G4_BB *bb) {
+  auto inst = *it;
+  auto dst = inst->getDst();
+  auto src = inst->getSrc(0);
+  auto dstTy = dst->getType();
+  auto srcTy = src->getType();
+
+  // Down-cvt rules apply to HF8/BF8; UE5M3 is handled with int pipe rules.
+  vISA_ASSERT(IS_BYTE_FLOAT(dstTy) || IS_BYTE_FLOAT(srcTy),
+              "expect byte-float mov");
+
+  const uint32_t BytesPerGrf = builder.numEltPerGRF<Type_UB>();
+  bool isPackedDst = dst->getHorzStride() == 1;
+  auto srcRgn = src->isSrcRegRegion() ? src->asSrcRegRegion() : nullptr;
+  bool isPackedSrc =
+      srcRgn ? srcRgn->getRegion()->isContiguous(inst->getExecSize()) : false;
+  if (IS_BYTE_FLOAT(dstTy) && isPackedDst && IS_FP16TYPE(srcTy)) {
+    // down conversion: 8-bit <- 16-bit
+    //   1. src0.subreg = 0|16  -> align src0's root dcl to GRF so its subreg
+    //      is known
+    //   2. dst.subreg = 0|16|32|48  -> align dst0's root dcl to 32 byte (half
+    //      GRF) so that (dst.subreg%32) is known
+    //   3. (dst.subreg%32) == src0.subreg
+    //      As both lhs and rhs are known, this condition can be checked.
+    uint32_t dstOff = 0, srcOff = 0;
+    bool isDstAligned32 = builder.tryToAlignOperandRootDcl(dst, dstOff, 32);
+    // As dst is 32-byte aligned, its real subreg isn't known, but
+    // its subreg%32 is known (dst.subreg=0|16|32|48 is equivalent to
+    // (dst.subreg%32) = 0|16).
+    uint32_t dstSubReg = dstOff % 32;
+    bool isSrcGrfAligned =
+        srcRgn ? builder.tryToAlignOperandRootDcl(src, srcOff, BytesPerGrf)
+               : false;
+    uint32_t srcSubReg = (srcOff % BytesPerGrf) / 2; // 16-bit element
+    bool isDstSubRegOk = (dstSubReg == 0 || dstSubReg == 16);
+    bool isSrcSubRegOk = (srcSubReg == 0 || srcSubReg == 16);
+    bool isMod32Ok = (dstSubReg == srcSubReg);
+    // SubReg check makes sense only if the root dcl is aligned. When mod32
+    // is mismatched, both operands are forced to be subreg 0
+    if (!isDstAligned32 || !isDstSubRegOk || (!isMod32Ok && dstSubReg != 0)) {
+      replaceDstWithRawMov(it, bb, 1, builder.getGRFAlign());
+      auto *movInst = *std::next(it);
+      movInst->setIntTypeForRawMov();
+    }
+
+    if (!isSrcGrfAligned || !isPackedSrc || !isSrcSubRegOk ||
+        (!isMod32Ok && srcSubReg != 0)) {
+      replaceSrcWithRawMov(it, bb, 0, /*stride*/ 1, builder.getGRFAlign(),
+                           /*sameExecSize*/ true);
+      auto *movInst = *std::prev(it);
+      movInst->setIntTypeForRawMov();
+    }
+
+    // Src must not cross 1 grf (both dst and src should be packed now)
+    src = inst->getSrc(0);
+    vISA_ASSERT(src->isSrcRegRegion(), "ICE: expect src register region");
+    if (src->crossGRF(builder)) {
+      evenlySplitInst(it, bb);
+    }
+    return;
+  }
+
+  // Narrowing: 8-bit float <- F/HF/BF(src).
+  // Widening : F/HF/BF <-- 8-bit float
+  // Int packed-destination restriction:
+  //   execChannelWidth=4 for F src -> FP8 stride=4 (matches HW spec rule).
+  //   execChannelWidth=2 for HF/BF src -> FP8 stride=2.
+  auto execChannelWidth = inst->getExecTypeSizeXe3p();
+  auto dstStrideInBytes = dst->getTypeSize() * dst->getHorzStride();
+  if (inst->getExecSize() != g4::SIMD1 &&
+      (dstStrideInBytes < execChannelWidth ||
+       !isAllowedTrueRegionPatternOnSrc0(src))) {
+    replaceDstWithRawMov(it, bb, execChannelWidth / TypeSize(dstTy),
+                         builder.getGRFAlign());
+    auto *movInst = *std::next(it);
+    movInst->setIntTypeForRawMov();
+  }
+}
 
 // Alignment rule for down conversion from fp32 to fp16(bf/hf):
 //    1, If dst is packed(stride is 1) with subreg offset .0/.16, src must be
@@ -485,8 +574,6 @@ void HWConformityPro::fixMovCvtBetweenFp16AndWordByte(INST_LIST_ITER it,
 // Restrictions for int pipeline:
 // 1, src0 restrictions:
 //    a, If opcode is non-mul and src2 is not broadcast, true region is allowed.
-//       Need to follow the bspec psedo code for allowed regioning patterns:
-//       https://gfxspecs.intel.com/Predator/Home/Index/73578
 //    b, Otherwise, must be flat region except that src is broadcast of a
 //       single channel from GRF register.
 // 2, src1/src2 restrictions:
@@ -603,6 +690,13 @@ void HWConformityPro::fixRegRegionIntPipe(INST_LIST_ITER it, G4_BB *bb) {
     if (((IS_HFTYPE(dstTy) || IS_BFTYPE(dstTy)) && IS_FTYPE(src0Ty)) ||
         ((IS_HFTYPE(src0Ty) || IS_BFTYPE(src0Ty)) && IS_FTYPE(dstTy))) {
       fixMovCvtBetweenFp16AndFp32(it, bb);
+      return;
+    }
+
+    // Fix mov convert instructions with byte float as one of its operands.
+    if ((IS_BYTE_FLOAT(dstTy) && (IS_FTYPE(src0Ty) || IS_FP16TYPE(src0Ty))) ||
+        (IS_BYTE_FLOAT(src0Ty) && (IS_FTYPE(dstTy) || IS_FP16TYPE(dstTy)))) {
+      fixMovCvtByteFloat(it, bb);
       return;
     }
   }
@@ -920,9 +1014,11 @@ void HWConformityPro::fixRawMovRegRegionRestrictions(G4_BB *bb) {
       continue;
 
     bool invalidPureBfInst = inst->isPureBFInst() && !builder.supportPureBF();
-
+    auto dstType = inst->getDst()->getType();
+    // mov for byte float needs to be done with ub type. Cannot skip.
     if (!inst->getSrc(0)->isSrcRegRegion() ||
-        (inst->getSrc(0)->asSrcRegRegion()->isScalar() && !invalidPureBfInst))
+        (!IS_BYTE_FLOAT(dstType) &&
+         inst->getSrc(0)->asSrcRegRegion()->isScalar() && !invalidPureBfInst))
       continue;
 
     // For conversions in float pipeline, change datatype to corresponding
@@ -931,7 +1027,6 @@ void HWConformityPro::fixRawMovRegRegionRestrictions(G4_BB *bb) {
     // HF/BF->HF/BF: UW->UW. Need further check the int pipeline restrictions.
     // F->F: UD->UD. Skip further check as UD support full regions.
     // DF->DF: UQ->UQ. Skip further check as UQ support full regions.
-    auto dstType = inst->getDst()->getType();
     if (IS_TYPE_FLOAT_ALL(dstType)) {
       auto intType = TypeSize(dstType) == 8
                          ? Type_UQ
@@ -2604,13 +2699,15 @@ G4_SubReg_Align HWConformityPro::getDclAlignment(int opndBytes,
   return subAlign;
 }
 
+// Insert a mov instruction from (*it)->getSrc(srcNum) to a tmp before 'it'.
+//
+// sameExecSize:
+//   if true, mov is forced to use the execSize of (*it); otherwise, mov
+//   generally uses SIMD1 if (*it)->getSrc(srcNum) is scalar (there may be
+//   special cases; see code for details).
 std::pair<G4_Operand *, bool> HWConformityPro::insertMovBeforeAndGetInserted(
-    INST_LIST_ITER it,
-                                                                              G4_BB *bb,
-                                                                              uint32_t srcNum,
-                                                                              G4_Type type,
-                                                                              uint16_t tmpStride,
-                                                                              G4_SubReg_Align tmpAlign) {
+    INST_LIST_ITER it, G4_BB *bb, uint32_t srcNum, G4_Type type,
+    uint16_t tmpStride, G4_SubReg_Align tmpAlign, bool sameExecSize) {
   G4_INST *inst = *it;
   G4_SubReg_Align subAlign;
   const RegionDesc *region = nullptr;
@@ -2625,10 +2722,12 @@ std::pair<G4_Operand *, bool> HWConformityPro::insertMovBeforeAndGetInserted(
       IS_BTYPE(src->getType()) && src->getType() == type ? 2 : 1;
 
   G4_ExecSize newExecSize =
-      (src->isImm() && !IS_VTYPE(src->getType())) ||
-              (src->isSrcRegRegion() && src->asSrcRegRegion()->isScalar())
-          ? g4::SIMD1
-          : execSize;
+      sameExecSize ? execSize
+                   : ((src->isImm() && !IS_VTYPE(src->getType())) ||
+                              (src->isSrcRegRegion() &&
+                               src->asSrcRegRegion()->isScalar())
+                          ? g4::SIMD1
+                          : execSize);
 
   if (newExecSize > 1) {
     if (tmpStride) {
@@ -2692,12 +2791,10 @@ std::pair<G4_Operand *, bool> HWConformityPro::insertMovBeforeAndGetInserted(
 }
 
 std::pair<G4_DstRegRegion *, bool>
-HWConformityPro::insertMovAfterAndGetInserted(INST_LIST_ITER it,
-                                                                                  G4_BB *bb,
-                                                                                  G4_DstRegRegion* dst,
-                                                                                  G4_Type type,
-                                                                                  uint16_t tmpStride,
-                                                                                  G4_SubReg_Align dstAlign) {
+HWConformityPro::insertMovAfterAndGetInserted(INST_LIST_ITER it, G4_BB *bb,
+                                              G4_DstRegRegion *dst,
+                                              G4_Type type, uint16_t tmpStride,
+                                              G4_SubReg_Align dstAlign) {
   G4_INST *inst = *it;
   bool wasMovInserted = false;
 
@@ -2830,6 +2927,13 @@ void HWConformityPro::fixMov(INST_LIST_ITER it, G4_BB *bb) {
 
   auto dstType = inst->getDst()->getType();
   auto srcType = inst->getSrc(0)->getType();
+
+  if (inst->getSrc(0)->isSrcRegRegion() && srcType == Type_TF32 &&
+      (dstType == Type_TF32 || dstType == Type_F)) {
+    // f<-tf32 and tf32<-tf32 are raw copies, retype both to ud.
+    inst->setIntTypeForRawMov();
+    return;
+  }
 
   bool dstByteSrc64b =
       IS_BTYPE(dstType) && (IS_DFTYPE(srcType) || IS_QTYPE(srcType));
@@ -3228,73 +3332,53 @@ void HWConformityPro::fixDstSrcOverlap(INST_LIST_ITER it, G4_BB *bb) {
     G4_Declare *srcDcl = src->getTopDcl();
     if (srcDcl == dstDcl && srcRg->getRegAccess() == Direct &&
         srcRg->getBase()->isRegVar()) {
-      bool srcCrossGRF =
-          ((srcRg->getSubRegOff() * srcRg->getTypeSize()) % grfSize +
-           (srcRg->getLinearizedEnd() - srcRg->getLinearizedStart()) + 1) >
-          grfSize;
       bool srcCross2GRF =
           ((srcRg->getSubRegOff() * srcRg->getTypeSize()) % grfSize +
            (srcRg->getLinearizedEnd() - srcRg->getLinearizedStart()) + 1) >
           grfSize * 2;
 
-      // The half define in region rule "second half of a source operand
-      // must not point to the same register as the first half of
-      // destination operand in a compressed instruction" is exactly size
-      // half, not GRF boundary based half.
-      int srcSecondHalf = 0;
-      if (srcRg->getRegion()->isContiguous(
-              inst->getExecSize())) { // For contiguous region, linear
-                                      // start/end can be used to calculate
-                                      // the start GRF of half size of
-                                      // region
-        srcSecondHalf =
-            (srcRg->getLinearizedStart() +
-             ((srcRg->getLinearizedEnd() - srcRg->getLinearizedStart() + 1) /
-              2)) /
-            grfSize;
-      } else {
-        // For non-congtiguous region, there are holes in the region,
-        // the start of second half elements need be calcauted in
-        // stride and elemement sizes at same time.
-        // Such as in following cases, there is no first/second half overlap
-        // issues.
-        // add(M1, 32) V146(0,1)<2> V146(0,1)<2;1,0> V146(0,0)<2;1,0>
-        // add(M1, 16) V147(0,2)<4> V147(0,2)<4;1,0> V147(0,1)<4;1,0>
-        // add(M1, 16) V148(0,3)<4> V148(0,3)<4;1,0> V148(0,1)<4;1,0>
-        const RegionDesc *regionDesc = srcRg->getRegion();
-        uint16_t vertSize = regionDesc->vertStride * srcRg->getElemSize();
-        uint16_t execTypeSize =
-            regionDesc->horzStride == 0
-                ? srcRg->getElemSize()
-                : regionDesc->horzStride * srcRg->getElemSize();
-        uint16_t rowSize = regionDesc->horzStride == 0
-                               ? execTypeSize
-                               : regionDesc->width * execTypeSize,
-                 numRows = regionDesc->vertStride == 0
-                               ? 1
-                               : inst->getExecSize() / regionDesc->width,
-                 numElePerRow = rowSize / execTypeSize,
-                 numExecEmePerRow =
-                     regionDesc->horzStride == 0 ? 1 : regionDesc->width;
-        uint16_t totalNumEle = (regionDesc->vertStride >= numElePerRow)
-                                   ? (numRows * numExecEmePerRow)
-                                   : (srcRg->getLinearizedEnd() -
-                                      srcRg->getLinearizedStart() + 1) /
-                                         execTypeSize;
-        srcSecondHalf =
-            (srcRg->getLinearizedStart() + (totalNumEle / 2) * vertSize) /
-            grfSize;
-      }
+      // The destination's first/second "part" split happens
+      // where the destination physically crosses its GRF boundary -- 1 GRF
+      // in for the 2-GRF case, 2 GRFs in for the 4-GRF case -- not
+      // necessarily at execSize/2. Use that channel index (rather than the
+      // source's own span midpoint) to locate the source bytes that must
+      // not overlap the destination's first part.
+      unsigned dstStartByte = dst->getLinearizedStart();
+      unsigned dstPitch = dst->getHorzStride() * dst->getTypeSize();
+      unsigned dstFirstGRFStart = (dstStartByte / grfSize) * grfSize;
+      const RegionDesc *regionDesc = srcRg->getRegion();
+      // Byte offset of the source element that lines up with the
+      // destination channel `numGRFs` GRFs past dstFirstGRFStart.
+      auto srcOffsetAtBoundary = [&](unsigned numGRFs) {
+        unsigned dstHalfBoundary = dstFirstGRFStart + numGRFs * grfSize;
+        unsigned bytesToGRFBoundary = dstHalfBoundary - dstStartByte;
+        // Round up: bytesToGRFBoundary may not be an exact multiple of
+        // dstPitch (e.g. when dst is strided, horzStride > 1), so K can
+        // land a few bytes past the actual GRF boundary rather than
+        // exactly on it. Either way, K is the smallest channel index
+        // whose byte offset is at or past the boundary -- i.e. the first
+        // channel of the destination's second part.
+        unsigned K = (bytesToGRFBoundary + dstPitch - 1) / dstPitch;
+        unsigned row = K / regionDesc->width;
+        unsigned col = K % regionDesc->width;
+        return srcRg->getLinearizedStart() +
+               row * regionDesc->vertStride * srcRg->getElemSize() +
+               col * regionDesc->horzStride * srcRg->getElemSize();
+      };
 
       if (dstCross2GRF || srcCross2GRF) {
         if (inst->opcode() == G4_mullh || inst->opcode() == G4_madw) {
           // Special case for SIMD32 mullh/madw instruction:
-          // The dst occupies 4 contiguous GRFs and src occupies 2 contiguous
-          // GRFs. But the first phase will write to the 1st and 3rd GRF of
-          // dst. For example:
+          // The dst is a wide-dst SOA operand: low result in the 1st/2nd
+          // GRF, high result in the 3rd/4th. dstCross2GRF reflects that
+          // combined 4-GRF span and is always true here -- it is NOT the
+          // per-phase split point. The first phase always writes only the
+          // 1st and 3rd GRF of dst, i.e. the split is always exactly 1 GRF
+          // into each half, regardless of dstCross2GRF. For example:
           // mullh (32|M0)  r6.0<1>:ud  -(abs)r7.0<1;1,0>:ud  -r19.0<1;1,0>:d
           // The 1st phase will write r6 and r8, and the 2nd phase will read
           // r8 as source. So, dst and src are overlapped.
+          int srcSecondHalf = srcOffsetAtBoundary(1) / grfSize;
           if (dstFirstHalf == srcSecondHalf ||
               (dstFirstHalf + 2) == srcSecondHalf) {
             srcOverlap = true;
@@ -3308,20 +3392,42 @@ void HWConformityPro::fixDstSrcOverlap(INST_LIST_ITER it, G4_BB *bb) {
           // add (32|M0) r6.0<1>:q  r4.0<1;1,0>:q  r10.0<0;1,0>:q
           // add (32|M0) r6.0<1>:q  r5.0<1;1,0>:q  r10.0<0;1,0>:q
           // Above instructions all have dst and src0 overlapped
-          int dstFisrtHalfLeftBound = dstFirstHalf;
+          int srcSecondHalf =
+              srcOffsetAtBoundary(dstCross2GRF ? 2u : 1u) / grfSize;
+          int dstFirstHalfLeftBound = dstFirstHalf;
           int dstFirstHalfRightBound =
               dstCross2GRF ? (dstFirstHalf + 1) : dstFirstHalf;
           int srcSecondHalfLeftBound = srcSecondHalf;
           int srcSecondHalfRightBound =
               srcCross2GRF ? (srcSecondHalf + 1) : srcSecondHalf;
           if (srcSecondHalfLeftBound <= dstFirstHalfRightBound &&
-              srcSecondHalfRightBound >= dstFisrtHalfLeftBound) {
+              srcSecondHalfRightBound >= dstFirstHalfLeftBound) {
             srcOverlap = true;
             break;
           }
         }
-      } else if (dstCrossGRF || srcCrossGRF) {
-        if (dstFirstHalf == srcSecondHalf) {
+      } else if (dstCrossGRF) {
+        // HW restriction: "A compressed instruction spans across 2 adjacent
+        // destination registers and is split into 2 parts. The source
+        // operand of the second part must not overlap with the destination
+        // operand of the first part." The split point is where the
+        // destination crosses its GRF boundary, which only coincides with
+        // execSize/2 when dst is GRF-aligned. dstCross2GRF is false here, so
+        // boundary=1 is exactly the 1-GRF boundary this branch cares about.
+        //
+        // Note: this is a coarse range check with GRF granularity instead
+        // of DW-channel granularity -- it flags overlap whenever the source's
+        // tail *span* touches dst's first GRF at all, rather than checking
+        // whether the source's tail bytes actually coincide with dst's
+        // (possibly strided, non-contiguous) first-part bytes at DW
+        // granularity. So, some strided cases (e.g. dst horzStride > 1) have
+        // no true DW-granularity overlap here but still get the (unnecessary
+        // but safe) temp-copy. For example:
+        //   bfrev (4|M16)  r12.8<4>:ud  r12.11<2;1,0>:ud
+        unsigned srcKthOffset = srcOffsetAtBoundary(1);
+        unsigned srcSecondPartEnd = srcRg->getLinearizedEnd();
+        if (srcKthOffset <= dstFirstGRFStart + grfSize - 1 &&
+            srcSecondPartEnd >= dstStartByte) {
           srcOverlap = true;
           break;
         }
@@ -3718,11 +3824,18 @@ void HWConformityPro::fixAddcSubb(INST_LIST_ITER it, G4_BB *bb) {
   vISA_ASSERT(inst->getDst()->getType() == Type_UD,
               "dst of addc/subb must be :ud data type");
 
-  // Fix immediate src operand whose type can only be :ud
+  // addc/subb sources must be :ud.
   for (int i = 0; i < 2; i++) {
     G4_Operand *src = inst->getSrc(i);
-    if (src->isImm() && src->getType() == Type_UW) {
-      // Just change the immediate's type to :ud
+    if (src->isImm() && src->getType() == Type_UV) {
+      // A :uv immediate is per-lane; a scalar reinterpret would broadcast one
+      // value. Materialize it into a :ud temp (fixVectSrc() then legalizes the
+      // inserted mov's :uv source).
+      replaceSrc(it, bb, i, Type_UD, /*tmpStride*/ 0, /*tmpAlign*/ Any);
+    } else if (src->isImm() &&
+               (src->getType() == Type_UW || src->getType() == Type_D)) {
+      // Reinterpret the bit pattern as :ud. Safe for the low-32-bit sum and
+      // carry; sign extension of a :d addend is handled in fixMadw().
       uint32_t immVal = (uint32_t)src->asImm()->getImm();
       inst->setSrc(builder.createImm(immVal, Type_UD), i);
     } else if (src->isSrcRegRegion() && src->getType() == Type_D) {
@@ -3778,9 +3891,13 @@ void HWConformityPro::fixVectSrc(INST_LIST_ITER it, G4_BB *bb) {
 
     G4_Type moveTy = (ty == Type_V) ? Type_W : Type_UW;
 
+    // A mov inserted is forced to use inst's execSize if sameExecSize=true.
+    bool sameExecSize = false;
+
     if (!dstAligned || IS_TYPE_FLOAT_ALL(dst->getType()) ||
         incompatibleSrcTypeFound) {
-      replaceSrc(it, bb, i, moveTy, /*tmpStride*/ 0, /*tmpAlign*/ Any);
+      replaceSrc(it, bb, i, moveTy, /*tmpStride*/ 0, /*tmpAlign*/ Any,
+                 sameExecSize);
     } else if (dstStrideInBytes != TypeSize(moveTy)) {
       if (dstStrideInBytes == 4 && execSize < 8) {
         // For the case where dst is dword and execution size is < 8,
@@ -3796,7 +3913,8 @@ void HWConformityPro::fixVectSrc(INST_LIST_ITER it, G4_BB *bb) {
         }
         inst->setSrc(builder.createImm(bitValue, ty), i);
       } else {
-        replaceSrc(it, bb, i, moveTy, /*tmpStride*/ 0, /*tmpAlign*/ Any);
+        replaceSrc(it, bb, i, moveTy, /*tmpStride*/ 0, /*tmpAlign*/ Any,
+                   sameExecSize);
       }
     }
   }

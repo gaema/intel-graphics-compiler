@@ -82,6 +82,7 @@ private:
   // HasMxfp - True if subtarget supports mxfp* operations
   bool HasMxfp = false;
 
+
   // HasIEEEDivSqrt - True if subtarget supports IEEE-754 div and sqrt
   bool HasIEEEDivSqrt = false;
 
@@ -287,6 +288,11 @@ public:
   bool isInternalIntrinsicSupported(unsigned ID) const;
 
 public:
+  // GenX does not use the target-independent code generator, so it has no
+  // register information. LLVM 22 made getRegisterInfo() a pure virtual, so
+  // provide a trivial override.
+  const TargetRegisterInfo *getRegisterInfo() const override { return nullptr; }
+
   /// * translateMediaWalker - true if translate media walker APIs
   bool translateMediaWalker() const { return !HasMediaWalker; }
 
@@ -350,6 +356,7 @@ public:
 
   /// * hasMxfp - true if target supports mxfp* operations
   bool hasMxfp() const { return HasMxfp; }
+
 
   /// * hasIEEEDivSqrt - true if target supports IEEE-754 div and sqrt
   bool hasIEEEDivSqrt() const { return HasIEEEDivSqrt; }

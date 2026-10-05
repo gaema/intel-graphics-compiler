@@ -968,6 +968,34 @@ void StatelessToStateful::addToPromotionMap(Instruction &I, Value *Ptr,
       m_promotionMap.size() < maxPromotionCount &&
       pointerIsPositiveOffsetFromKernelArgument(m_F, Ptr, offset, baseArgNumber, true, OriginalInstructionAlignment);
 
+  // Skip only bindful a32 promotions in bindless+buffer_offset no-large mode.
+  // Bindless stateful ldraw.indexed loads are allowed (they are fast).
+  if (isPromotable) {
+    ModuleMetaData *modMD = getAnalysis<MetaDataUtilsWrapper>().getModuleMetaData();
+    const bool skipLoadPromotionForBindlessBufferOffset = modMD->compOpt.UseBindlessMode &&
+                                                          modMD->compOpt.HasBufferOffsetArg &&
+                                                          !modMD->compOpt.GreaterThan4GBBufferRequired;
+
+    const bool isLoadPromotionCandidate = I.getOpcode() == Instruction::Load;
+    const bool isBindfulMode = m_targetAddressing == TargetAddressing::BINDFUL;
+    // Identify MTL-H (Xe-LPG, release=GFX_GMD_ARCH_12_RELEASE_XE_LP_LG) as the platform
+    // with slow bindless loads. MTL-H is the only variant where bindless load promotion
+    // regresses performance (arch=12, release=71).
+    // Use both enum (IGFX_METEORLAKE) and ip_version (release=XE_LP_LG=71) checks to
+    // exclude ARL-S which is mapped to IGFX_METEORLAKE offline but has release=XE_LP_MD=70.
+    // ARL-H uses Xe-LPG+ and is not affected anyway (different release value).
+    const auto &platform = m_ctx->platform.getPlatformInfo();
+    const bool isSlowBindlessLoadPlatform =
+        platform.eProductFamily == IGFX_METEORLAKE && platform.sRenderBlockID.GmdID.GMDArch == GFX_GMD_ARCH_12 &&
+        platform.sRenderBlockID.GmdID.GMDRelease == GFX_GMD_ARCH_12_RELEASE_XE_LP_LG;
+
+    // Keep MTL-H on the conservative path: bindless load promotion regresses performance there.
+    if (skipLoadPromotionForBindlessBufferOffset && isLoadPromotionCandidate &&
+        (isBindfulMode || isSlowBindlessLoadPlatform)) {
+      return;
+    }
+  }
+
   if (isPromotable) {
     InstructionInfo II(&I, Ptr, offset);
     m_promotionMap[baseArgNumber].push_back(II);
@@ -1066,10 +1094,30 @@ void StatelessToStateful::visitCallInst(CallInst &I) {
 
 void StatelessToStateful::visitLoadInst(LoadInst &I) {
   Value *ptr = I.getPointerOperand();
+
+  ModuleMetaData *modMD = getAnalysis<MetaDataUtilsWrapper>().getModuleMetaData();
+  const bool skipLoadPromotionForBindlessBufferOffset = modMD->compOpt.UseBindlessMode &&
+                                                        modMD->compOpt.HasBufferOffsetArg &&
+                                                        !modMD->compOpt.GreaterThan4GBBufferRequired;
+
+  // Skip only bindful a32 loads and MTL-H bindless loads in bindless+buffer_offset no-large mode.
+  // Use both enum (IGFX_METEORLAKE) and ip_version (release=XE_LP_LG=71) checks to
+  // exclude ARL-S which is mapped to IGFX_METEORLAKE offline but has release=XE_LP_MD=70.
+  const bool isBindfulMode = m_targetAddressing == TargetAddressing::BINDFUL;
+  const auto &platform = m_ctx->platform.getPlatformInfo();
+  const bool isSlowBindlessLoadPlatform = platform.eProductFamily == IGFX_METEORLAKE &&
+                                          platform.sRenderBlockID.GmdID.GMDArch == GFX_GMD_ARCH_12 &&
+                                          platform.sRenderBlockID.GmdID.GMDRelease == GFX_GMD_ARCH_12_RELEASE_XE_LP_LG;
+
+  if (skipLoadPromotionForBindlessBufferOffset && pointerIsFromKernelArgument(*ptr) &&
+      (isBindfulMode || isSlowBindlessLoadPlatform)) {
+    return;
+  }
+
   addToPromotionMap(I, ptr, I.getAlign());
 
   // check if there's non-kernel-arg load/store
-  if (IGC_IS_FLAG_ENABLED(DumpHasNonKernelArgLdSt) && ptr != nullptr && !pointerIsFromKernelArgument(*ptr)) {
+  if (IGC_IS_FLAG_ENABLED(DumpHasNonKernelArgLdSt) && !pointerIsFromKernelArgument(*ptr)) {
     ModuleMetaData *modMD = getAnalysis<MetaDataUtilsWrapper>().getModuleMetaData();
     FunctionMetaData *funcMD = &modMD->FuncMD[m_F];
     funcMD->hasNonKernelArgLoad = true;
@@ -1080,7 +1128,7 @@ void StatelessToStateful::visitStoreInst(StoreInst &I) {
   Value *ptr = I.getPointerOperand();
   addToPromotionMap(I, ptr, I.getAlign());
 
-  if (IGC_IS_FLAG_ENABLED(DumpHasNonKernelArgLdSt) && ptr != nullptr && !pointerIsFromKernelArgument(*ptr)) {
+  if (IGC_IS_FLAG_ENABLED(DumpHasNonKernelArgLdSt) && !pointerIsFromKernelArgument(*ptr)) {
     ModuleMetaData *modMD = getAnalysis<MetaDataUtilsWrapper>().getModuleMetaData();
     FunctionMetaData *funcMD = &modMD->FuncMD[m_F];
     funcMD->hasNonKernelArgStore = true;

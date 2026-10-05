@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2024 Intel Corporation
+Copyright (C) 2017-2026 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -71,7 +71,7 @@ static void ProcessDbgValueInst(BasicBlock &blk, DominatorTree *DT) {
         ToMove.emplace_back(E, &*def->getParent()->getFirstInsertionPt());
       } else {
         ToMove.emplace_back(E, IGCLLVM::getNextNonDebugInstruction(def));
-        IGC_ASSERT(!isa<BranchInst>(def));
+        IGC_ASSERT((!isa<IGCLLVM::CondBrInst, IGCLLVM::UncondBrInst>(def)));
       }
     });
   }
@@ -126,6 +126,28 @@ static BasicBlock *findLowestSinkTarget(Instruction *inst, SmallPtrSetImpl<Instr
         return nullptr;
       }
     }
+    // Skip uses in blocks that are unreachable from the entry. Such blocks are
+    // not present in the dominator tree, so querying them via
+    // findNearestCommonDominator()/getNode() below would dereference a null
+    // DomTreeNode and crash. Skipping the use keeps tgtBlk built only
+    // from reachable blocks, so the instruction can still sink towards its
+    // remaining live uses in the mixed case. If every use is unreachable
+    // the value is dead and tgtBlk stays null, so nothing is sunk.
+    // Example (%p is defined in a reachable block but used only in the
+    // unreachable OutputsFlush block):
+    //   GlobalScopeInitialization:         ; reachable, has a successor
+    //     %p = inttoptr i64 %v to i64 addrspace(1)*
+    //     br label %body
+    //   body:
+    //     call void @llvm.genx.GenISA.discard(i1 true)
+    //     ret void
+    //   dead.exit:                         ; No predecessors! -> unreachable
+    //     br label %OutputsFlush
+    //   OutputsFlush:                      ; reachable only from %dead.exit
+    //     call void @llvm.genx.GenISA.OUTPUTPS.f32.p1i64(..., i64 addrspace(1)* %p)
+    if (!DT->isReachableFromEntry(useBlock)) {
+      continue;
+    }
     if (tgtBlk == nullptr) {
       tgtBlk = useBlock;
     } else {
@@ -159,6 +181,44 @@ static BasicBlock *findLowestSinkTarget(Instruction *inst, SmallPtrSetImpl<Instr
     }
   }
   return nullptr;
+}
+
+// Latency-hiding sink heuristic (regkey EnableSampleResultLatencySink).
+// Returns true if 'inst's operands trace back through extractelement/extractvalue
+// and simple ALU/casts to a long-latency send (sample/gather4/ld/resinfo/sampler-
+// load) pinned above it in the same block. Sinking such a consumer delays the send
+// result read, hiding the send latency.
+static bool isLongLatencySendConsumer(Instruction *inst) {
+  auto isLongLatencySend = [](Instruction *I) {
+    return isSampleInstruction(I) || isGather4Instruction(I) || isInfoInstruction(I) || isLdInstruction(I) ||
+           isa<SamplerLoadIntrinsic>(I);
+  };
+
+  BasicBlock *BB = inst->getParent();
+  SmallPtrSet<Instruction *, 16> Visited;
+  SmallVector<Instruction *, 16> WorkList;
+  auto pushOperands = [&](Instruction *I) {
+    for (Value *Op : I->operands())
+      if (auto *OpI = dyn_cast<Instruction>(Op))
+        WorkList.push_back(OpI);
+  };
+
+  pushOperands(inst);
+  while (!WorkList.empty()) {
+    Instruction *Cur = WorkList.pop_back_val();
+    if (!Visited.insert(Cur).second)
+      continue;
+    // Only follow the chain while it stays pinned above 'inst' in the same block.
+    if (Cur->getParent() != BB)
+      continue;
+    if (isLongLatencySend(Cur))
+      return true;
+    // Forward only through cheap, side-effect-free value-forwarding ops so we do not
+    // accidentally classify an unrelated memory/side-effecting op as a hideable chain.
+    if (isa<ExtractElementInst>(Cur) || isa<ExtractValueInst>(Cur) || isa<BinaryOperator>(Cur) || isa<CastInst>(Cur))
+      pushOperands(Cur);
+  }
+  return false;
 }
 
 static bool isCastInstrReducingPressure(Instruction *Inst, bool FlagPressureAware) {
@@ -196,21 +256,6 @@ static unsigned numInsts(const Function &F) {
   return std::count_if(llvm::inst_begin(F), llvm::inst_end(F), [](const auto &I) { return !isDbgIntrinsic(&I); });
 }
 
-static bool isDPAS(Value *V) {
-  GenIntrinsicInst *Intr = dyn_cast<GenIntrinsicInst>(V);
-  if (!Intr)
-    return false;
-  switch (Intr->getIntrinsicID()) {
-  case GenISAIntrinsic::GenISA_dpas:
-  case GenISAIntrinsic::GenISA_sub_group_dpas:
-  case GenISAIntrinsic::GenISA_sub_group_bdpas:
-    return true;
-  default:
-    break;
-  }
-  return false;
-};
-
 /// ===================== ///
 /// Non-loop code sinking ///
 /// ===================== ///
@@ -226,6 +271,8 @@ IGC_INITIALIZE_PASS_DEPENDENCY(PostDominatorTreeWrapperPass)
 IGC_INITIALIZE_PASS_DEPENDENCY(LoopInfoWrapperPass)
 IGC_INITIALIZE_PASS_DEPENDENCY(TargetLibraryInfoWrapperPass)
 IGC_INITIALIZE_PASS_DEPENDENCY(CodeGenContextWrapper)
+IGC_INITIALIZE_PASS_DEPENDENCY(IGCLivenessAnalysis)
+IGC_INITIALIZE_PASS_DEPENDENCY(IGCFunctionExternalRegPressureAnalysis)
 IGC_INITIALIZE_PASS_END(CodeSinking, PASS_FLAG, PASS_DESCRIPTION, PASS_CFG_ONLY, PASS_ANALYSIS)
 
 char CodeSinking::ID = 0;
@@ -240,8 +287,7 @@ bool CodeSinking::treeSink(Function &F) {
   do {
     IterChanged = false;
     // Process all basic blocks in dominator-tree post-order
-    for (po_iterator<DomTreeNode *> domIter = po_begin(DT->getRootNode()), domEnd = po_end(DT->getRootNode());
-         domIter != domEnd; ++domIter) {
+    for (DomTreeNode *domIter : llvm::post_order(DT->getRootNode())) {
       IterChanged |= processBlock(*(domIter->getBlock()));
     }
   } while (IterChanged);
@@ -281,6 +327,29 @@ bool CodeSinking::runOnFunction(Function &F) {
   LI = &getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
   DL = &F.getParent()->getDataLayout();
 
+  // Latency-hiding sink (EnableSampleResultLatencySink) setup; the per-target-block gate
+  // lives in hasRegPressureHeadroomForLatencySink().
+  latencySinkEnabled = false;
+  RPE = nullptr;
+  WI = nullptr;
+  latencySinkBBPressure.clear();
+  // Pixel shaders are skipped due to the regressions in both spill and GPU-cycle.
+  // Retries are skipped too.
+  if (IGC_IS_FLAG_ENABLED(EnableSampleResultLatencySink) && CTX->platform.supportsSampleResultLatencySink() &&
+      CTX->type != ShaderType::PIXEL_SHADER && CTX->m_retryManager && CTX->m_retryManager->IsFirstTry()) {
+    RPE = &getAnalysis<IGCLivenessAnalysis>().getLivenessRunner();
+    auto &FRPE = getAnalysis<IGCFunctionExternalRegPressureAnalysis>();
+    WI = &FRPE.getWIAnalysis(&F);
+    latencySinkExternalPressure = FRPE.getExternalPressureForFunction(&F);
+    // One IR feeds every SIMD mode's EmitPass and non-uniform live ranges cost 2x the GRF
+    // at SIMD32, so budget the widest mode. Guessing SIMD16 let sinks overflow SIMD32.
+    // Only an OCL required sub-group size pins it narrower.
+    unsigned pinnedSimd = (unsigned)IGC::getSIMDSize(CTX->getModuleMetaData(), &F);
+    latencySinkSimd = pinnedSimd ? pinnedSimd : numLanes(SIMDMode::SIMD32);
+    latencySinkBudget = CTX->getNumGRFPerThread(true, &F);
+    latencySinkEnabled = true;
+  }
+
   bool Changed = treeSink(F);
 
   if (Changed) {
@@ -299,7 +368,7 @@ bool CodeSinking::processBlock(BasicBlock &blk) {
   if (blk.empty())
     return false;
 
-  uint32_t registerPressureThreshold = CTX->getNumGRFPerThread();
+  uint32_t registerPressureThreshold = CTX->getNumGRFPerThread(true, blk.getParent());
 
   uint pressure0 = 0;
   if (registerPressureThreshold) {
@@ -331,7 +400,7 @@ bool CodeSinking::processBlock(BasicBlock &blk) {
       prevLoca = inst;
     }
     // intrinsic like discard has no explict use, gets skipped here
-    else if (isa<DbgInfoIntrinsic>(inst) || inst->isTerminator() || isa<PHINode>(inst) || inst->use_empty()) {
+    else if (isDebugInst(inst) || inst->isTerminator() || isa<PHINode>(inst) || inst->use_empty()) {
       prevLoca = inst;
     } else {
       Instruction *undoLoca = prevLoca;
@@ -369,6 +438,27 @@ bool CodeSinking::processBlock(BasicBlock &blk) {
   return madeChange;
 }
 
+// Is there GRF headroom in 'TgtBB' to absorb a latency sink? The send stays put and its
+// consumer moves into TgtBB, so TgtBB is the block whose pressure grows; unchecked, this
+// spills in shaders already near the budget.
+bool CodeSinking::hasRegPressureHeadroomForLatencySink(BasicBlock *TgtBB) {
+  if (!latencySinkEnabled)
+    return false;
+  // Budget unknown (0): stay permissive for LIT tests.
+  if (latencySinkBudget == 0)
+    return true;
+
+  auto It = latencySinkBBPressure.find(TgtBB);
+  if (It == latencySinkBBPressure.end()) {
+    unsigned Pressure = RPE->getMaxRegCountForBB(*TgtBB, latencySinkSimd, WI) + latencySinkExternalPressure;
+    It = latencySinkBBPressure.try_emplace(TgtBB, Pressure).first;
+  }
+
+  // Percent of the GRF budget below which the sink is allowed.
+  const unsigned MaxPercent = 50;
+  return (uint64_t)It->second * 100 <= (uint64_t)latencySinkBudget * MaxPercent;
+}
+
 bool CodeSinking::sinkInstruction(Instruction *InstToSink, SmallPtrSetImpl<Instruction *> &Stores) {
   // Check if it's safe to move the instruction.
   bool HasAliasConcern = false;
@@ -381,6 +471,7 @@ bool CodeSinking::sinkInstruction(Instruction *InstToSink, SmallPtrSetImpl<Instr
   // decide.
   BasicBlock *SuccToSinkTo = nullptr;
   SmallPtrSet<Instruction *, 16> UsesInBB;
+  bool LatencySink = false;
 
   if (!HasAliasConcern) {
     // find the lowest common dominator of all uses
@@ -388,7 +479,13 @@ bool CodeSinking::sinkInstruction(Instruction *InstToSink, SmallPtrSetImpl<Instr
     if (BasicBlock *TgtBB = findLowestSinkTarget(InstToSink, UsesInBB, IsOuterLoop, false, DT, LI)) {
       // heuristic, avoid code-motion that does not reduce execution frequency
       // but may increase register usage
-      if (ReducePressure || (TgtBB && (IsOuterLoop || !PDT->dominates(TgtBB, InstToSink->getParent())))) {
+      bool ReducesFrequency = TgtBB && (IsOuterLoop || !PDT->dominates(TgtBB, InstToSink->getParent()));
+      // Latency-hiding sink: sink a long-latency send's consumer chain with no RP or
+      // frequency win, if TgtBB has GRF headroom. Operands are ordered cheapest-first for
+      // compile time.
+      LatencySink = !ReducePressure && !ReducesFrequency && latencySinkEnabled &&
+                    isLongLatencySendConsumer(InstToSink) && hasRegPressureHeadroomForLatencySink(TgtBB);
+      if (ReducePressure || ReducesFrequency || LatencySink) {
         SuccToSinkTo = TgtBB;
       }
     } else {
@@ -429,6 +526,13 @@ bool CodeSinking::sinkInstruction(Instruction *InstToSink, SmallPtrSetImpl<Instr
 
   if (!ReducePressure || HasAliasConcern) {
     IGCLLVM::moveBefore(InstToSink, &(*SuccToSinkTo->getFirstInsertionPt()));
+    // For latency-hiding sinks, additionally schedule a local sink so the consumer
+    // lands right before its use inside the target block instead of at the block top,
+    // maximizing the independent work between the pinned send and this result read.
+    if (LatencySink && !UsesInBB.empty()) {
+      LocalBlkSet.insert(SuccToSinkTo);
+      LocalInstSet.insert(InstToSink);
+    }
   }
   // when alasing is not an issue and reg-pressure is not an issue
   // move it as close to the uses as possible
@@ -519,6 +623,10 @@ bool CodeSinking::isSafeToMove(Instruction *inst, bool &reducePressure, bool &ha
     return true;
   }
   if (isSampleInstruction(inst) || isGather4Instruction(inst) || isInfoInstruction(inst) || isLdInstruction(inst)) {
+    // A sampler deliberately raised by InstructionHoistingOptimization for
+    // latency must not be sunk back toward its consumer.
+    if (inst->getMetadata(MD_LATENCY_HOISTED_SAMPLE))
+      return false;
     if (IGC_IS_FLAG_ENABLED(DisableCodeSinkingLongLatencyInsts)) {
       // TBD: Support more long latency instructions in the future
       // Currently, Sample instructions only.
@@ -613,7 +721,7 @@ uint CodeSinking::estimateLiveOutPressure(BasicBlock *blk, const DataLayout *DL)
     if (!processedBegin)
       --I;
 
-    if (isa<DbgInfoIntrinsic>(inst))
+    if (isDebugInst(inst))
       continue;
     // intrinsic like discard has no explicit use, get skipped here
     if (inst->use_empty())
@@ -804,7 +912,7 @@ void CodeLoopSinking::dumpToFile(const std::string &Log) {
 uint CodeLoopSinking::getMaxRegCountForLoop(Loop *L) {
   IGC_ASSERT(RPE);
   Function *F = L->getLoopPreheader()->getParent();
-  uint SIMD = numLanes(RPE->bestGuessSIMDSize(F, FGA));
+  uint SIMD = numLanes(IGC::bestGuessSIMDSize(CTX, F, FGA));
   unsigned int Max = 0;
   for (BasicBlock *BB : L->getBlocks()) {
     auto BBPressureEntry = BBPressures.try_emplace(BB);
@@ -843,8 +951,13 @@ bool CodeLoopSinking::loopSink(Function &F) {
       Changed |= loopSink(L, SinkMode);
   }
 
+  uint SIMD = numLanes(IGC::bestGuessSIMDSize(CTX, &F, FGA));
+  PressurePair ExternalPair = FRPE->getExternalPressurePairForFunction(&F);
   unsigned int MaxPressure = getMaxRegCountForFunction(&F);
-  RPE->publishRegPressureMetadata(F, MaxPressure + FRPE->getExternalPressureForFunction(&F));
+  unsigned RegSize = CTX->platform.getGRFSize();
+  PressurePair Pair = {MaxPressure * RegSize, 0};
+  RPE->publishNormalizedPressurePair(F, Pair + ExternalPair, SIMD);
+
   return Changed;
 }
 
@@ -857,8 +970,8 @@ LoopSinkMode CodeLoopSinking::needLoopSink(Loop *L) {
 
   Function *F = Preheader->getParent();
   uint GRFThresholdDelta = IGC_GET_FLAG_VALUE(LoopSinkThresholdDelta);
-  uint NGRF = CTX->getNumGRFPerThread();
-  uint SIMD = numLanes(RPE->bestGuessSIMDSize(F, FGA));
+  uint NGRF = CTX->getNumGRFPerThread(true, F);
+  uint SIMD = numLanes(IGC::bestGuessSIMDSize(CTX, F, FGA));
 
   PrintDump(VerbosityLevel::Low, "\n");
   if (!Preheader->getName().empty()) {
@@ -966,7 +1079,7 @@ bool CodeLoopSinking::loopSink(Loop *L, LoopSinkMode Mode) {
   PrintDump(VerbosityLevel::Low, ">> Sinking in the loop with preheader " << Preheader->getName() << "\n");
 
   Function *F = Preheader->getParent();
-  uint NGRF = CTX->getNumGRFPerThread();
+  uint NGRF = CTX->getNumGRFPerThread(true, F);
 
   uint InitialLoopPressure = getMaxRegCountForLoop(L);
   uint MaxLoopPressure = InitialLoopPressure;
@@ -991,12 +1104,14 @@ bool CodeLoopSinking::loopSink(Loop *L, LoopSinkMode Mode) {
   for (BasicBlock *BB : L->blocks())
     AffectedBBs.insert(BB);
 
-  // Save original positions for rollback
+  // Save original positions for rollback. Skipping the terminator: re-moving it strands
+  // its DbgRecords in the block's trailing marker, and it won't be sunk anyway.
   DenseMap<BasicBlock *, InstrVec> OriginalPositions;
   for (BasicBlock *BB : AffectedBBs) {
     InstrVec BBInstructions;
     for (Instruction &I : *BB)
-      BBInstructions.push_back(&I);
+      if (!I.isTerminator())
+        BBInstructions.push_back(&I);
     OriginalPositions[BB] = std::move(BBInstructions);
   }
 
@@ -1352,7 +1467,7 @@ bool CodeLoopSinking::loopSink(Loop *L, LoopSinkMode Mode) {
 
       // Getting the size of the sinked on this iteration candidates
       // Must be before local sinking
-      auto SIMD = numLanes(RPE->bestGuessSIMDSize(F, FGA));
+      auto SIMD = numLanes(IGC::bestGuessSIMDSize(CTX, F, FGA));
       ValueSet InstsSet;
       for (auto &Pair : CurrentInstToCandidate) {
         InstsSet.insert(Pair.first);
@@ -1463,7 +1578,7 @@ bool CodeLoopSinking::loopSink(Loop *L, LoopSinkMode Mode) {
   // more GRF will be enough to eliminate spills and we would degrade performance
   // if we sinked. So we rollback the changes if autoGRF is provided
   if (Mode == LoopSinkMode::SinkWhileRegpressureIsHigh && !AchievedNeededRegpressure &&
-      (NGRF <= 128 && CTX->isAutoGRFSelectionEnabled()) &&
+      (NGRF <= 128 && CTX->isAutoGRFSelectionEnabled(F)) &&
       MaxLoopPressure >= (NGRF + IGC_GET_FLAG_VALUE(LoopSinkRollbackThreshold))) {
     PrintDump(VerbosityLevel::Low, "AutoGRF is enabled and the needed regpressure is not achieved:\n");
     PrintDump(VerbosityLevel::Low, "New max loop pressure = " << MaxLoopPressure << "\n");

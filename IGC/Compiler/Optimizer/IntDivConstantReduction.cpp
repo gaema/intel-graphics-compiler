@@ -129,6 +129,8 @@ struct IntDivConstantReduction : public FunctionPass {
       result = expandPowerOf2Signed(B, isMod, divRem, dividend, divisorValue);
     } else if (!isSigned && divisorValue.isPowerOf2()) {
       result = expandPowerOf2Unsigned(B, dividend, divisorValue, isMod);
+    } else if (divisor->isZero()) {
+      result = PoisonValue::get(dividend->getType());
     } else {
       // non-power of twos require multiplication by a shifted reciprocal
       result = expandNonPowerOf2(F, divRem, B, dividend, divisor, isSigned, isMod);
@@ -190,7 +192,7 @@ struct IntDivConstantReduction : public FunctionPass {
     if (isMod) {
       // C.f. Hacker's Delight 10-2
       // faster than using the re-multiply quotient and subtract
-      result = B.CreateAnd(result, -(1LL << shiftAmt));
+      result = B.CreateAnd(result, llvm::ConstantInt::getSigned(result->getType(), -(1LL << shiftAmt)));
       result = B.CreateSub(dividend, result, "rem");
     } else {
       if (divisor.isNegative()) {

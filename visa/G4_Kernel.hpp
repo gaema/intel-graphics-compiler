@@ -170,6 +170,8 @@ public:
 
   unsigned getSpillThreshold(unsigned mode) const;
   unsigned getSpillThreshold() const { return getSpillThreshold(currentMode); }
+  void setDynamicSpillThreshold(unsigned val) { dynamicSpillThreshold = val; }
+  unsigned getDynamicSpillThreshold() const { return dynamicSpillThreshold; }
 
   bool canUpdateMode() const;
   unsigned getCurrentMode() const { return currentMode; }
@@ -298,8 +300,12 @@ private:
   // Per-BB spill threshold bonus in GRFs. Set explicitly by the pre-RA
   // scheduler via setSpillThresholdBonusInGRFs() to reflect BBs where spills
   // are cheap (sampler-heavy or cold BBs). Read by getSpillThreshold() to
-  // augment the platform base threshold.
+  // augment the base threshold.
   unsigned spillThresholdBonusInGRFs = 0;
+  // Dynamic base spill threshold (in bytes), pre-computed once before RA via
+  // setDynamicSpillThreshold(). Used by getSpillThreshold() as the base when
+  // no explicit vISA_SpillAllowed option is set.
+  unsigned dynamicSpillThreshold = 0;
 };
 
 // NoMask WA Information
@@ -605,6 +611,9 @@ private:
   // separate class (G4_IRInfo?).
   std::unordered_map<G4_INST *, G4_SrcRegRegion *> instImplicitAccSrc;
   std::unordered_map<G4_INST *, G4_DstRegRegion *> instImplicitAccDef;
+  // Page-fault WA: the data-return wait (mov) and its write; the local
+  // scheduler bundles each pair into one node to keep them adjacent.
+  std::unordered_set<G4_INST *> pageFaultWAInsts;
 
   // Kernel cost model
   std::unique_ptr<KernelCostInfo> m_kernelCost;
@@ -874,6 +883,10 @@ public:
   G4_DstRegRegion *getImplicitAccDef(G4_INST *inst) const {
     auto iter = instImplicitAccDef.find(inst);
     return iter == instImplicitAccDef.end() ? nullptr : iter->second;
+  }
+  void addPageFaultWAInst(G4_INST *inst) { pageFaultWAInsts.insert(inst); }
+  bool isPageFaultWAInst(const G4_INST *inst) const {
+    return pageFaultWAInsts.count(const_cast<G4_INST *>(inst)) != 0;
   }
   void setImplicitAccSrc(G4_INST *inst, G4_SrcRegRegion *accSrc) {
     // Do not allow null implicit acc operand.

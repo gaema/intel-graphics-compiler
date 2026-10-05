@@ -111,6 +111,10 @@ private:
   void replaceI1MinMax(IntrinsicInst *I);
   void replaceI64MinMax(IntrinsicInst *I);
   void replaceHalvesDivsSqrts(IntrinsicInst *I);
+  void replaceVectorReduce(IntrinsicInst *I);
+#if LLVM_VERSION_MAJOR >= 22
+  void replaceCmp(IntrinsicInst *I);
+#endif
 #if LLVM_VERSION_MAJOR >= 15
   void replaceIsFpClass(IntrinsicInst *I);
 #endif
@@ -153,6 +157,23 @@ const std::map<Intrinsic::ID, ReplaceUnsupportedIntrinsics::MemFuncPtr_t>
     { Intrinsic::experimental_constrained_sqrt, &ReplaceUnsupportedIntrinsics::replaceHalvesDivsSqrts},
 #if LLVM_VERSION_MAJOR >= 15
     { Intrinsic::is_fpclass,                    &ReplaceUnsupportedIntrinsics::replaceIsFpClass },
+#endif
+    { Intrinsic::vector_reduce_and,             &ReplaceUnsupportedIntrinsics::replaceVectorReduce },
+    { Intrinsic::vector_reduce_or,              &ReplaceUnsupportedIntrinsics::replaceVectorReduce },
+    { Intrinsic::vector_reduce_xor,             &ReplaceUnsupportedIntrinsics::replaceVectorReduce },
+    { Intrinsic::vector_reduce_add,             &ReplaceUnsupportedIntrinsics::replaceVectorReduce },
+    { Intrinsic::vector_reduce_mul,             &ReplaceUnsupportedIntrinsics::replaceVectorReduce },
+    { Intrinsic::vector_reduce_smax,            &ReplaceUnsupportedIntrinsics::replaceVectorReduce },
+    { Intrinsic::vector_reduce_smin,            &ReplaceUnsupportedIntrinsics::replaceVectorReduce },
+    { Intrinsic::vector_reduce_umax,            &ReplaceUnsupportedIntrinsics::replaceVectorReduce },
+    { Intrinsic::vector_reduce_umin,            &ReplaceUnsupportedIntrinsics::replaceVectorReduce },
+    { Intrinsic::vector_reduce_fadd,            &ReplaceUnsupportedIntrinsics::replaceVectorReduce },
+    { Intrinsic::vector_reduce_fmul,            &ReplaceUnsupportedIntrinsics::replaceVectorReduce },
+    { Intrinsic::vector_reduce_fmax,            &ReplaceUnsupportedIntrinsics::replaceVectorReduce },
+    { Intrinsic::vector_reduce_fmin,            &ReplaceUnsupportedIntrinsics::replaceVectorReduce },
+#if LLVM_VERSION_MAJOR >= 22
+    { Intrinsic::scmp,                          &ReplaceUnsupportedIntrinsics::replaceCmp },
+    { Intrinsic::ucmp,                          &ReplaceUnsupportedIntrinsics::replaceCmp },
 #endif
         // clang-format on
 };
@@ -1169,12 +1190,77 @@ void ReplaceUnsupportedIntrinsics::replaceI1MinMax(IntrinsicInst *I) {
     I->replaceAllUsesWith(Builder.CreateAnd(LHS, RHS));
 }
 
+#if LLVM_VERSION_MAJOR >= 22
+/*
+  Replaces calls to llvm.{s,u}cmp, which returns -1/0/1 depending on whether the
+  first operand is less than, equal to or greater than the second one when
+  both are interpreted as (un)signed integers.
+
+  E.g.:
+    %r = call i32 @llvm.scmp.i32.i64(i64 %a, i64 %b)
+  =>
+    %lt = icmp slt i64 %a, %b
+    %gt = icmp sgt i64 %a, %b
+    %gt.sel = select i1 %gt, i32 1, i32 0
+    %r = select i1 %lt, i32 -1, i32 %gt.sel
+
+    %r = call i32 @llvm.ucmp.i32.i64(i64 %a, i64 %b)
+  =>
+    %lt = icmp ult i64 %a, %b
+    %gt = icmp ugt i64 %a, %b
+    %gt.sel = select i1 %gt, i32 1, i32 0
+    %r = select i1 %lt, i32 -1, i32 %gt.sel
+
+*/
+void ReplaceUnsupportedIntrinsics::replaceCmp(IntrinsicInst *I) {
+  const Intrinsic::ID IID = I->getIntrinsicID();
+  IGC_ASSERT(IID == Intrinsic::scmp || IID == Intrinsic::ucmp);
+  bool IsSigned = IID == Intrinsic::scmp;
+  IGCLLVM::IRBuilder<> Builder(I);
+  Builder.SetCurrentDebugLocation(I->getDebugLoc());
+
+  Value *LHS = I->getArgOperand(0), *RHS = I->getArgOperand(1);
+  IGC_ASSERT_MESSAGE(LHS->getType() == RHS->getType(), "Operands of @llvm.{s,u}cmp must have the same type");
+  Type *ResTy = I->getType();
+  Value *Res = nullptr;
+
+  // This is needed as emission of vector cmp works only on SIMD16
+  // and at this state, we don't know what SIMD Width we will choose
+  // see EmitVISAPass.cpp:5658
+  if (ResTy->isVectorTy()) {
+    auto *VecTy = cast<IGCLLVM::FixedVectorType>(ResTy);
+    const unsigned NumElts = (unsigned)VecTy->getNumElements();
+    for (unsigned i = 0; i < NumElts; ++i) {
+      Value *LHS_i = Builder.CreateExtractElement(LHS, Builder.getInt32(i));
+      Value *RHS_i = Builder.CreateExtractElement(RHS, Builder.getInt32(i));
+      Value *IsLT = IsSigned ? Builder.CreateICmpSLT(LHS_i, RHS_i) : Builder.CreateICmpULT(LHS_i, RHS_i);
+      Value *IsGT = IsSigned ? Builder.CreateICmpSGT(LHS_i, RHS_i) : Builder.CreateICmpUGT(LHS_i, RHS_i);
+
+      Value *GTOrEQ = Builder.CreateSelect(IsGT, llvm::ConstantInt::get(ResTy->getScalarType(), 1),
+                                           llvm::ConstantInt::get(ResTy->getScalarType(), 0));
+      Value *Res_i = Builder.CreateSelect(IsLT, llvm::ConstantInt::getSigned(ResTy->getScalarType(), -1), GTOrEQ);
+      if (!Res)
+        Res = PoisonValue::get(ResTy);
+      Res = Builder.CreateInsertElement(Res, Res_i, Builder.getInt32(i));
+    }
+  } else {
+    Value *IsLT = IsSigned ? Builder.CreateICmpSLT(LHS, RHS) : Builder.CreateICmpULT(LHS, RHS);
+    Value *IsGT = IsSigned ? Builder.CreateICmpSGT(LHS, RHS) : Builder.CreateICmpUGT(LHS, RHS);
+
+    Value *GTOrEQ = Builder.CreateSelect(IsGT, llvm::ConstantInt::get(ResTy, 1), llvm::ConstantInt::get(ResTy, 0));
+    Res = Builder.CreateSelect(IsLT, llvm::ConstantInt::getSigned(ResTy, -1), GTOrEQ);
+  }
+
+  I->replaceAllUsesWith(Res);
+  I->eraseFromParent();
+}
+#endif
 /*
   Replaces half-precision llvm.experimental.constrained.fdiv and
   llvm.experimental.constrained.sqrt intrinsics by promoting operands to float,
-  performing the operation in float with RNE rounding via GenISA intrinsics,
-  and converting the result back to half with the original rounding mode
-  using GenISA_ftof_rt{e,z,p,n}.
+  performing the operation with RNE rounding via GenISA intrinsics, and
+  converting the result back to half with the requested rounding mode using
+  GenISA_ftof_rt{e,z,p,n}.
 
   E.g. for fdiv:
   %r = call half @llvm.experimental.constrained.fdiv.f16(half %a, half %b,
@@ -1197,18 +1283,22 @@ void ReplaceUnsupportedIntrinsics::replaceHalvesDivsSqrts(IntrinsicInst *I) {
   auto *CFP = cast<ConstrainedFPIntrinsic>(I);
   Type *OrigTy = I->getType();
 
-  // Only replace half-precision operations.
-  if (!OrigTy->getScalarType()->isHalfTy())
+  bool IsHalf = OrigTy->getScalarType()->isHalfTy();
+  if (!IsHalf)
     return;
+
+  auto OrigRounding = CFP->getRoundingMode();
 
   Intrinsic::ID IID = I->getIntrinsicID();
   IGC_ASSERT(IID == Intrinsic::experimental_constrained_fdiv || IID == Intrinsic::experimental_constrained_sqrt);
 
-  Type *FloatTy = Type::getFloatTy(I->getContext());
+  Type *ComputeScalarTy = Type::getFloatTy(I->getContext());
+  Type *ComputeTy = ComputeScalarTy;
+  if (auto *VectorTy = dyn_cast<IGCLLVM::FixedVectorType>(OrigTy))
+    ComputeTy = IGCLLVM::FixedVectorType::get(ComputeScalarTy, VectorTy->getNumElements());
   Module *M = I->getModule();
 
   // Map LLVM constrained rounding mode to GenISA ftof intrinsic.
-  auto OrigRounding = CFP->getRoundingMode();
   GenISAIntrinsic::ID FtofID = GenISAIntrinsic::GenISA_ftof_rte; // default RNE
   if (OrigRounding) {
     switch (*OrigRounding) {
@@ -1235,23 +1325,22 @@ void ReplaceUnsupportedIntrinsics::replaceHalvesDivsSqrts(IntrinsicInst *I) {
       ConstantInt::get(Type::getInt32Ty(I->getContext()), static_cast<uint32_t>(ERoundingMode::ROUND_TO_NEAREST_EVEN));
 
   IGCLLVM::IRBuilder<> Builder(I);
+  GenISAIntrinsic::ID ComputeID = IID == Intrinsic::experimental_constrained_fdiv
+                                      ? GenISAIntrinsic::GenISA_IEEE_Divide_rm
+                                      : GenISAIntrinsic::GenISA_IEEE_Sqrt_rm;
+  Function *ComputeFn = GenISAIntrinsic::getDeclaration(M, ComputeID, {ComputeTy});
+
   Value *ComputeResult = nullptr;
-
   if (IID == Intrinsic::experimental_constrained_fdiv) {
-    Value *LHS = Builder.CreateFPExt(I->getArgOperand(0), FloatTy, "fdiv.lhs.ext");
-    Value *RHS = Builder.CreateFPExt(I->getArgOperand(1), FloatTy, "fdiv.rhs.ext");
-
-    Function *DivFn = GenISAIntrinsic::getDeclaration(M, GenISAIntrinsic::GenISA_IEEE_Divide_rm, {FloatTy});
-    ComputeResult = Builder.CreateCall(DivFn, {LHS, RHS, RNE}, "div_rm");
+    Value *LHS = Builder.CreateFPExt(I->getArgOperand(0), ComputeTy, "fdiv.lhs.ext");
+    Value *RHS = Builder.CreateFPExt(I->getArgOperand(1), ComputeTy, "fdiv.rhs.ext");
+    ComputeResult = Builder.CreateCall(ComputeFn, {LHS, RHS, RNE}, "div_rm");
   } else {
-    Value *Op = Builder.CreateFPExt(I->getArgOperand(0), FloatTy, "fsqrt.op.ext");
-
-    Function *SqrtFn = GenISAIntrinsic::getDeclaration(M, GenISAIntrinsic::GenISA_IEEE_Sqrt_rm, {FloatTy});
-    ComputeResult = Builder.CreateCall(SqrtFn, {Op, RNE}, "sqrt_rm");
+    Value *Op = Builder.CreateFPExt(I->getArgOperand(0), ComputeTy, "fsqrt.op.ext");
+    ComputeResult = Builder.CreateCall(ComputeFn, {Op, RNE}, "sqrt_rm");
   }
 
-  // Truncate float result back to half with the original rounding mode.
-  Type *OverloadTypes[] = {OrigTy, FloatTy};
+  Type *OverloadTypes[] = {OrigTy, ComputeTy};
   Function *FtofFn = GenISAIntrinsic::getDeclaration(M, FtofID, OverloadTypes);
   Value *Result = Builder.CreateCall(FtofFn, {ComputeResult}, "ftof_rm");
   cast<Instruction>(Result)->setDebugLoc(I->getDebugLoc());
@@ -1344,7 +1433,7 @@ Value *ReplaceUnsupportedIntrinsics::evaluateCtlzUpto32bit(IGCLLVM::IRBuilder<> 
   Value *retVal = Builder->CreateZExt(inVal, Builder->getInt32Ty());
   retVal = Builder->CreateIntrinsic(Intrinsic::ctlz, {Builder->getInt32Ty()}, {retVal, canBePoison});
   retVal = Builder->CreateTrunc(retVal, singleElementType);
-  auto constInt = Builder->getIntN(sizeInBits, sizeInBits - 32);
+  auto constInt = llvm::ConstantInt::getSigned(Builder->getIntNTy(sizeInBits), sizeInBits - 32);
   retVal = Builder->CreateNSWAdd(retVal, constInt);
   return retVal;
 }
@@ -1442,6 +1531,89 @@ void ReplaceUnsupportedIntrinsics::replaceCountTheTrailingZeros(IntrinsicInst *I
   }
 
   I->replaceAllUsesWith(OutputVal);
+  I->eraseFromParent();
+}
+/*
+  Replaces calls to @llvm.vector.reduce.OP with a sequence of extractelement and OP instructions.
+  E.g. for vector_reduce_add:
+  %1 = call <4 x i32> @llvm.vector.reduce.add.v4i32(<4 x i32> %0)
+  =>
+  %2 = extractelement <4 x i32> %0, i32 0
+  %3 = extractelement <4 x i32> %0, i32 1
+  %4 = add i32 %2, %3
+  %5 = extractelement <4 x i32> %0, i32 2
+  %6 = add i32 %4, %5
+  %7 = extractelement <4 x i32> %0, i32 3
+  %8 = add i32 %6, %7
+*/
+void ReplaceUnsupportedIntrinsics::replaceVectorReduce(IntrinsicInst *I) {
+  const Intrinsic::ID IID = I->getIntrinsicID();
+
+  // fadd and fmul are the only intrinsics that takes scalar instead of vector as an input
+  const bool HasStartValue = (IID == Intrinsic::vector_reduce_fadd || IID == Intrinsic::vector_reduce_fmul);
+  Value *Vec = I->getArgOperand(HasStartValue ? 1 : 0);
+
+  auto *VecTy = cast<IGCLLVM::FixedVectorType>(Vec->getType());
+  const unsigned NumElts = (unsigned)VecTy->getNumElements();
+  IGC_ASSERT_MESSAGE(NumElts > 0, "vector reduce on an empty vector");
+
+  IGCLLVM::IRBuilder<> Builder(I);
+  Builder.SetCurrentDebugLocation(I->getDebugLoc());
+  // Propagate fast-math flags to new FP instructions
+  if (isa<FPMathOperator>(I))
+    Builder.setFastMathFlags(I->getFastMathFlags());
+
+  auto Combine = [&](Value *Acc, Value *Elt) -> Value * {
+    switch (IID) {
+    case Intrinsic::vector_reduce_and:
+      return Builder.CreateAnd(Acc, Elt);
+    case Intrinsic::vector_reduce_or:
+      return Builder.CreateOr(Acc, Elt);
+    case Intrinsic::vector_reduce_xor:
+      return Builder.CreateXor(Acc, Elt);
+    case Intrinsic::vector_reduce_add:
+      return Builder.CreateAdd(Acc, Elt);
+    case Intrinsic::vector_reduce_mul:
+      return Builder.CreateMul(Acc, Elt);
+    case Intrinsic::vector_reduce_fadd:
+      return Builder.CreateFAdd(Acc, Elt);
+    case Intrinsic::vector_reduce_fmul:
+      return Builder.CreateFMul(Acc, Elt);
+    case Intrinsic::vector_reduce_fmax:
+      return Builder.CreateBinaryIntrinsic(Intrinsic::maxnum, Acc, Elt, I);
+    case Intrinsic::vector_reduce_fmin:
+      return Builder.CreateBinaryIntrinsic(Intrinsic::minnum, Acc, Elt, I);
+    case Intrinsic::vector_reduce_smax:
+    case Intrinsic::vector_reduce_smin:
+    case Intrinsic::vector_reduce_umax:
+    case Intrinsic::vector_reduce_umin: {
+      CmpInst::Predicate Pred = (IID == Intrinsic::vector_reduce_smax)   ? CmpInst::ICMP_SGT
+                                : (IID == Intrinsic::vector_reduce_smin) ? CmpInst::ICMP_SLT
+                                : (IID == Intrinsic::vector_reduce_umax) ? CmpInst::ICMP_UGT
+                                                                         : CmpInst::ICMP_ULT;
+      return Builder.CreateSelect(Builder.CreateICmp(Pred, Acc, Elt), Acc, Elt);
+    }
+    default:
+      IGC_ASSERT_MESSAGE(0, "unexpected vector reduce intrinsic");
+      return nullptr;
+    }
+  };
+
+  Value *Acc = nullptr;
+  unsigned StartIdx = 0;
+  if (HasStartValue) {
+    Acc = I->getArgOperand(0);
+  } else {
+    Acc = Builder.CreateExtractElement(Vec, Builder.getInt32(0));
+    StartIdx = 1;
+  }
+
+  for (unsigned Idx = StartIdx; Idx < NumElts; ++Idx) {
+    Value *Elt = Builder.CreateExtractElement(Vec, Builder.getInt32(Idx));
+    Acc = Combine(Acc, Elt);
+  }
+
+  I->replaceAllUsesWith(Acc);
   I->eraseFromParent();
 }
 

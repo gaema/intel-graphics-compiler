@@ -387,9 +387,11 @@ enum class ShaderTypeMD
         bool IsInitializer = false;
         bool IsFinalizer = false;
         unsigned CompiledSubGroupsNumber = 0;
-        unsigned maxRegPressure = 0;       // 0 = not specified
         unsigned maxRegPressureSimd16 = 0; // 0 = not specified
         unsigned maxRegPressureSimd32 = 0; // 0 = not specified
+        unsigned maxRegUniformPressure = 0; // 0 = not specified, IN BYTES
+        unsigned maxRegNonUniformPressure = 0; // 0 = not specified, IN BYTES
+        unsigned bestGuessSimd = 0; // this is a failsafe, should be removed
         bool hasInlineVmeSamplers = false;
         int localSize = 0;
         bool localIDPresent = false;
@@ -401,6 +403,7 @@ enum class ShaderTypeMD
         // This is true if the function has any sync raytracing functionality
         bool hasSyncRTCalls = false;
         bool hasPrintfCalls = false;
+        bool hasDPAS = false;
         bool requireAssertBuffer = false;
         bool requireSyncBuffer = false;
         bool hasIndirectCalls = false;
@@ -432,6 +435,7 @@ enum class ShaderTypeMD
     // function as clone and later in debug info iterating over
     // original function instead of clone helps emit out correct debug
     // info.
+
 
     //new structure to replace old Metatdata framework's CompilerOptions
     struct CompOptions
@@ -523,11 +527,17 @@ enum class ShaderTypeMD
         bool WaForceHalfPromotionComputeShader          = false;
         bool WaForceHalfPromotionPixelVertexShader      = false;
         bool DisableConstantCoalescing                  = false;
+        bool DisableBitcastedLoadNarrowing              = false;
         bool EnableUndefAlphaOutputAsRed                = true;
         bool WaEnableALTModeVisaWA                      = false;
         bool WaConvergentGradientsOnGenISA              = false;
+        bool WaDisableDualSIMD8                         = false;
         bool EnableLdStCombineforLoad                   = false;
         bool EnableLdStCombinewithDummyLoad             = false;
+        // Read zero from WaveShuffleIndex source lanes that are inactive, rather than
+        // whatever the register happened to hold. For shaders that shuffle from a lane
+        // divergent control flow has deactivated, which HLSL leaves undefined.
+        bool WaZeroInactiveLanesForWaveShuffle          = false;
         bool ForceUniformBuffer                         = false;
         bool ForceUniformSurfaceSampler                 = false;
         bool EnableIndependentSharedMemoryFenceFunctionality = false;
@@ -554,11 +564,13 @@ enum class ShaderTypeMD
         bool UseInstructionHoistingOptimization         = false;
         bool DisableResourceLoopDestLifeTimeStart       = false;
         unsigned ForceVRTGRFCeiling                     = 0;
-        unsigned DisableSamplerBackingByLSC             = 0;
+        unsigned EnableSamplerBackingByLSC              = 0;
         bool UseLinearScanRA                            = false;
         bool DisableConvertingAtomicIAddToIncDec        = false;
         bool ZeroInitRegistersBeforeExecution = false;
         unsigned VISASpillAllowed                       = 0;
+        unsigned ConstantCoalescingMaxBBDepthDelta      = 0;
+        unsigned ConstantCoalescingDepthCheckMinBytes   = 0;
     };
 
     enum class ThreadIDLayout
@@ -838,8 +850,8 @@ enum class ShaderTypeMD
 
         bool UseBindlessImageWithSamplerTracking = false;
         bool enableRangeReduce = false;
-        //when true, compiler enables MatchMad optimization for VS
-        bool allowMatchMadOptimizationforVS = false;
+        //when true, compiler enables MatchMad optimization for position calculations
+        bool allowMatchMadOptimizationforPosition = false;
 
         //when true, compiler disables MatchMad optimization for CS
         bool disableMatchMadOptimizationForCS = false;

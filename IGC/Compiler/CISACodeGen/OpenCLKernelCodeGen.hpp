@@ -73,7 +73,9 @@ public:
   bool isSPIRV() const;
   void setAsSPIRV();
   float getProfilingTimerResolution();
-  uint32_t getNumGRFPerThread(bool returnDefault = true) override;
+  uint32_t getNumGRFPerThread(bool ReturnDefault = true, const llvm::Function *F = nullptr) override;
+  int32_t getRequestedNumGRF(const llvm::Function *F) const;
+  bool kernelQualifiesFor512(bool hasDPAS, SIMDMode simd, const llvm::Function *F) const;
   int32_t getNumThreadsPerEU() const override;
   uint32_t getExpGRFSize() const override;
   bool forceGlobalMemoryAllocation() const override;
@@ -90,7 +92,7 @@ public:
   bool needsDivergentBarrierHandling() const;
   unsigned GetSlmSizePerSubslice();
   float GetSpillThreshold(SIMDMode dispatchSize);
-  bool isAutoGRFSelectionEnabled() const override;
+  bool isAutoGRFSelectionEnabled(const llvm::Function *F = nullptr) const override;
   uint64_t getMinimumValidAddress() const override;
 
   void clearBeforeRetry() { m_programOutput.clearBeforeRetry(); }
@@ -229,7 +231,7 @@ private:
   // Returns the effective required SIMD size, considering both intel_reqd_sub_group_size
   // attribute and forcedSIMDSize from compute shader info.
   SIMDSizeRequirement getEffectiveRequiredSIMDSize(llvm::Function &F) const;
-  uint32_t getMaxPressure(llvm::Function &F) const;
+  uint32_t getMaxPressure(llvm::Function &F, unsigned int SIMD) const;
   uint32_t getMaxPressureForSIMD(llvm::Function &F, unsigned SimdLanes) const;
   bool isUnusedArg(KernelArg &arg) const;
   bool canSkipScratchPointer(KernelArgs &args) const;

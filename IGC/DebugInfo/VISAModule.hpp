@@ -281,19 +281,7 @@ private:
 public:
   Address(GfxAddress addr = 0) : m_addr(addr) {}
 
-  Space GetSpace() const { return (Space)((m_addr >> c_space_shift) & c_space_mask); }
-
-  uint32_t GetIndex() const { return (uint32_t)((m_addr >> c_index_shift) & c_index_mask); }
-
-  uint64_t GetOffset() const { return ((m_addr >> c_offset_shift) & c_offset_mask); }
-
   uint64_t GetAddress() const { return m_addr; }
-
-  uint64_t GetCanonicalizedAddress() const {
-    bool isSignBitSet = ((1ull << 47) & m_addr) != 0;
-
-    return isSignBitSet ? (~c_offset_mask) | m_addr : c_offset_mask & m_addr;
-  }
 
   void SetSpace(Space space) {
     GfxAddress s = static_cast<GfxAddress>(space);
@@ -316,8 +304,6 @@ public:
     SetIndex(index);
     SetOffset(offset);
   }
-
-  void Set(GfxAddress address) { m_addr = address; }
 
 private:
   uint64_t m_addr;
@@ -451,11 +437,6 @@ public:
   /// @return Return true if instruction has VISA offset, otherwise false.
   bool HasVisaOffset(const llvm::Instruction *pInst) const;
 
-  /// @brief Return VISA offset (in instructions) mapped to given instruction.
-  /// @param Instruction to query.
-  /// @return VISA offset (in instructions)
-  unsigned int GetVisaOffset(const llvm::Instruction *) const;
-
   /// @brief Return LLVM module.
   /// @return LLVM module.
   const llvm::Module *GetModule() const;
@@ -499,7 +480,8 @@ public:
   /// @brief Look up the StorageOffset recorded by PrivateMemoryResolution.
   /// @return nullopt if no entry found (variable is not stack-based private memory).
   virtual std::optional<uint32_t> getStorageOffset(DbgVarStorageKey dbgKey) const { return std::nullopt; }
-  virtual std::optional<uint32_t> getStorageSize(DbgVarStorageKey dbgKey) const { return std::nullopt; }
+  virtual std::optional<uint32_t> getStorageStride(DbgVarStorageKey dbgKey) const { return std::nullopt; }
+  virtual std::optional<bool> getStorageIsStackBased(DbgVarStorageKey dbgKey) const { return std::nullopt; }
 
   /// @brief Updates VISA instruction id to current instruction number.
   virtual void UpdateVisaId() = 0;
@@ -517,8 +499,6 @@ public:
   ///  @brief return false if inst is a placeholder instruction
   bool IsExecutableInst(const llvm::Instruction &inst);
   const DbgDecoder::VarInfo *getVarInfo(const VISAObjectDebugInfo &VD, unsigned int vreg) const;
-
-  bool hasOrIsStackCall(const VISAObjectDebugInfo &VD) const;
 
   // TODO: deprectate this function
   const std::vector<DbgDecoder::SubroutineInfo> *getSubroutines(const VISAObjectDebugInfo &VD) const;

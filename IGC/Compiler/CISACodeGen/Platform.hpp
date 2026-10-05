@@ -22,6 +22,8 @@ SPDX-License-Identifier: MIT
 #include "iStdLib/utility.h"
 #include "visa_igc_common_header.h"
 
+#include <initializer_list>
+
 namespace IGC {
 
 class CPlatform {
@@ -97,7 +99,7 @@ public:
   bool forceMaxGrf256() const {
     switch (m_platformInfo.eRenderCoreFamily) {
     case IGFX_XE3P_CORE:
-      return true;
+      return m_platformInfo.eProductFamily != IGFX_CRI || !IGC_IS_FLAG_ENABLED(EnableCRIDefault512GRF);
     default:
       return false;
     }
@@ -162,14 +164,19 @@ public:
   // set EnableBitcastedLoadNarrowing regkey (enable or disable) always takes
   // precedence.
   bool enableBitcastedLoadNarrowing() const {
-    return IGC_IS_FLAG_ENABLED(EnableBitcastedLoadNarrowing);
+    // Enabled by default on Panther Lake and later (Xe3+).
+    return IGC_IS_FLAG_SET(EnableBitcastedLoadNarrowing) ? IGC_IS_FLAG_ENABLED(EnableBitcastedLoadNarrowing)
+                                                         : isCoreChildOf(IGFX_XE3_CORE);
   }
 
   // Narrowing of bitcasted vector loads down to a scalar load (see
   // VectorPreProcess). An explicitly set EnableBitcastedLoadNarrowingToScalar
   // regkey always takes precedence.
   bool enableBitcastedLoadNarrowingToScalar() const {
-    return IGC_IS_FLAG_ENABLED(EnableBitcastedLoadNarrowingToScalar);
+    // Enabled by default on Panther Lake and later (Xe3+).
+    return IGC_IS_FLAG_SET(EnableBitcastedLoadNarrowingToScalar)
+               ? IGC_IS_FLAG_ENABLED(EnableBitcastedLoadNarrowingToScalar)
+               : isCoreChildOf(IGFX_XE3_CORE);
   }
 
   bool isCoreXE2() const { return (m_platformInfo.eRenderCoreFamily == IGFX_XE2_HPG_CORE); }
@@ -259,6 +266,7 @@ public:
     return (m_platformInfo.eRenderCoreFamily >= IGFX_GEN11_CORE);
   }
   bool enableBlendToDiscardAndFill() const { return (m_platformInfo.eRenderCoreFamily < IGFX_GEN11_CORE); }
+
   bool needWASlmGlobalOffsetS20() const { return getWATable().Wa_14026265758 != 0; }
 
   bool NeedResetA0forVxHA0() const {
@@ -280,7 +288,8 @@ public:
 
   bool SupportCPS() const { return (m_platformInfo.eRenderCoreFamily >= IGFX_GEN10_CORE); }
   bool hasUnifiedCoarseAndPixelDispatchRates() const {
-    return /*(m_platformInfo.eRenderCoreFamily >= IGFX_XE3_CORE);*/ false;
+    // HSD-14015289391: Unify coarse and pixel dispatch rates.
+    return isCoreChildOf(IGFX_XE3_CORE) && IGC_IS_FLAG_ENABLED(EnableUnifiedCoarseAndPixelDispatchRates);
   }
   bool supportsSIMD32forCPS() const { return (m_platformInfo.eProductFamily >= IGFX_METEORLAKE); }
 
@@ -581,6 +590,8 @@ public:
 
   bool hasFP4DPAS() const { return isCoreChildOf(IGFX_XE3P_CORE) && IGC_IS_FLAG_ENABLED(EnableFP4Dpas); }
 
+  bool hasFP8Dpas() const { return isCoreChildOf(IGFX_XE3P_CORE); }
+
   bool hasExecSize16DPAS() const { return isCoreChildOf(IGFX_XE_HPC_CORE); }
 
   bool LSCSimd1NeedFullPayload() const {
@@ -595,6 +606,11 @@ public:
 
   bool hasBFTFDenormMode() const {
     return isCoreChildOf(IGFX_XE2_HPG_CORE);
+  }
+
+  // True if the platform has native HW float<->bfloat16 conversion.
+  bool hasBF16Conversion() const {
+    return isCoreChildOf(IGFX_XE_HPG_CORE) && m_platformInfo.eProductFamily != IGFX_METEORLAKE;
   }
   bool hasWideMulMad() const {
     return isCoreChildOf(IGFX_XE3P_CORE) &&
@@ -826,6 +842,7 @@ public:
 
   bool supportsWriteableMSAATextures() const { return isCoreChildOf(IGFX_XE3_CORE); }
   bool supportsVRT() const { return isCoreChildOf(IGFX_XE3_CORE); }
+  bool supportsSampleResultLatencySink() const { return isCoreChildOf(IGFX_XE3_CORE); }
 
 
   bool supportsOutOfBoundsGrfAccess() const { return !isCoreChildOf(IGFX_XE3_CORE); }
@@ -837,9 +854,7 @@ public:
             m_platformInfo.eProductFamily == IGFX_ARROWLAKE);
   }
 
-  bool supportDualSimd8PS() const {
-    return IGC_IS_FLAG_ENABLED(EnableDualSIMD8) && (m_platformInfo.eRenderCoreFamily >= IGFX_GEN12_CORE);
-  }
+  bool supportDualSimd8PS() const { return (m_platformInfo.eRenderCoreFamily >= IGFX_GEN12_CORE); }
 
   bool hasDualSimd8Payload() const {
     return (m_platformInfo.eRenderCoreFamily >= IGFX_GEN12_CORE) && !isCoreChildOf(IGFX_XE2_HPG_CORE);
@@ -924,6 +939,51 @@ public:
   }
 
   uint32_t getMinNumGRF() const { return supportsVRT() ? 32 : 128; }
+
+  llvm::SmallVector<uint32_t, 16> getSupportedGRFSizes() const {
+    llvm::SmallVector<uint32_t, 16> List;
+
+    if (!supportsStaticRegSharing()) {
+      // Pre-XeHP: a single, fixed configuration.
+      List.push_back(128);
+      return List;
+    }
+
+    if (!supportsVRT()) {
+      // XeHP..Xe2: static register sharing with two configurations.
+      List.push_back(128);
+      List.push_back(256);
+      return List;
+    }
+
+    // Xe3+: variable register targeting.
+    for (uint32_t NumGRF : {32, 64, 96, 128, 160, 192, 256})
+      List.push_back(NumGRF);
+
+    bool Has320And448 = supports320And448GRFWithoutSendg();
+    if (Has320And448) {
+      List.push_back(320);
+      List.push_back(448);
+    }
+
+    if (supports512GRFPerThread())
+      List.push_back(512);
+
+    return List;
+  }
+
+  uint32_t legalizeNumGRF(uint32_t NumGRF) const {
+    if (NumGRF == 0)
+      return 0;
+
+    auto Supported = getSupportedGRFSizes();
+    uint32_t Legalized = Supported.front();
+    for (uint32_t Candidate : Supported) {
+      if (NumGRF >= Candidate && Candidate > Legalized)
+        Legalized = Candidate;
+    }
+    return Legalized;
+  }
 
   uint32_t getInlineDataSize() const {
     if (!supportInlineData())
@@ -1154,8 +1214,10 @@ public:
     if (!supportsRayQueryThrottling())
       return false;
 
-    if (IGC_IS_FLAG_SET(OverrideRayQueryThrottling))
-      return IGC_GET_FLAG_VALUE(OverrideRayQueryThrottling);
+    const auto overrideValue = static_cast<IGC::TriboolFlag>(IGC_GET_FLAG_VALUE(OverrideRayQueryThrottling));
+
+    if (overrideValue != TriboolFlag::Default)
+      return static_cast<bool>(overrideValue);
 
     if (isCoreChildOf(IGFX_XE3P_CORE))
       return true;
@@ -1499,6 +1561,22 @@ public:
   bool allowProceedBasedApproachForRayQueryDynamicRayManagementMechanism() const {
     return IGC_IS_FLAG_DISABLED(DisableProceedBasedApproachForRayQueryDynamicRayManagementMechanism);
   }
+  bool allowEmitMoreMoviCases() const {
+    bool status = false;
+    const IGC::TriboolFlag EnableEmitMoreMoviCases =
+        static_cast<IGC::TriboolFlag>(IGC_GET_FLAG_VALUE(SupportEmitMoreMoviCases));
+    switch (EnableEmitMoreMoviCases) {
+    case IGC::TriboolFlag::Enabled:
+      status = true;
+      break;
+    case IGC::TriboolFlag::Disabled:
+      status = false;
+      break;
+    case IGC::TriboolFlag::Default:
+      break;
+    }
+    return status;
+  }
 
   bool allowsMoviForType(VISA_Type type) const { return (type == ISA_TYPE_UD || type == ISA_TYPE_D); }
 
@@ -1582,6 +1660,8 @@ public:
 
   bool supportIntDivRemIncrementReduction() const { return isCoreChildOf(IGFX_XE_HP_CORE); }
 
+
+  bool supportBranchToSelect() const { return isCoreChildOf(IGFX_XE2_HPG_CORE); }
 };
 
 } // namespace IGC

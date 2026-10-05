@@ -45469,8 +45469,71 @@ const ged_ins_field_entry_t PositionInterpreterTable11[50] =
     { GED_PSEUDO_FIELD_DPOneAddrReg,                  GED_TABLE_ENTRY_TYPE_CONSECUTIVE,     4, /* {  25,  28,   0,  25, 0x1e000000 } */ { 0x19001c19, (void*)(g_uintptr_t)0x1e000000 }, RestrictionTable225 }, // 48
     { GED_PSEUDO_FIELD_DPCmask,                       GED_TABLE_ENTRY_TYPE_CONSECUTIVE,     4, /* {  12,  15,   0,  12,     0xf000 } */ {  0xc000f0c, (void*)(g_uintptr_t)    0xf000 }, RestrictionTable226 } // 49
 }; // PositionInterpreterTable11[]
-const ged_ins_field_entry_t PositionInterpreterTable12[2] =
+const ged_ins_field_entry_t PositionInterpreterTable12[65] =
 {
     { GED_PSEUDO_FIELD_ArchReg,                       GED_TABLE_ENTRY_TYPE_CONSECUTIVE,     4, /* {   4,   7,   0,   4,       0xf0 } */ {  0x4000704, (void*)(g_uintptr_t)      0xf0 }, RestrictionTable234 }, // 0
-    { GED_PSEUDO_FIELD_ArchRegNum,                    GED_TABLE_ENTRY_TYPE_CONSECUTIVE,     4, /* {   0,   3,   0,   0,        0xf } */ {      0x300, (void*)(g_uintptr_t)       0xf }, NULL } // 1
+    { GED_PSEUDO_FIELD_ArchRegNum,                    GED_TABLE_ENTRY_TYPE_CONSECUTIVE,     4, /* {   0,   3,   0,   0,        0xf } */ {      0x300, (void*)(g_uintptr_t)       0xf }, NULL }, // 1
+    { GED_PSEUDO_FIELD_SwizzleX,                      GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 2
+    { GED_PSEUDO_FIELD_SwizzleY,                      GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 3
+    { GED_PSEUDO_FIELD_SwizzleZ,                      GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 4
+    { GED_PSEUDO_FIELD_SwizzleW,                      GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 5
+    { GED_PSEUDO_FIELD_MessageLength,                 GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 6
+    { GED_PSEUDO_FIELD_ResponseLength,                GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 7
+    { GED_PSEUDO_FIELD_HeaderPresent,                 GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 8
+    { GED_PSEUDO_FIELD_MessageTypeDP_SAMPLER,         GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 9
+    { GED_PSEUDO_FIELD_MessageTypeDP_RC,              GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 10
+    { GED_PSEUDO_FIELD_MessageTypeDP_CC,              GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 11
+    { GED_PSEUDO_FIELD_MessageTypeDP_DC0,             GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 12
+    { GED_PSEUDO_FIELD_TypedSurfaceSlotGroup,         GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 13
+    { GED_PSEUDO_FIELD_TypedAtomicSlotGroup,          GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 14
+    { GED_PSEUDO_FIELD_UntypedSurfaceSIMDMode,        GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 15
+    { GED_PSEUDO_FIELD_UntypedAtomicSIMDMode,         GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 16
+    { GED_PSEUDO_FIELD_InvalidateAfterRead,           GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 17
+    { GED_PSEUDO_FIELD_BlockSize,                     GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 18
+    { GED_PSEUDO_FIELD_RedChannel,                    GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 19
+    { GED_PSEUDO_FIELD_GreenChannel,                  GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 20
+    { GED_PSEUDO_FIELD_BlueChannel,                   GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 21
+    { GED_PSEUDO_FIELD_AlphaChannel,                  GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 22
+    { GED_PSEUDO_FIELD_ReturnDataControl,             GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 23
+    { GED_PSEUDO_FIELD_AtomicOperationType,           GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 24
+    { GED_PSEUDO_FIELD_AtomicCounterOperationType,    GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 25
+    { GED_PSEUDO_FIELD_SubFuncID,                     GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 26
+    { GED_PSEUDO_FIELD_BindingTableIndex,             GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 27
+    { GED_PSEUDO_FIELD_FuncControl,                   GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 28
+    { GED_PSEUDO_FIELD_MessageTypeDP_DC1,             GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 29
+    { GED_PSEUDO_FIELD_MessageTypeDP0Category,        GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 30
+    { GED_PSEUDO_FIELD_MessageTypeDP_DC0Legacy,       GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 31
+    { GED_PSEUDO_FIELD_MessageTypeDP_DC0ScratchBlock, GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 32
+    { GED_PSEUDO_FIELD_MessageTypeDP_DC2,             GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 33
+    { GED_PSEUDO_FIELD_MessageTypeDP_DCRO,            GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 34
+    { GED_PSEUDO_FIELD_ExMessageLength,               GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 35
+    { GED_PSEUDO_FIELD_DPOpcode,                      GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 36
+    { GED_PSEUDO_FIELD_DPAddrSurfaceType,             GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 37
+    { GED_PSEUDO_FIELD_DPVectSize,                    GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 38
+    { GED_PSEUDO_FIELD_DPFlushType,                   GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 39
+    { GED_PSEUDO_FIELD_DPTranspose,                   GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 40
+    { GED_PSEUDO_FIELD_DPFlushRange,                  GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 41
+    { GED_PSEUDO_FIELD_DPDataSize,                    GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 42
+    { GED_PSEUDO_FIELD_DPFenceScope,                  GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 43
+    { GED_PSEUDO_FIELD_DPAddrSize,                    GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 44
+    { GED_PSEUDO_FIELD_DPCacheStore,                  GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 45
+    { GED_PSEUDO_FIELD_DPCacheLoad,                   GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 46
+    { GED_PSEUDO_FIELD_DPAddrRegSize,                 GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 47
+    { GED_PSEUDO_FIELD_DPOneAddrReg,                  GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 48
+    { GED_PSEUDO_FIELD_DPCmask,                       GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 49
+    { GED_PSEUDO_FIELD_MessageTypeDP_CONST,           GED_TABLE_ENTRY_TYPE_NOT_SUPPORTED,   0, { 0 }, NULL }, // 50
+    { GED_PSEUDO_FIELD_DP64Opcode,                    GED_TABLE_ENTRY_TYPE_CONSECUTIVE,     6, /* {   0,   5,   0,   0,       0x3f } */ {      0x500, (void*)(g_uintptr_t)      0x3f }, RestrictionTable257 }, // 51
+    { GED_PSEUDO_FIELD_DP64Cmask,                     GED_TABLE_ENTRY_TYPE_CONSECUTIVE,     4, /* {   7,  10,   0,   7,      0x780 } */ {  0x7000a07, (void*)(g_uintptr_t)     0x780 }, RestrictionTable258 }, // 52
+    { GED_PSEUDO_FIELD_DP64DataSize,                  GED_TABLE_ENTRY_TYPE_CONSECUTIVE,     3, /* {  11,  13,   0,  11,     0x3800 } */ {  0xb000d0b, (void*)(g_uintptr_t)    0x3800 }, RestrictionTable259 }, // 53
+    { GED_PSEUDO_FIELD_DP64FenceScope,                GED_TABLE_ENTRY_TYPE_CONSECUTIVE,     3, /* {  11,  13,   0,  11,     0x3800 } */ {  0xb000d0b, (void*)(g_uintptr_t)    0x3800 }, RestrictionTable260 }, // 54
+    { GED_PSEUDO_FIELD_DP64CacheStore,                GED_TABLE_ENTRY_TYPE_CONSECUTIVE,     4, /* {  16,  19,   0,  16,    0xf0000 } */ { 0x10001310, (void*)(g_uintptr_t)   0xf0000 }, RestrictionTable261 }, // 55
+    { GED_PSEUDO_FIELD_DP64CacheLoad,                 GED_TABLE_ENTRY_TYPE_CONSECUTIVE,     4, /* {  16,  19,   0,  16,    0xf0000 } */ { 0x10001310, (void*)(g_uintptr_t)   0xf0000 }, RestrictionTable262 }, // 56
+    { GED_PSEUDO_FIELD_DP64CacheAtomic,               GED_TABLE_ENTRY_TYPE_CONSECUTIVE,     4, /* {  16,  19,   0,  16,    0xf0000 } */ { 0x10001310, (void*)(g_uintptr_t)   0xf0000 }, RestrictionTable263 }, // 57
+    { GED_PSEUDO_FIELD_DP64VectorSize,                GED_TABLE_ENTRY_TYPE_CONSECUTIVE,     3, /* {   7,   9,   0,   7,      0x380 } */ {  0x7000907, (void*)(g_uintptr_t)     0x380 }, RestrictionTable264 }, // 58
+    { GED_PSEUDO_FIELD_DP64Transpose,                 GED_TABLE_ENTRY_TYPE_CONSECUTIVE,     1, /* {  10,  10,   0,  10,      0x400 } */ {  0xa000a0a, (void*)(g_uintptr_t)     0x400 }, NULL }, // 59
+    { GED_PSEUDO_FIELD_DP64GlobalAddressTypeSize,     GED_TABLE_ENTRY_TYPE_CONSECUTIVE,     2, /* {  14,  15,   0,  14,     0xc000 } */ {  0xe000f0e, (void*)(g_uintptr_t)    0xc000 }, RestrictionTable265 }, // 60
+    { GED_PSEUDO_FIELD_DP64ScaleOffset,               GED_TABLE_ENTRY_TYPE_CONSECUTIVE,     2, /* {  44,  45,   1,  12,     0x3000 } */ {  0xc012d2c, (void*)(g_uintptr_t)    0x3000 }, RestrictionTable266 }, // 61
+    { GED_PSEUDO_FIELD_DP64FlushType,                 GED_TABLE_ENTRY_TYPE_CONSECUTIVE,     3, /* {   8,  10,   0,   8,      0x700 } */ {  0x8000a08, (void*)(g_uintptr_t)     0x700 }, RestrictionTable267 }, // 62
+    { GED_PSEUDO_FIELD_DP64GlobalOffsetStateful,      GED_TABLE_ENTRY_TYPE_FRAGMENTED,     17, { 2, FragmentsTable89 }, NULL }, // 63
+    { GED_PSEUDO_FIELD_DP64GlobalOffsetStateless,     GED_TABLE_ENTRY_TYPE_FRAGMENTED,     22, { 2, FragmentsTable90 }, NULL } // 64
 }; // PositionInterpreterTable12[]

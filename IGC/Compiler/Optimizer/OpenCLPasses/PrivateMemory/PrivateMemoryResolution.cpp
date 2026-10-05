@@ -16,9 +16,11 @@ SPDX-License-Identifier: MIT
 #include "Compiler/CISACodeGen/EmitVISAPass.hpp"
 #include "Compiler/CISACodeGen/GenCodeGenModule.h"
 #include "Compiler/CISACodeGen/LowerGEPForPrivMem.hpp"
+#include "GenISAIntrinsics/GenIntrinsicInst.h"
 #include "llvmWrapper/IR/DerivedTypes.h"
 #include "common/LLVMWarningsPush.hpp"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/Dominators.h"
@@ -26,6 +28,7 @@ SPDX-License-Identifier: MIT
 #include "llvmWrapper/IR/DebugInfo.h"
 #include "llvmWrapper/IR/IRBuilder.h"
 #include "llvmWrapper/IR/IntrinsicInst.h"
+#include <llvm/IR/Instructions.h>
 #include <llvmWrapper/ADT/Optional.h>
 #include "Probe/Assertion.h"
 
@@ -107,6 +110,7 @@ public:
   void handleLoadInst(LoadInst *pLoad, Value *pScalarizedIdx);
   void handleStoreInst(StoreInst *pStore, Value *pScalarizedIdx);
   void handleLifetimeMark(IntrinsicInst *inst);
+  void handlePredicatedLoadInst(PredicatedLoadIntrinsic *pPredLoad, Value *pScalarizedIdx);
   bool useNewAlgo() { return true; }
 
 private:
@@ -122,6 +126,10 @@ private:
   Value *getChunkNum(IGCLLVM::IRBuilder<> &IRB, Value *OffsetInBytes);
   // Return the offset within chunk that byteOffset points to
   Value *getChunkOff(IGCLLVM::IRBuilder<> &IRB, Value *OFfsetInBytes);
+  // Compute the SoA-transposed private-memory element pointer for an access of
+  // type AccessTy at the given scalarized index. Returns a private-AS pointer
+  // to AccessTy. Shared by the load/store/predicated-load handlers.
+  Value *getTransposedEltPtr(IGCLLVM::IRBuilder<> &IRB, Type *AccessTy, Value *pScalarizedIdx, const Twine &Name);
 };
 
 // helper
@@ -438,8 +446,7 @@ bool PrivateMemoryResolution::runOnModule(llvm::Module &M) {
     llvm::dbgs() << "[DumpDbgVarStorageInfo] DbgVarStorageMap entries:\n";
     for (const auto &KV : m_pCtx->m_DbgVarStorageMap) {
       llvm::dbgs() << "  variable=" << KV.first->getVariable()->getName() << " StorageOffset=" << KV.second.offset
-                   << " StorageSize=" << (KV.second.size.has_value() ? std::to_string(*KV.second.size) : "none")
-                   << "\n";
+                   << " StorageStride=" << KV.second.stride << " IsStackBased=" << KV.second.isStackBased << "\n";
     }
   }
 
@@ -642,6 +649,7 @@ public:
     base = b;
     elementSize = eltSize;
     vectorIO = vectorType;
+    m_idxUnitBytes = eltSize;
   }
   void handleLoadInst(LoadInst *pLoad, Value *pScalarizedIdx) {
     IGC_ASSERT(nullptr != pLoad);
@@ -658,7 +666,7 @@ public:
     if (!vectorIO && pLoad->getType()->isVectorTy()) {
       Type *scalarType = pLoad->getType()->getScalarType();
       IGC_ASSERT(nullptr != scalarType);
-      Type *scalarptrTy = IGCLLVM::PointerType::get(scalarType, pLoad->getPointerAddressSpace());
+      Type *scalarptrTy = IGCLLVM::PointerType::get(scalarType, ADDRESS_SPACE_PRIVATE);
       IGC_ASSERT(scalarType->getPrimitiveSizeInBits() / 8 == elementSize);
       Value *vec = UndefValue::get(pLoad->getType());
       auto pLoadVT = cast<IGCLLVM::FixedVectorType>(pLoad->getType());
@@ -671,7 +679,8 @@ public:
       pLoad->replaceAllUsesWith(vec);
       pLoad->eraseFromParent();
     } else {
-      Value *ptr = IRB.CreateIntToPtr(address, pLoad->getPointerOperand()->getType());
+      Type *ptrTy = IGCLLVM::PointerType::get(pLoad->getType(), ADDRESS_SPACE_PRIVATE);
+      Value *ptr = IRB.CreateIntToPtr(address, ptrTy);
       pLoad->setOperand(0, ptr);
     }
   }
@@ -690,7 +699,7 @@ public:
     if (!vectorIO && pStore->getValueOperand()->getType()->isVectorTy()) {
       Type *scalarType = pStore->getValueOperand()->getType()->getScalarType();
       IGC_ASSERT(nullptr != scalarType);
-      Type *scalarptrTy = IGCLLVM::PointerType::get(scalarType, pStore->getPointerAddressSpace());
+      Type *scalarptrTy = IGCLLVM::PointerType::get(scalarType, ADDRESS_SPACE_PRIVATE);
       IGC_ASSERT(scalarType->getPrimitiveSizeInBits() / 8 == elementSize);
       Value *vec = pStore->getValueOperand();
 
@@ -702,7 +711,8 @@ public:
       }
       pStore->eraseFromParent();
     } else {
-      Value *ptr = IRB.CreateIntToPtr(address, pStore->getPointerOperand()->getType());
+      Type *ptrTy = IGCLLVM::PointerType::get(pStore->getValueOperand()->getType(), ADDRESS_SPACE_PRIVATE);
+      Value *ptr = IRB.CreateIntToPtr(address, ptrTy);
       pStore->setOperand(1, ptr);
     }
   }
@@ -724,11 +734,9 @@ Value *TransposePrivMem::getChunkOff(IGCLLVM::IRBuilder<> &IRB, Value *OffsetInB
   return chunkOffset;
 }
 
-void TransposePrivMem::handleLoadInst(LoadInst *pLoad, Value *pScalarizedIdx) {
-  IGC_ASSERT(nullptr != pLoad);
-  IGC_ASSERT(pLoad->isSimple());
-  IGCLLVM::IRBuilder<> IRB(pLoad);
-  uint32_t bytes = (uint32_t)m_DL.getTypeStoreSize(pLoad->getType());
+Value *TransposePrivMem::getTransposedEltPtr(IGCLLVM::IRBuilder<> &IRB, Type *AccessTy, Value *pScalarizedIdx,
+                                             const Twine &Name) {
+  uint32_t bytes = (uint32_t)m_DL.getTypeStoreSize(AccessTy);
   IGC_ASSERT(bytes <= m_chunkBytes);
   IGC_ASSERT(isPowerOf2_32(bytes));
 
@@ -752,8 +760,20 @@ void TransposePrivMem::handleLoadInst(LoadInst *pLoad, Value *pScalarizedIdx) {
       eltIx = IRB.CreateLShr(chunkOff, IRB.getInt32(lshrAmt));
   }
 
-  Value *addrInElt = convertToPtr(IRB, m_DL, addr, pLoad->getPointerOperandType());
-  Value *gep = IRB.CreateGEP(pLoad->getType(), addrInElt, eltIx, VALUE_NAME(pLoad->getName() + ".SOAPrivMemGEP"));
+  // The SoA buffer lives in private memory. Force a private-AS pointer so that
+  // inttoptr (or bitcast) on the integer address always yields a private
+  // pointer, regardless of the original access's pointer AS (e.g. generic AS4).
+  Type *privatePtrTy = IGCLLVM::PointerType::get(AccessTy, ADDRESS_SPACE_PRIVATE);
+  Value *addrInElt = convertToPtr(IRB, m_DL, addr, privatePtrTy);
+  return IRB.CreateGEP(AccessTy, addrInElt, eltIx, Name);
+}
+
+void TransposePrivMem::handleLoadInst(LoadInst *pLoad, Value *pScalarizedIdx) {
+  IGC_ASSERT(nullptr != pLoad);
+  IGC_ASSERT(pLoad->isSimple());
+  IGCLLVM::IRBuilder<> IRB(pLoad);
+  Value *gep =
+      getTransposedEltPtr(IRB, pLoad->getType(), pScalarizedIdx, VALUE_NAME(pLoad->getName() + ".SOAPrivMemGEP"));
   Value *val =
       IRB.CreateAlignedLoad(cast<GetElementPtrInst>(gep)->getResultElementType(), gep, IGCLLVM::getAlign(*pLoad));
 
@@ -765,34 +785,8 @@ void TransposePrivMem::handleStoreInst(StoreInst *pStore, Value *pScalarizedIdx)
   IGC_ASSERT(nullptr != pStore);
   IGC_ASSERT(pStore->isSimple());
   IGCLLVM::IRBuilder<> IRB(pStore);
-  Type *valTy = pStore->getValueOperand()->getType();
-  uint32_t bytes = (uint32_t)m_DL.getTypeStoreSize(valTy);
-  IGC_ASSERT(bytes <= m_chunkBytes);
-  IGC_ASSERT(isPowerOf2_32(bytes));
-
-  Value *chunkNo = getChunkNum(IRB, pScalarizedIdx);
-  Value *chunkVal = IRB.getInt32(m_chunkBytes);
-  Value *chunkBytesPerWI = IRB.CreateMul(chunkNo, chunkVal);
-  Value *chunkByteOffset = IRB.CreateMul(m_simdSize, chunkBytesPerWI);
-  Value *addr = addOffset(IRB, m_DL, m_bufferBase, chunkByteOffset);
-
-  Value *eltIx;
-  if (bytes == m_chunkBytes) {
-    // Each type is naturally aligned -> chunk offset = 0
-    eltIx = IRB.getInt32(0);
-  } else {
-    // (a / bytes) == (a >> Log2_32(bytes))
-    uint32_t lshrAmt = Log2_32(bytes);
-    Value *chunkOff = getChunkOff(IRB, pScalarizedIdx);
-    if (bytes == 1)
-      eltIx = chunkOff;
-    else
-      eltIx = IRB.CreateLShr(chunkOff, IRB.getInt32(lshrAmt));
-  }
-
-  Value *addrInElt = convertToPtr(IRB, m_DL, addr, pStore->getPointerOperandType());
-  Value *gep = IRB.CreateGEP(pStore->getValueOperand()->getType(), addrInElt, eltIx,
-                             VALUE_NAME(pStore->getName() + ".SOAPrivMemGEP"));
+  Value *gep = getTransposedEltPtr(IRB, pStore->getValueOperand()->getType(), pScalarizedIdx,
+                                   VALUE_NAME(pStore->getName() + ".SOAPrivMemGEP"));
   IRB.CreateAlignedStore(pStore->getValueOperand(), gep, IGCLLVM::getAlign(*pStore));
 
   pStore->eraseFromParent();
@@ -803,6 +797,27 @@ void TransposePrivMem::handleLifetimeMark(IntrinsicInst *inst) {
   IGC_ASSERT((inst->getIntrinsicID() == llvm::Intrinsic::lifetime_start) ||
              (inst->getIntrinsicID() == llvm::Intrinsic::lifetime_end));
   inst->eraseFromParent();
+}
+
+void TransposePrivMem::handlePredicatedLoadInst(PredicatedLoadIntrinsic *pPredLoad, Value *pScalarizedIdx) {
+  IGC_ASSERT(nullptr != pPredLoad);
+  IGC_ASSERT(pPredLoad->isSimple());
+  // Only scalar predicated loads reach here; vector ones block SoA promotion in
+  // SOALayoutChecker and are resolved on the flat path instead.
+  Type *loadTy = pPredLoad->getType();
+  IGC_ASSERT(!loadTy->isVectorTy());
+  IGCLLVM::IRBuilder<> IRB(pPredLoad);
+  Value *gep = getTransposedEltPtr(IRB, loadTy, pScalarizedIdx, VALUE_NAME(pPredLoad->getName() + ".SOAPrivMemGEP"));
+
+  Module *Mod = pPredLoad->getModule();
+  Type *ITys[3] = {loadTy, gep->getType(), loadTy};
+  Function *predLoadFunc = GenISAIntrinsic::getDeclaration(Mod, GenISAIntrinsic::GenISA_PredicatedLoad, ITys);
+  Value *Args[4] = {gep, pPredLoad->getAlignmentValue(), pPredLoad->getPredicate(), pPredLoad->getMergeValue()};
+  Instruction *newPredLoad = IRB.CreateCall(predLoadFunc, Args);
+  newPredLoad->setDebugLoc(pPredLoad->getDebugLoc());
+
+  pPredLoad->replaceAllUsesWith(newPredLoad);
+  pPredLoad->eraseFromParent();
 }
 
 [[maybe_unused]] bool PrivateMemoryResolution::testTransposedMemory(const Type *pTmpType,
@@ -1048,11 +1063,10 @@ bool PrivateMemoryResolution::resolveAllocaInstructions(bool privateOnStack, boo
         auto DbgDcls = IGCLLVM::findDbgDeclareUses(pAI);
         for (auto DbgDcl : DbgDcls) {
           unsigned scalarBufferOffset = m_ModAllocaInfo->getBufferOffset(pAI);
-          unsigned bufferSize = m_ModAllocaInfo->getBufferStride(pAI);
+          unsigned bufferStride = m_ModAllocaInfo->getBufferStride(pAI);
 
-          // Record storage offset/size so DwarfCompileUnit can interpret this as a
-          // stack-based location and safely inline it even with optimizations disabled (O0).
-          Ctx.m_DbgVarStorageMap[DbgDcl] = {scalarBufferOffset, bufferSize};
+          // Record stack based location which we can inline even with optimizations disabled (O0).
+          Ctx.m_DbgVarStorageMap[DbgDcl] = {scalarBufferOffset, bufferStride, /*isStackBased=*/true};
         }
       }
       // Replace all uses of original alloca with the bitcast
@@ -1153,7 +1167,7 @@ bool PrivateMemoryResolution::resolveAllocaInstructions(bool privateOnStack, boo
       Value *privateBufferPTR;
 
       // New Algo handles both 64bit ptr and 32bi ptr.
-      if (!isUniform && SOAInfo.canUseSOALayout && SOAChecker.useNewAlgo(pTypeOfAccessedObject)) {
+      if (!isUniform && SOAInfo.canUseSOALayout && SOAInfo.useNewAlgoTranspose) {
         Value *simdBufferOffset =
             m_ModAllocaInfo->getOffset(builder, pAI, simdSize, simdLaneId, SOAInfo.SOAPartitionBytes);
         Value *bufferBase = addOffset(builder, DL, threadBase, simdBufferOffset);
@@ -1310,7 +1324,7 @@ bool PrivateMemoryResolution::resolveAllocaInstructions(bool privateOnStack, boo
     // If we can use SOA layout transpose the memory
     IGC::SOALayoutChecker SOAChecker(*pAI, Ctx.type == ShaderType::OPENCL_SHADER, OpenCLShaderStrategy);
     IGC::SOALayoutInfo SOAInfo = SOAChecker.getOrGatherInfo();
-    if (!isUniform && SOAInfo.canUseSOALayout && SOAChecker.useNewAlgo(SOAInfo.baseType)) {
+    if (!isUniform && SOAInfo.canUseSOALayout && SOAInfo.useNewAlgoTranspose) {
       uint32_t chunksize = SOAInfo.SOAPartitionBytes;
       Value *SIMDBufferOffset = m_ModAllocaInfo->getOffset(builder, pAI, simdSize, simdLaneId, chunksize);
       Value *totalOffset = addOffset(builder, DL, perThreadOffset, SIMDBufferOffset);
@@ -1345,9 +1359,9 @@ bool PrivateMemoryResolution::resolveAllocaInstructions(bool privateOnStack, boo
     if (modMD->compOpt.OptDisable) {
       auto DbgDcls = IGCLLVM::findDbgDeclareUses(pAI);
       for (auto DbgDcl : DbgDcls) {
-        // Record in the cross-pass side-map (offset only; no size needed here).
         unsigned int scalarBufferOffset = m_ModAllocaInfo->getBufferOffset(pAI);
-        Ctx.m_DbgVarStorageMap[DbgDcl] = {scalarBufferOffset, std::nullopt};
+        unsigned int bufferStride = m_ModAllocaInfo->getBufferStride(pAI);
+        Ctx.m_DbgVarStorageMap[DbgDcl] = {scalarBufferOffset, bufferStride, /*isStackBased=*/false};
       }
     }
 

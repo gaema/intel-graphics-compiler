@@ -24,6 +24,7 @@ SPDX-License-Identifier: MIT
 #include "common/LLVMWarningsPop.hpp"
 // clang-format on
 
+#include <functional>
 #include <limits>
 #include <list>
 #include <map>
@@ -50,6 +51,7 @@ enum BankConflict {
 
 class VarSplit;
 class SpillAnalysis;
+class PhyRegAllocationState;
 
 class BankConflictPass {
 private:
@@ -165,6 +167,7 @@ class LiveRange final {
   unsigned numRegNeeded;
   unsigned degree = 0;
   unsigned refCount = 0;
+  unsigned rawRefCount = 0;
   unsigned parentLRID = 0;
   AssignedReg reg;
   float spillCost = 0.0f;
@@ -236,6 +239,10 @@ public:
   unsigned getRefCount() const { return refCount; }
   void setRefCount(unsigned count) { refCount = count; }
 
+  unsigned getRawRefCount() const { return rawRefCount; }
+  void incRawRefCount() { rawRefCount++; }
+  void resetRawRefCount() { rawRefCount = 0; }
+
   float getSpillCost() const { return spillCost; }
   void setSpillCost(float cost) { spillCost = cost; }
 
@@ -275,6 +282,15 @@ public:
   void markForbidden(vISA::Mem_Manager &GCMem, int reg, int numReg);
   const BitSet *getForbidden();
   int getNumForbidden();
+
+  // Snapshot / restore the forbidden set. Called by
+  // GraphColor::breakSLMLoadSendAntiDep for fallback path.
+  BitSet *getForbiddenPtr() const { return forbidden; }
+  forbiddenKind getForbiddenType() const { return forbiddenType; }
+  void restoreForbidden(BitSet *bs, forbiddenKind k) {
+    forbidden = bs;
+    forbiddenType = k;
+  }
   G4_RegVar *getVar() const { return var; }
   G4_Declare *getDcl() const { return dcl; }
   G4_RegFileKind getRegKind() const { return regKind; }
@@ -286,6 +302,7 @@ public:
   void setCallerSaveBias(bool v) { callerSaveBias = v; }
   bool getCallerSaveBias() const { return callerSaveBias; }
 
+  // FIXME: Are these relevant when builder.hasEOTGRFBinding() == false?
   void setEOTSrc() { isEOTSrc = true; }
   bool getEOTSrc() const { return isEOTSrc; }
 
@@ -1084,9 +1101,12 @@ class GraphColor {
   // Reserved GRF count for fail-safe RA
   unsigned reserveSpillGRFCount = 0;
 
-  template<bool Support4GRFAlign>
+  bool UseRelaxedDegree = false;
+
+  template <bool Support4GRFAlign, bool UseRelaxedDegreeV>
   unsigned edgeWeightGRF(const LiveRange *lr1, const LiveRange *lr2);
   unsigned edgeWeightARF(const LiveRange *lr1, const LiveRange *lr2);
+  template <bool UseRelaxedDegreeV>
   static unsigned edgeWeightGRF(bool lr1EvenAlign, bool lr2EvenAlign,
                                 unsigned lr1_nreg, unsigned lr2_nreg) {
     unsigned sum = lr1_nreg + lr2_nreg;
@@ -1097,13 +1117,20 @@ class GraphColor {
     if (!lr2EvenAlign)
       return sum + 1 - ((sum) % 2);
 
+    if constexpr (UseRelaxedDegreeV) {
+      if (lr1_nreg == 2 && lr2_nreg == 2)
+        return 2;
+    }
+
     return sum - 1 + (lr1_nreg % 2) + (lr2_nreg % 2);
   }
 
+  template <bool UseRelaxedDegreeV>
   static unsigned edgeWeightWith4GRF(int lr1Align, int lr2Align,
                                      unsigned lr1_nreg, unsigned lr2_nreg) {
     if (lr1Align < 4 && lr2Align < 4)
-      return edgeWeightGRF(lr1Align == 2, lr2Align == 2, lr1_nreg, lr2_nreg);
+      return edgeWeightGRF<UseRelaxedDegreeV>(lr1Align == 2, lr2Align == 2,
+                                             lr1_nreg, lr2_nreg);
 
     auto roundUpToMultipleOf4 = [](unsigned int N) {
       return ((N + 3) / 4) * 4;
@@ -1179,8 +1206,7 @@ class GraphColor {
     }
   }
 
-  template <bool Support4GRFAlign>
-  void computeDegreeForGRF();
+  template <bool Support4GRFAlign> void computeDegreeForGRF();
   void computeDegreeForARF();
   void computeSpillCosts(bool useSplitLLRHeuristic, const RPE *rpe);
   void determineColorOrdering();
@@ -1193,6 +1219,18 @@ class GraphColor {
     // Do graph coloring without bank conflict reduction.
     return assignColors(h, false, false);
   }
+  // In-RA anti-dependency breaking for SLM load-send destinations.
+  void breakSLMLoadSendAntiDep(
+      ColorHeuristic colorHeuristicGRF, PhyRegAllocationState &parms,
+      const std::function<bool(LiveRange *)> &assignColor);
+  // SLMLoadRecolorCand: an SLM load-send destination root and its size.
+  struct SLMLoadRecolorCand {
+      G4_Declare* root;
+      // destination size in GRFs
+      unsigned rows;
+  };
+  // Helper function for breakSLMLoadSendAntiDep
+  std::vector<std::vector<SLMLoadRecolorCand>> collectSLMLoadAntiDepCandidates();
 
   void clearSpillAddrLocSignature() {
     std::fill(spAddrRegSig.begin(), spAddrRegSig.end(), 0);
@@ -1444,7 +1482,7 @@ private:
   void markSlot1HwordSpillFill(G4_BB *);
   void expandSpillIntrinsic(G4_BB *);
   void expandFillIntrinsic(G4_BB *);
-  void spillFillPropagation();
+  unsigned spillFillPropagation();
   void expandSpillFillIntrinsics(unsigned);
   void expandSpillFillIntrinsicsXE3P(unsigned int);
   void saveRestoreA0(G4_BB *);
@@ -1891,17 +1929,18 @@ public:
   }
 
   unsigned get_bundle(unsigned baseReg, int offset) const {
-    if (builder.has64bundleSize2GRFPerBank()) {
+    // Note the order of check cannot be changed.
+    if (builder.has64bundleSize2GRFPerBank()) { // == Xe_ARL
       return (((baseReg + offset) % 32) / 4);
     }
-    if (builder.hasPartialInt64Support()) {
-      return (((baseReg + offset) % 32) / 2);
-    }
-    if (builder.has64bundleSize()) {
+    if (builder.has64bundleSize()) { // >= Xe2
       if (builder.kernel.getNumRegTotal() == 512) {
         return (((baseReg + offset) % 32) / 2);
       }
       return (((baseReg + offset) % 16) / 2);
+    }
+    if (builder.hasPartialInt64Support()) { // >= Xe_PVC
+      return (((baseReg + offset) % 32) / 2);
     }
     return (((baseReg + offset) % 64) / 4);
   }

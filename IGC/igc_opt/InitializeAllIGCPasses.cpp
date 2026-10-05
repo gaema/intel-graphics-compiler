@@ -166,6 +166,7 @@ void initializeAllIGCPasses(llvm::PassRegistry &Registry) {
   initializeSPIRMetaDataTranslationLPMPass(Registry);
   initializeSplitStructurePhisPassPass(Registry);
   initializeMergeScalarPhisPassPass(Registry);
+  initializePromotePhiToSourceWidthPass(Registry);
   initializeTypeLegalizerPass(Registry);
   initializeVectorPreProcessPass(Registry);
   initializeVectorProcessPass(Registry);
@@ -208,6 +209,7 @@ void initializeAllIGCPasses(llvm::PassRegistry &Registry) {
   initializeLowerGPCallArgLPMPass(Registry);
   IGC::initializePredefinedConstantResolvingLPMPass(Registry);
   initializePromoteToPredicatedMemoryAccessPass(Registry);
+  initializeBranchToSelectPass(Registry);
   initializeHoistConvOpToDomPass(Registry);
   initializeFixResourcePtrLPMPass(Registry);
   IGC::initializePushAnalysisPass(Registry);
@@ -294,6 +296,8 @@ void initializeAllIGCPasses(llvm::PassRegistry &Registry) {
   initializeStatelessOffsetNarrowingPass(Registry);
   initializeMemOpt2Pass(Registry);
   initializeSplitLoadsPass(Registry);
+  initializeSplitPHIsOfAllocaPointersPass(Registry);
+  initializeSplitSelectsOfAllocaPointersPass(Registry);
   initializeResolveSampledImageBuiltinsLPMPass(Registry);
   initializeLowerImplicitArgIntrinsicsPass(Registry);
   initializeCanonicalizeMulAddPass(Registry);
@@ -318,6 +322,7 @@ void initializeAllIGCPasses(llvm::PassRegistry &Registry) {
   initializeVariableReuseAnalysisPass(Registry);
   initializePreprocessSPVIRLPMPass(Registry);
   initializeConvertUserSemanticDecoratorOnFunctionsLPMPass(Registry);
+  initializeConvertSPIRVExecutionModesLPMPass(Registry);
   initializePromoteSubByteLPMPass(Registry);
   initializeHandleSpirvDecorationMetadataLPMPass(Registry);
   initializeResolveConstExprCallsLPMPass(Registry);
@@ -330,7 +335,6 @@ void initializeAllIGCPasses(llvm::PassRegistry &Registry) {
   initializeBufferBoundsCheckingPatcherLPMPass(Registry);
   initializeFPRoundingModeCoalescingPass(Registry);
   initializeMinimumValidAddressCheckingLPMPass(Registry);
-  initializeTranslateToProgrammableOffsetsPassPass(Registry);
   initializeDynamicRayManagementPassPass(Registry);
   IGC::initializeFreezeIntDivLPMPass(Registry);
   IGC::initializeEvaluateFreezePass(Registry);
@@ -351,10 +355,12 @@ void initializeAllIGCPasses(llvm::PassRegistry &Registry) {
   initializeWaveShuffleIndexSinkingPass(Registry);
   IGC::initializeAddRequiredMemoryFencesPass(Registry);
   initializeInstructionHoistingOptimizationPass(Registry);
+  initializeSamplerLoopSpeculationPass(Registry);
   initializeSinkPointerConstAddPassPass(Registry);
   initializeWaveBallotCSEPass(Registry);
   initializeSpvPredicatedIOResolutionLPMPass(Registry);
   initializeProcessBICodeAssumptionLPMPass(Registry);
+  initializeFoldZeroInitAllocaIntoMemsetLPMPass(Registry);
   initializePrintFPRangeAnalysisPass(Registry);
   initializeSimpleAluVectorizerPass(Registry);
   initializeRedundantOpsCSEPassPass(Registry);

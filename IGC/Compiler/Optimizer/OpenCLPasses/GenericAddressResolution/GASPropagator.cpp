@@ -9,6 +9,7 @@ SPDX-License-Identifier: MIT
 #include "llvmWrapper/IR/Intrinsics.h"
 #include "llvmWrapper/IR/DerivedTypes.h"
 #include "llvmWrapper/IR/Instructions.h"
+#include "DebugInfo/DbgVariableTypes.hpp"
 
 using namespace IGC;
 
@@ -468,18 +469,6 @@ bool GASPropagator::visitCallInst(CallInst &I) {
   return false;
 }
 
-bool GASPropagator::visitDbgDeclareInst(DbgDeclareInst &I) {
-  MetadataAsValue *MAV = MetadataAsValue::get(TheVal->getContext(), ValueAsMetadata::get(TheVal));
-  I.replaceVariableLocationOp(I.getVariableLocationOp(0), MAV);
-  return true;
-}
-
-bool GASPropagator::visitDbgValueInst(DbgValueInst &I) {
-  MetadataAsValue *MAV = MetadataAsValue::get(TheVal->getContext(), ValueAsMetadata::get(TheVal));
-  I.replaceVariableLocationOp(I.getVariableLocationOp(0), MAV);
-  return true;
-}
-
 bool GASPropagator::propagateToAllUsers(AddrSpaceCastInst *I) {
   // Since %49 is used twice in a phi instruction like the one below:
   // %56 = phi %"class.someclass" addrspace(4)* [ %49, %53 ], [ %49, %742 ]
@@ -495,16 +484,26 @@ bool GASPropagator::propagateToAllUsers(AddrSpaceCastInst *I) {
     }
   }
 
-  if (auto *L = LocalAsMetadata::getIfExists(I))
-    if (auto *MDV = MetadataAsValue::getIfExists(I->getContext(), L))
-      for (auto &Use : MDV->uses())
-        Uses.push_back(&Use);
-
   bool Changed = false;
-  // Propagate that source through all users of this cast.
+  // Propagate that source through all (instruction) users of this cast.
   for (Use *U : Uses) {
     Changed |= propagateToUser(U, I->getOperand(0));
   }
+
+  // dbg.value/dbg.declare users reference I through metadata, so they are not in
+  // I->uses(); on LLVM >=22 they are debug records, not instructions, and are
+  // invisible to I->users(). IGC::findDbgUsers surfaces them on both versions.
+  // Redirect them to the cast source so the variable keeps a live location once
+  // a dead cast is erased. addrspacecast is a debug no-op (same numeric address),
+  // so the DIExpression stays valid; this mirrors the non-debug users repointed
+  // at the source above.
+  llvm::SmallVector<IGC::DbgVarInstEntry *, 4> DbgUsers;
+  IGC::findDbgUsers(DbgUsers, I);
+  for (auto *E : DbgUsers) {
+    E->replaceVariableLocationOp(I, I->getOperand(0));
+    Changed = true;
+  }
+
   return Changed;
 }
 

@@ -54,7 +54,6 @@ SPDX-License-Identifier: MIT
 #include "llvm/IR/TypeFinder.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/LegacyPassManager.h"
-#include "llvm/Transforms/Utils/UnifyFunctionExitNodes.h"
 #include "llvm/Transforms/Utils.h"
 #include "llvm/Support/YAMLTraits.h"
 #include "llvm/Support/ManagedStatic.h"
@@ -63,8 +62,13 @@ SPDX-License-Identifier: MIT
 #include "llvmWrapper/IR/DerivedTypes.h"
 #include "llvmWrapper/IR/Type.h"
 #include "llvmWrapper/IR/Instructions.h"
+#include "llvmWrapper/IR/Intrinsics.h"
 #include "llvmWrapper/Support/YAMLParser.h"
 #include "llvmWrapper/IR/LLVMContext.h"
+
+#if LLVM_VERSION_MAJOR < 22
+#include "llvm/Transforms/Utils/UnifyFunctionExitNodes.h"
+#endif
 
 #include <map>
 #include <optional>
@@ -910,7 +914,7 @@ bool processCreate(const Function &F, raw_ostream &OS, const AnnotationMap &Anno
           getIntrinsicInfoTableEntries(II->getIntrinsicID(), Table);
           ArrayRef<Intrinsic::IITDescriptor> TableRef = Table;
 
-          if (Intrinsic::matchIntrinsicSignature(FTy, TableRef, ArgTys)) {
+          if (!IGCLLVM::isSignatureValid(II->getIntrinsicID(), FTy, TableRef, ArgTys)) {
             assert(0 && "unhandled?");
           }
 
@@ -968,13 +972,13 @@ bool processCreate(const Function &F, raw_ostream &OS, const AnnotationMap &Anno
           else
             OS << "return";
         }
-      } else if (auto *BI = dyn_cast<BranchInst>(&I)) {
+      } else if (isa<IGCLLVM::CondBrInst, IGCLLVM::UncondBrInst>(&I)) {
         // branch argument ordering is unusual, do this manually.
-        if (BI->isConditional()) {
+        if (auto *BI = dyn_cast<IGCLLVM::CondBrInst>(&I)) {
           OS << "derived().CreateCondBr(" << repr(BI->getCondition()) << ", " << repr(BI->getSuccessor(0)) << ", "
              << repr(BI->getSuccessor(1)) << ")";
         } else {
-          OS << "derived().CreateBr(" << repr(BI->getSuccessor(0)) << ")";
+          OS << "derived().CreateBr(" << repr(I.getSuccessor(0)) << ")";
         }
       } else {
         unknownInst(I);

@@ -175,8 +175,7 @@ public:
   void TraceRay(CVariable *destination, TRACE_RAY_OPCODE opcode, CVariable *globalBufferPointer,
                 STACK_ADDRESS_MODE stackAddressMode, CVariable *payload);
 
-  void BTD(BTD_OPCODE opcode, CVariable *globalBufferPointer, CVariable *stackId, CVariable *shaderRecordIdentifier
-  );
+
   void ExtendedCacheControl(LSC_CACHE_OPTS cacheControlPolicy, LSC_CACHE_CTRL_OPERATION cacheControlOperation,
                             LSC_CACHE_CTRL_SIZE cacheControlSize, CVariable *cacheLineAddresses,
                             LSC_DOC_ADDR_SPACE addressSpace);
@@ -949,6 +948,7 @@ inline void CEncoder::EndForcedNoMaskRegion() {
 }
 
 inline void CEncoder::SetNoMask() { m_encoderState.m_noMask = true; }
+
 
 inline void CEncoder::SetMask(e_mask mask) { m_encoderState.m_mask = mask; }
 

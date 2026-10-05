@@ -9,6 +9,7 @@ SPDX-License-Identifier: MIT
 #include "Compiler/CodeGenPublic.h"
 #include "Compiler/CISACodeGen/helper.h"
 #include "Compiler/CISACodeGen/CISACodeGen.h"
+#include "Compiler/CISACodeGen/GenCodeGenModule.h"
 #include "Compiler/CISACodeGen/OpenCLKernelCodeGen.hpp"
 #include "Compiler/Optimizer/OpenCLPasses/KernelArgs/KernelArgs.hpp"
 #include "common/LLVMWarningsPush.hpp"
@@ -835,6 +836,7 @@ void ChangePtrTypeInIntrinsic(llvm::GenIntrinsicInst *&pIntr, llvm::Value *oldPt
   pNewIntr = llvm::GenISAIntrinsic::getDeclaration(pModule, id, overloadedTys);
 
   llvm::CallInst *pNewCall = llvm::CallInst::Create(pNewIntr, args, "", IGCLLVM::insertPosition(pIntr));
+  pNewCall->copyMetadata(*pIntr);
   pNewCall->setDebugLoc(pIntr->getDebugLoc());
 
   pIntr->replaceAllUsesWith(pNewCall);
@@ -1226,6 +1228,16 @@ bool isSubGroupShuffleVariant(const llvm::Instruction *I) {
   }
 }
 
+bool shouldEmitMoreMoviCases(CodeGenContext *ctx) {
+  // exclude OCL shaders from movi promotion currently.
+  bool enabled = ctx->platform.allowEmitMoreMoviCases() && ctx->type != ShaderType::OPENCL_SHADER;
+  // Disable movi promotion on retry when spilling occurred, to reduce
+  // register pressure from NoMask sanitization temporaries.
+  if (enabled && ctx->m_retryManager && !ctx->m_retryManager->IsFirstTry())
+    enabled = false;
+  return enabled;
+}
+
 bool subgroupIntrinsicHasHelperLanes(const Instruction &I) {
   const GenIntrinsicInst *GII = dyn_cast<GenIntrinsicInst>(&I);
   if (!GII)
@@ -1284,6 +1296,21 @@ bool isBarrierIntrinsic(const llvm::Instruction *I) {
   case GenISAIntrinsic::GenISA_threadgroupnamedbarriers_signal:
   case GenISAIntrinsic::GenISA_threadgroupnamedbarriers_wait:
   case GenISAIntrinsic::GenISA_wavebarrier:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool isDPAS(const llvm::Value *V) {
+  const GenIntrinsicInst *GII = dyn_cast<GenIntrinsicInst>(V);
+  if (!GII)
+    return false;
+
+  switch (GII->getIntrinsicID()) {
+  case GenISAIntrinsic::GenISA_dpas:
+  case GenISAIntrinsic::GenISA_sub_group_dpas:
+  case GenISAIntrinsic::GenISA_sub_group_bdpas:
     return true;
   default:
     return false;
@@ -1400,6 +1427,8 @@ bool SupportsModifier(llvm::Instruction *inst, const IGC::CPlatform &platform) {
     return !inst->getType()->isIntegerTy(64);
   case Instruction::URem:
     // neg mod is negative. Disable it as URem must have positive operands,
+    return false;
+  case Instruction::SExt:
     return false;
   default:
     break;
@@ -2222,12 +2251,51 @@ Function *getUniqueEntryFunc(const IGCMD::MetaDataUtils *pM, IGC::ModuleMetaData
   return entryFunc;
 }
 
-int getSIMDSize(const IGC::ModuleMetaData *modMD, llvm::Function *F) {
-  auto it = modMD->FuncMD.find(F);
+int getSIMDSize(const IGC::ModuleMetaData *modMD, const llvm::Function *F) {
+  auto it = modMD->FuncMD.find(const_cast<llvm::Function *>(F));
   if (it != modMD->FuncMD.end()) {
     return it->second.requiredSubGroupSize;
   }
   return 0;
+}
+
+SIMDMode bestGuessSIMDSize(const CodeGenContext *CTX, const llvm::Function *F, GenXFunctionGroupAnalysis *FGA) {
+  switch (IGC_GET_FLAG_VALUE(ForceOCLSIMDWidth)) {
+  case 0:
+    break;
+  case 8:
+    return SIMDMode::SIMD8;
+  case 16:
+    return SIMDMode::SIMD16;
+  case 32:
+    return SIMDMode::SIMD32;
+  }
+
+  // simd size of the kernel has the priority, if we can do that
+  unsigned SimdSize = IGC::getSIMDSize(CTX->getModuleMetaData(), F);
+  if (FGA) {
+    const llvm::Function *Kernel = F;
+    auto *FG = FGA->getGroup(F);
+    Kernel = FG ? FG->getHead() : nullptr;
+    if (Kernel)
+      SimdSize = IGC::getSIMDSize(CTX->getModuleMetaData(), Kernel);
+  }
+  if (SimdSize)
+    return lanesToSIMDMode(SimdSize);
+
+  if (!CTX->platform.isProductChildOf(IGFX_PVC))
+    return SIMDMode::SIMD8;
+
+  bool abortOnSpills =
+      IGC_GET_FLAG_VALUE(AllowSIMD16DropForXE2Plus) && (CTX->platform.isCoreXE2() || CTX->platform.isCoreXE3());
+  auto FG = FGA ? FGA->getGroup(F) : nullptr;
+  bool hasStackCall = (FG && FG->hasStackCall()) || (F && F->hasFnAttribute("visaStackCall"));
+  bool isIndirectGroup = FG && FGA->isIndirectCallGroup(FG);
+  bool hasSubroutine = FG && !FG->isSingle() && !hasStackCall && !isIndirectGroup;
+  if (abortOnSpills || hasSubroutine) {
+    return SIMDMode::SIMD16;
+  }
+  return SIMDMode::SIMD32;
 }
 
 #define DEBUG_TYPE "kernel-simd-resolver"
@@ -3185,9 +3253,10 @@ ExtractBoundsResult ExtractBounds(llvm::Use &U, llvm::AssumptionCache &AC, llvm:
       U.set(Operand);
 
       if (MaybeLaunder->user_empty()) {
-        CRFromErasedLaunder = llvm::computeConstantRange(MaybeLaunder, /*ForSigned=*/false,
-                                                         /*UseInstrInfo=*/true, &AC, CtxI,
-                                                         /*DT=*/nullptr, /*Depth=*/0);
+        CRFromErasedLaunder =
+            IGCLLVM::computeConstantRange(MaybeLaunder, /*ForSigned=*/false, MaybeLaunder->getModule()->getDataLayout(),
+                                          /*UseInstrInfo=*/true, &AC, CtxI,
+                                          /*DT=*/nullptr, /*Depth=*/0);
         MaybeLaunder->eraseFromParent();
         V = nullptr;
       }
@@ -3200,16 +3269,17 @@ ExtractBoundsResult ExtractBounds(llvm::Use &U, llvm::AssumptionCache &AC, llvm:
 
   const llvm::DataLayout &DL = CtxI->getModule()->getDataLayout();
 
-  llvm::ConstantRange CRFromOperand = llvm::computeConstantRange(
-      Result.SourceValue, /*ForSigned=*/false, /*UseInstrInfo=*/true, &AC, CtxI, /*DT=*/nullptr, /*Depth=*/0);
+  llvm::ConstantRange CRFromOperand = IGCLLVM::computeConstantRange(
+      Result.SourceValue, /*ForSigned=*/false, DL, /*UseInstrInfo=*/true, &AC, CtxI, /*DT=*/nullptr, /*Depth=*/0);
   llvm::KnownBits KB = IGCLLVM::computeKnownBits(Result.SourceValue, DL, &AC, CtxI);
   llvm::ConstantRange Combined = CRFromOperand.intersectWith(llvm::ConstantRange::fromKnownBits(KB, false));
 
   if (CRFromErasedLaunder.has_value()) {
     Combined = Combined.intersectWith(*CRFromErasedLaunder);
   } else if (V && V != Result.SourceValue) {
-    llvm::ConstantRange CRFromV = llvm::computeConstantRange(V, /*ForSigned=*/false, /*UseInstrInfo=*/true, &AC, CtxI,
-                                                             /*DT=*/nullptr, /*Depth=*/0);
+    llvm::ConstantRange CRFromV =
+        IGCLLVM::computeConstantRange(V, /*ForSigned=*/false, DL, /*UseInstrInfo=*/true, &AC, CtxI,
+                                      /*DT=*/nullptr, /*Depth=*/0);
     Combined = Combined.intersectWith(CRFromV);
   }
 

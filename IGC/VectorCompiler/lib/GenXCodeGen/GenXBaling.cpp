@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2024 Intel Corporation
+Copyright (C) 2017-2026 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -17,6 +17,7 @@ SPDX-License-Identifier: MIT
 #include "GenXLiveness.h"
 #include "GenXUtil.h"
 
+#include "vc/Support/GenXDiagnostic.h"
 #include "vc/Utils/GenX/GlobalVariable.h"
 #include "vc/Utils/GenX/IntrinsicsWrapper.h"
 
@@ -37,6 +38,7 @@ SPDX-License-Identifier: MIT
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Transforms/Utils/Local.h"
 
 #include "llvmWrapper/Analysis/InstructionSimplify.h"
@@ -254,8 +256,8 @@ void GenXBaling::processInst(Instruction *Inst) {
  * we may have illegal standalone read-region.
  */
 bool GenXBaling::isRegionOKForIntrinsic(unsigned ArgInfoBits,
-                                        const vc::Region &R,
-                                        bool CanSplitBale) {
+                                        const vc::Region &R, bool CanSplitBale,
+                                        const Instruction *Inst) {
   GenXIntrinsicInfo::ArgInfo AI(ArgInfoBits);
   if (!AI.isGeneral())
     return false;
@@ -266,16 +268,20 @@ bool GenXBaling::isRegionOKForIntrinsic(unsigned ArgInfoBits,
   if (R.Indirect && (AI.isDirectOnly()))
     return false;
   unsigned Restriction = AI.getRestriction();
-  if (!Restriction)
-    return true;
 
   const unsigned GRFWidth = ST ? ST->getGRFByteSize() : defaultGRFByteSize;
-  const auto Align = AI.getAlignment();
-  const auto Log2Align = getLogAlignment(Align, GRFWidth * ByteBits);
+  unsigned Log2Align = 0;
+  if (AI.hasDpasSrc2Align() && Inst) {
+    auto *CI = cast<CallInst>(Inst);
+    Log2Align = Log2_32(genx::getDpasSrc2AlignmentBytes(CI, ST));
+  } else if (Restriction) {
+    const auto Align = AI.getAlignment();
+    Log2Align = getLogAlignment(Align, GRFWidth * ByteBits);
+  }
 
   if (Log2Align > 0) {
     IGC_ASSERT_EXIT(Log2Align < 32);
-    const auto ElementsPerAlign = (1 << Log2Align) / R.ElementBytes;
+    const auto ElementsPerAlign = (1U << Log2Align) / R.ElementBytes;
 
     if (R.Indirect) {
       // Instructions that cannot be splitted also cannot allow indirect
@@ -298,6 +304,7 @@ bool GenXBaling::isRegionOKForIntrinsic(unsigned ArgInfoBits,
     // fall through...
   case GenXIntrinsicInfo::FIXED4:
   case GenXIntrinsicInfo::CONTIGUOUS:
+  case GenXIntrinsicInfo::FORCE_GRF_BASE:
     return R.isContiguous();
   case GenXIntrinsicInfo::STRIDE1:
     // For the dot product instructions, the vISA spec just says that the
@@ -543,7 +550,7 @@ bool GenXBaling::operandCanBeBaled(
     // intrinsic, since in that case AI is initialized to a state
     // where there are no region restrictions.)
     Region RdR = makeRegionFromBaleInfo(Opnd, BaleInfo());
-    if (!isRegionOKForIntrinsic(AI.Info, RdR, canSplitBale(Inst)) ||
+    if (!isRegionOKForIntrinsic(AI.Info, RdR, canSplitBale(Inst), Inst) ||
         !genx::isSafeToSink_CheckAVLoadKill(Opnd, Inst, this))
       return false;
 
@@ -1531,22 +1538,26 @@ void GenXBaling::processMainInst(Instruction *Inst, int IntrinID) {
       Simplified = IGCLLVM::simplifyInstruction(Inst, SimplifyQuery(DL));
     } else {
       // SimplifyInstruction does not work on abs, so we roll our own for now.
+      const DataLayout &DL = Inst->getModule()->getDataLayout();
       if (auto C = dyn_cast<Constant>(Inst->getOperand(0))) {
-        if (C->getType()->isIntOrIntVectorTy()) {
-          if (!ConstantExpr::getICmp(CmpInst::ICMP_SLT, C,
-                                     Constant::getNullValue(C->getType()))
-                   ->isNullValue())
-
-            C = ConstantExpr::getNeg(C);
-        } else {
-          if (!ConstantExpr::getFCmp(CmpInst::FCMP_OLT, C,
-                                     Constant::getNullValue(C->getType()))
-                   ->isNullValue()) {
-            C = llvm::ConstantFoldUnaryOpOperand(
-                llvm::Instruction::FNeg, C, Inst->getModule()->getDataLayout());
+        // ConstantFoldCompareInstOperands may fail to fold (returns nullptr),
+        // e.g. for a denormal FP constant when the denormal mode is unknown.
+        // In that case we cannot determine the sign, so we must not simplify.
+        Constant *IsNeg = llvm::ConstantFoldCompareInstOperands(
+            C->getType()->isIntOrIntVectorTy() ? CmpInst::ICMP_SLT
+                                               : CmpInst::FCMP_OLT,
+            C, Constant::getNullValue(C->getType()), DL);
+        if (IsNeg) {
+          if (!IsNeg->isNullValue()) {
+            if (C->getType()->isIntOrIntVectorTy())
+              C = ConstantExpr::getNeg(C);
+            else
+              C = llvm::ConstantFoldUnaryOpOperand(
+                  llvm::Instruction::FNeg, C,
+                  Inst->getModule()->getDataLayout());
           }
+          Simplified = C;
         }
-        Simplified = C;
       }
     }
     if (Simplified) {
@@ -1799,7 +1810,7 @@ void GenXBaling::processTwoAddrSend(CallInst *CI) {
  * setBaleInfo : set BaleInfo for an instruction
  */
 void GenXBaling::setBaleInfo(const Instruction *Inst, genx::BaleInfo BI) {
-  IGC_ASSERT(BI.Bits < 1 << Inst->getNumOperands());
+  IGC_ASSERT(BI.areBaledOperandsBelow(Inst->getNumOperands()));
   LLVM_DEBUG(llvm::dbgs() << "Adding InstMap entry for " << *Inst
                           << "; BI type: " << BI.getTypeString() << "\n");
   InstMap[Inst] = BI;
@@ -1823,8 +1834,22 @@ void GenXBaling::setBaleInfo(const Instruction *Inst, genx::BaleInfo BI) {
  */
 void GenXBaling::setOperandBaled(Instruction *Inst, unsigned OperandNum,
                                  BaleInfo *BI) {
-  // Set the bit.
-  BI->Bits |= 1 << OperandNum;
+  // Set the bit. Inline asm calls can have more operands than BaleInfo can
+  // track. If the operand does not fit in the bitmap it stays unbaled.
+  if (!BI->setOperandBaled(OperandNum)) {
+    IGC_ASSERT_MESSAGE(
+        isa<CallInst>(Inst) && cast<CallInst>(Inst)->isInlineAsm(),
+        "only inline asm is expected to have more operands than the baling "
+        "bitmap can track");
+    vc::warn(Inst->getContext(), "Inline asm baling",
+             "operand #" + Twine(OperandNum) + " is not baled, at most " +
+                 Twine(BaleInfo::MaxBaledOperands) +
+                 " operands can be baled. A large number of inline asm "
+                 "operands may degrade performance because not all "
+                 "optimizations can be applied",
+             Inst);
+    return;
+  }
   // Check whether the operand has more than one use.
   Instruction *BaledInst = cast<Instruction>(Inst->getOperand(OperandNum));
   if (!BaledInst->hasOneUse()) {
@@ -2119,12 +2144,11 @@ void GenXBaling::buildBaleSub(Instruction *Inst, Bale *B,
     }
   }
 
-  IGC_ASSERT(BI.Bits < (1 << Inst->getNumOperands()) ||
-             Inst->getNumOperands() > 16);
+  IGC_ASSERT(BI.areBaledOperandsBelow(Inst->getNumOperands()));
 
   while (BI.Bits) {
     unsigned Idx = genx::log2(BI.Bits);
-    BI.Bits &= ~(1 << Idx);
+    BI.clearOperandBaled(Idx);
     if (Instruction *Op = dyn_cast<Instruction>(Inst->getOperand(Idx)))
       buildBaleSub(Op, B, IncludeAddr);
   }
@@ -2167,7 +2191,7 @@ int GenXBaling::getAddrOperandNum(unsigned IID) const {
  * It is used by GenXLegalization to unbale.
  */
 void GenXBaling::store(BaleInst BI) {
-  IGC_ASSERT(BI.Info.Bits < 1 << BI.Inst->getNumOperands());
+  IGC_ASSERT(BI.Info.areBaledOperandsBelow(BI.Inst->getNumOperands()));
   InstMap[BI.Inst] = BI.Info;
 }
 

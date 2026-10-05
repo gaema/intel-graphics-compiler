@@ -117,6 +117,8 @@ bool G4Verifier::verifyInst(G4_INST *inst) {
         passIndex == Optimizer::PI_addSWSBInfo) {
       // feature verification. Do it twice for now.
       verifyBFMixedMode(inst);
+      verifyByteFloatCvtMov(inst);
+      verifyTF32Mov(inst);
     }
   }
   return true;
@@ -230,16 +232,18 @@ bool G4Verifier::dataHazardCheck(G4_Operand *dst, G4_Operand *src) {
     return false;
   }
 
-  int dstReg = dstStart / kernel.numEltPerGRF<Type_UB>();
-  int dstRegNum = (dstEnd - dstStart + kernel.numEltPerGRF<Type_UB>()) /
-                  kernel.numEltPerGRF<Type_UB>();
-  int srcReg = srcStart / kernel.numEltPerGRF<Type_UB>();
-  int srcRegNum = (srcEnd - srcStart + kernel.numEltPerGRF<Type_UB>()) /
-                  kernel.numEltPerGRF<Type_UB>();
+  unsigned grfSize = kernel.numEltPerGRF<Type_UB>();
+  int dstReg = dstStart / (int)grfSize;
+  // Number of GRFs an operand spans, computed from its absolute start/end
+  // register indices. (end - start + grfSize) / grfSize undercounts when
+  // start is not GRF-aligned.
+  int dstRegNum = dstEnd / (int)grfSize - dstStart / (int)grfSize + 1;
+  int srcReg = srcStart / (int)grfSize;
+  int srcRegNum = srcEnd / (int)grfSize - srcStart / (int)grfSize + 1;
   int srcReg2 = -1;
 
   if (srcRegNum > 1) {
-    srcReg2 = srcReg + 1;
+    srcReg2 = srcEnd / (int)grfSize;
   }
 
   if (dstRegNum >= 2 && srcRegNum == 1) {
@@ -520,12 +524,14 @@ void G4Verifier::verifyOpnd(G4_Operand *opnd, G4_INST *inst) {
         vISA_ASSERT((opnd->getRightBound() - opnd->getLeftBound()) <
                         (4u * kernel.numEltPerGRF<Type_UB>()),
                     "Src cannot span more than 4 GRFs!");
-      } else if ((opnd->getRightBound() - opnd->getLeftBound()) >
-                 (2u * kernel.numEltPerGRF<Type_UB>())) {
+      } else if ((opnd->getRightBound() / kernel.numEltPerGRF<Type_UB>()) -
+                     (opnd->getLeftBound() / kernel.numEltPerGRF<Type_UB>()) +
+                     1 >
+                 2u) {
         if (!(inst->opcode() == G4_pln && inst->getSrc(1) == opnd)) {
           DEBUG_VERBOSE(
-              "Difference between left/right bound is greater than 2 GRF for "
-              "src region. Single non-send opnd cannot span 2 GRFs. lb = "
+              "Src region spans more than 2 GRF indices. Single non-send "
+              "opnd cannot span more than 2 GRFs. lb = "
               << opnd->getLeftBound() << ", rb = " << opnd->getRightBound()
               << "\n");
           inst->emit(std::cerr);
@@ -574,6 +580,7 @@ void G4Verifier::verifyOpnd(G4_Operand *opnd, G4_INST *inst) {
         }
       }
 
+
       if (opnd->getLeftBound() != newRgn.getLeftBound()) {
         DEBUG_VERBOSE(
             "Left bound mismatch for src opnd for following inst. Orig lb = "
@@ -610,12 +617,15 @@ void G4Verifier::verifyOpnd(G4_Operand *opnd, G4_INST *inst) {
         vISA_ASSERT((opnd->getRightBound() - opnd->getLeftBound()) <
                         (4u * kernel.numEltPerGRF<Type_UB>()),
                     "Dst cannot span more than 4 GRFs!");
-      } else if ((opnd->getRightBound() - opnd->getLeftBound()) >
-                     (2u * kernel.numEltPerGRF<Type_UB>()) &&
+      } else if ((opnd->getRightBound() / kernel.numEltPerGRF<Type_UB>()) -
+                         (opnd->getLeftBound() /
+                          kernel.numEltPerGRF<Type_UB>()) +
+                         1 >
+                     2u &&
                  (inst->opcode() != G4_madw && inst->opcode() != G4_mullh)) {
         DEBUG_VERBOSE(
-            "Difference between left/right bound is greater than 2 GRF for dst "
-            "region. Single non-send opnd cannot span 2 GRFs. lb = "
+            "Dst region spans more than 2 GRF indices. Single non-send "
+            "opnd cannot span more than 2 GRFs. lb = "
             << opnd->getLeftBound() << ", rb = " << opnd->getRightBound()
             << "\n");
         inst->emit(std::cerr);
@@ -652,6 +662,7 @@ void G4Verifier::verifyOpnd(G4_Operand *opnd, G4_INST *inst) {
         }
       }
 
+
       if (opnd->getLeftBound() != newRgn.getLeftBound()) {
         DEBUG_VERBOSE(
             "Left bound mismatch for dst opnd for following inst. Orig lb = "
@@ -679,7 +690,16 @@ void G4Verifier::verifyOpnd(G4_Operand *opnd, G4_INST *inst) {
       newRgn.setLeftBound(0);
       newRgn.computeRightBound(execSize);
 
-      if (inst->getMaskOffset() > 0) {
+      // ".any"/".all" whole-flag reduction predicates (PRED_ANY_WHOLE /
+      // PRED_ALL_WHOLE, used when the platform lacks predicate-control group
+      // width) always cover the entire flag declare starting at bit 0 (see
+      // G4_Predicate::computeRightBound), independent of the instruction's
+      // mask offset, so their bounds must not be shifted by the mask offset.
+      G4_Predicate_Control predCtrl = newRgn.getControl();
+      bool isWholeFlagReduction =
+          predCtrl == PRED_ANY_WHOLE || predCtrl == PRED_ALL_WHOLE;
+
+      if (inst->getMaskOffset() > 0 && !isWholeFlagReduction) {
         // Update left/right bound as per inst mask offset, eg Q2
         // has offset 8
         newRgn.setLeftBound(newRgn.getLeftBound() + inst->getMaskOffset());
@@ -1354,6 +1374,13 @@ void G4Verifier::verifyDpas(G4_INST *inst) {
 void G4Verifier::verifyAccMov(G4_INST *inst) {
   const G4_Operand *src = inst->getSrc(0);
   const G4_Operand *dst = inst->getDst();
+  if (kernel.fg.builder->relaxedACCRestrictions()) {
+    // for mimic fcvt after translating fcvt to mov
+    if (dst && dst->isAccReg() && dst->getType() == Type_HF && src &&
+        !src->isAccReg() && IS_BYTE_FLOAT(src->getType()))
+      return;
+    // fall-thru
+  }
   if (kernel.fg.builder->hasFormatConversionACCRestrictions() &&
       inst->opcode() == G4_mov && (src->isAccReg() || dst->isAccReg())) {
     const bool allowedICombination =
@@ -1377,42 +1404,91 @@ void G4Verifier::verifyAccMov(G4_INST *inst) {
   }
 }
 
+// Legal mov pairings involving tf32 reaching this point:
+//   tf32 <- f      : real down-convert
+// Both f <- tf32 and tf32 <- tf32 should have been converted to UD <- UD
+// by HWConformity/HWConformityPro.
+void G4Verifier::verifyTF32Mov(G4_INST *inst) {
+  if (inst->opcode() != G4_mov)
+    return;
+  G4_Type dstTy = inst->getDst()->getType();
+  G4_Type srcTy = inst->getSrc(0)->getType();
+  if (dstTy != Type_TF32 && srcTy != Type_TF32)
+    return;
+  vISA_ASSERT((dstTy == Type_TF32 && srcTy == Type_F) &&
+                  inst->getPlatform() >= Xe_PVCXT,
+              "tf32 <- F is supported only on platform PVCXT or later");
+
+  [[maybe_unused]] auto *srcReg = inst->getSrc(0)->isSrcRegRegion()
+                                      ? inst->getSrc(0)->asSrcRegRegion()
+                                      : nullptr;
+  vISA_ASSERT(inst->getPredicate() == nullptr &&
+                  inst->getSaturate() == g4::NOSAT &&
+                  (!srcReg || !srcReg->hasModifier()),
+              "tf32<-f mov must not use predicate, saturation, or source "
+              "modifier");
+}
+
+void G4Verifier::verifyByteFloatCvtMov(G4_INST *inst) {
+  if (inst->opcode() != G4_mov)
+    return;
+  G4_Type dstTy = inst->getDst()->getType();
+  G4_Type srcTy = inst->getSrc(0)->getType();
+
+  // not conversion, skip
+  if (dstTy == srcTy)
+    return;
+
+  // Not byte float, skip
+  if (!(IS_BYTE_FLOAT(dstTy) || IS_BYTE_FLOAT(srcTy)))
+    return;
+
+  if (dstTy == Type_BF8 || srcTy == Type_BF8) {
+    // If one operand is BF8, the other must be HF [PVC+].
+    [[maybe_unused]] bool isBF8ToHF = (dstTy == Type_HF && srcTy == Type_BF8);
+    [[maybe_unused]] bool isHFToBF8 = (dstTy == Type_BF8 && srcTy == Type_HF);
+    vISA_ASSERT(inst->getPlatform() >= Xe_PVC && (isBF8ToHF || isHFToBF8),
+                "bf8 <-> hf is allowed only on PVC or later!");
+  } else if (dstTy == Type_HF8 || srcTy == Type_HF8) {
+    bool isHF8ToHF = (dstTy == Type_HF && srcTy == Type_HF8);
+    bool isHFToHF8 = (dstTy == Type_HF8 && srcTy == Type_HF);
+    [[maybe_unused]] bool isLegal =
+        inst->getPlatform() >= Xe3 && (isHF8ToHF || isHFToHF8);
+    vISA_ASSERT(isLegal, "hf8 <-> hf is allowed only on Xe3 or later");
+  }
+}
 
 //
 // Mixed mode instruction allows bfloat16 operands in the following cases:
 //   1. dst, src0, and src1 for 2 source instructions format not involving
-//   multiplier(mov, add, cmp, sel).
+//      multiplier(mov, add, cmp, sel).
 //   2. dst and src0 for 2 source instructions format involving multiplier(mul,
-//   mac etc).
+//      mac etc).
 //   3. dst, src0, and src1 for 3 source instructions format(mad).
 //   4. Broadcast of bfloat16 scalar is not supported.
 //   5. Unpacked bfloat16 destination with stride 2 when register offset is 0
-//   or 1.
+//      or 1.
 //   6. Packed bfloat16 source and destination when register offset is 0 or 8.
-//   7. Execution size must not be greater than 8.
+//   7. Execution size must not be greater than 8 (or 16 for pvc+).
 //   8. Instructions with pure bfloat16 operands are not supported.
 //
-// **More examples**
+// **Examples**
 //   1. BF imm is not allowed
 //      mov  (1|M0)  r12.0<1>:f  0xffff:bf - ILLEGAL "Imm operand with BF type
 //      is not allowed"
 //   2. BF scalar operand can be used in SIMD1
 //      mul  (1|M0)  r14.0<1>:f  r11.0<0;1,0>:bf  r12.3<0;1,0>:f - OK
-//   3. For SIMD1, scalar operands (both dst/src) of F or BF can have any
-//   subreg!
-//      add  (1|M0)  r16.3<1>:bf  r11.0<0;1,0>:f  r12.3<0;1,0>:f - OK
-//   4. F Operand should have subreg = 0 if execSize > SIMD1
+//   3. F Operand should have subreg = 0 if execSize > SIMD1
 //      add  (2|M0)  r10.4<1>:f  r11.0<1;1,0>:bf   0x12345:f
 //       ILLEGAL "Src0 regioning must be aligned to destination or scalar for
 //       Float/64bit pipes"
-//   5. Others
-//     add  (8|M0)  r16.0<2>:bf  r11.0<1;1,0>:f  r12.0<1;1,0>:f- OK
-//     add  (8|M0)  r16.1<2>:bf  r11.0<1;1,0>:f  r12.8<1;1,0>:f- OK
-//     add  (8|M0)  r16.0<1>:bf  r11.0<1;1,0>:f  r12.8<1;1,0>:f- OK
-//     add  (8|M0)  r16.8<1>:bf  r11.0<1;1,0>:f  r12.0<1;1,0>:f- OK
+//   4. Others
+//      add  (8|M0)  r16.0<2>:bf  r11.0<1;1,0>:f  r12.0<1;1,0>:f- OK
+//      add  (8|M0)  r16.1<2>:bf  r11.0<1;1,0>:f  r12.8<1;1,0>:f- OK
+//      add  (8|M0)  r16.0<1>:bf  r11.0<1;1,0>:f  r12.8<1;1,0>:f- OK
+//      add  (8|M0)  r16.8<1>:bf  r11.0<1;1,0>:f  r12.0<1;1,0>:f- OK
 //         Note that float source operands  can be scalar region <0;1,0>
 //
-//   For PVC, case 6 should be "Execution size must not be greater than 16."
 void G4Verifier::verifyBFMixedMode(G4_INST *inst) {
   auto useGivenType = [](G4_INST *I, G4_Type GivenTy) -> bool {
     G4_Operand *dst = I->getDst();
@@ -1520,6 +1596,7 @@ void G4Verifier::verifyBFMixedMode(G4_INST *inst) {
   }
 
   uint32_t nativeES = kernel.fg.builder->getNativeExecSize();
+  const bool isSIMD1 = (inst->getExecSize() == g4::SIMD1);
   // verify dst
   G4_DstRegRegion *dreg = inst->getDst();
   if (dreg && !dreg->isNullReg() && !inst->isCompare()) {
@@ -1530,7 +1607,7 @@ void G4Verifier::verifyBFMixedMode(G4_INST *inst) {
     bool isLegitUnpackedBF =
         (dreg->getType() == Type_BF && (hs == 2 && (so == 0 || so == 1)));
     bool isLegitF = (dreg->getType() == Type_F && (hs == 1 && so == 0));
-    bool isLegitScalar = (inst->getExecSize() == g4::SIMD1 && hs == 1);
+    bool isLegitScalar = isSIMD1;
     if (!(isLegitPackedBF || isLegitUnpackedBF || isLegitF || isLegitScalar)) {
       // case 5 & 6
       DEBUG_VERBOSE("BF/F Dst has illegal region and type combination!");
@@ -1568,9 +1645,7 @@ void G4Verifier::verifyBFMixedMode(G4_INST *inst) {
         (srcTy == Type_F && !sreg->getRegion()->isScalar() &&
          sreg->getRegion()->isContiguous(inst->getExecSize()) && so == 0);
     bool isLegitScalar =
-        (sreg->getRegion()->isScalar() &&
-         (srcTy == Type_F ||
-          (srcTy == Type_BF && inst->getExecSize() == g4::SIMD1)));
+        isSIMD1 || (sreg->getRegion()->isScalar() && srcTy == Type_F);
     if (!(isLegitPackedBF || isLegitF || isLegitScalar)) {
       // case 5 & 6
       DEBUG_VERBOSE("Src has illegal region and type combination!");

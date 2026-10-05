@@ -23,11 +23,13 @@ define spir_kernel void @test(ptr addrspace(1) %img_2darr) {
   ; CHECK-LABEL: @test(
 
   ; CHECK-NOT: __builtin_IB_OCL_2darr_ldmcs
-  ; CHECK: GenISA.ldmcsptr
+  ; CHECK: %[[MCS_BUF:.*]] = call ptr addrspace(196608) @llvm.genx.GenISA.GetBufferPtr.p196608(i32 0, i32 2)
+  ; CHECK: call <4 x float> @llvm.genx.GenISA.ldmcsptr.v4f32.i32.p196608(i32 %CoordX, i32 %CoordY, i32 %CoordZ, i32 0, ptr addrspace(196608) %[[MCS_BUF]], i32 0, i32 0, i32 0)
   %a = call spir_func <4 x float> @__builtin_IB_OCL_2darr_ldmcs(i64 %img_as_int, <4 x i32> zeroinitializer)
 
   ; CHECK-NOT: __builtin_IB_OCL_2darr_ld2dms
-  ; CHECK: GenISA.ldmsptr
+  ; CHECK: %[[MS_BUF:.*]] = call ptr addrspace(196608) @llvm.genx.GenISA.GetBufferPtr.p196608(i32 0, i32 2)
+  ; CHECK: call <4 x float> @llvm.genx.GenISA.ldmsptr.v4f32.p196608(i32 0, i32 %imcsl, i32 %imcsh, i32 %{{.*}}, i32 %{{.*}}, i32 %{{.*}}, i32 0, ptr addrspace(196608) %[[MS_BUF]], i32 0, i32 0, i32 0)
   %b = call spir_func <4 x float> @__builtin_IB_OCL_2darr_ld2dms(i64 %img_as_int, <4 x i32> zeroinitializer, i32 0, <4 x float> zeroinitializer)
 
   ret void

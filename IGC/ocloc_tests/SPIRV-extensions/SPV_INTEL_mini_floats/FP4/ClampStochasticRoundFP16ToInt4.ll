@@ -11,10 +11,10 @@
 ; RUN: llvm-spirv %t.bc -o %t.spv --spirv-ext=+SPV_INTEL_int4,+SPV_INTEL_fp_conversions
 ; RUN: ocloc compile -spirv_input -file %t.spv -device cri -options "-igc_opts 'ForceOCLSIMDWidth=32,DumpVISAASMToConsole=1,AddVISADumpDeclarationsToEnd=1'" | FileCheck %s
 
-; Test if conversion opcodes are present in spirv disassembly
+; Verify opcode lowering; _builtin_spirv* functions shouldn't be called directly
 ; RUN: llvm-spirv --to-text %t.spv -o %t.spt
-; RUN: cat %t.spt | FileCheck %s -check-prefix=CHECK-SPV
-; CHECK-SPV: StochasticRoundFToSINTEL
+; RUN: FileCheck < %t.spt %s -check-prefix=CHECK-SPIRV
+; CHECK-SPIRV-NOT: __builtin_spirv_
 
 target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024"
 target triple = "spir64-unknown-unknown"
@@ -27,8 +27,8 @@ declare spir_func i64 @_Z33__spirv_BuiltInGlobalInvocationIdi(i32)
 
 define spir_kernel void @FP16_to_Int4_scalar(half addrspace(1)* %input, i32 addrspace(1)* %seed, <2 x i4> addrspace(1)* %output) {
 ; CHECK-LABEL: .kernel "FP16_to_Int4_scalar"
-; CHECK: lfsr.b8v4 (M1, 32) [[RAND:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
-; CHECK-NOT: lfsr.b8v4
+; CHECK: lfsr.b16v2 (M1, 32) [[RAND:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
+; CHECK-NOT: lfsr.b16v2
 ; CHECK-DAG: dnscl.hftoint4.mode0.srnd (M1, 32) [[DST:[A-z0-9]*]].0 [[INPUT0:[A-z0-9]*]].0 [[INPUT1:[A-z0-9]*]].0 [[RAND]].0
 ; CHECK-DAG: mov (M1, 32) [[INPUT1]](0,0)<1> 0x0:ud
 ; CHECK-DAG: // .decl [[INPUT0]] v_type=G type=ud num_elts=32
@@ -52,8 +52,8 @@ declare dso_local spir_func i4 @_Z51__builtin_spirv_ClampStochasticRoundFP16ToIn
 
 define spir_kernel void @FP16_to_Int4_vector2(<2 x half> addrspace(1)* %input, i32 addrspace(1)* %seed, <2 x i4> addrspace(1)* %output) {
 ; CHECK-LABEL: .kernel "FP16_to_Int4_vector2"
-; CHECK: lfsr.b8v4 (M1, 32) [[RAND:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
-; CHECK-NOT: lfsr.b8v4
+; CHECK: lfsr.b16v2 (M1, 32) [[RAND:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
+; CHECK-NOT: lfsr.b16v2
 ; CHECK-DAG: dnscl.hftoint4.mode0.srnd (M1, 32) [[DST:[A-z0-9]*]].0 [[INPUT0:[A-z0-9]*]].0 [[INPUT1:[A-z0-9]*]].0 [[RAND]].0
 ; CHECK-DAG: mov (M1, 32) [[INPUT1]](0,0)<1> 0x0:ud
 ; CHECK-DAG: // .decl [[INPUT0]] v_type=G type=ud num_elts=32
@@ -75,8 +75,8 @@ declare dso_local spir_func <2 x i4> @_Z51__builtin_spirv_ClampStochasticRoundFP
 
 define spir_kernel void @FP16_to_Int4_vector3(<3 x half> addrspace(1)* %input, i32 addrspace(1)* %seed, <4 x i4> addrspace(1)* %output) {
 ; CHECK-LABEL: .kernel "FP16_to_Int4_vector3"
-; CHECK: lfsr.b8v4 (M1, 32) [[RAND:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
-; CHECK-NOT: lfsr.b8v4
+; CHECK: lfsr.b16v2 (M1, 32) [[RAND:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
+; CHECK-NOT: lfsr.b16v2
 ; CHECK: dnscl.hftoint4.mode0.srnd (M1, 32) [[DST:[A-z0-9]*]].0 [[INPUT0:[A-z0-9]*]].0 [[INPUT1:[A-z0-9]*]].0 [[RAND]].0
 ; CHECK-NOT: dnscl.hftoint4
 ; CHECK-DAG: // .decl [[INPUT0]] v_type=G type=ud num_elts=32
@@ -99,8 +99,8 @@ declare dso_local spir_func <3 x i4> @_Z51__builtin_spirv_ClampStochasticRoundFP
 
 define spir_kernel void @FP16_to_Int4_vector4(<4 x half> addrspace(1)* %input, i32 addrspace(1)* %seed, <4 x i4> addrspace(1)* %output) {
 ; CHECK-LABEL: .kernel "FP16_to_Int4_vector4"
-; CHECK: lfsr.b8v4 (M1, 32) [[RAND:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
-; CHECK-NOT: lfsr.b8v4
+; CHECK: lfsr.b16v2 (M1, 32) [[RAND:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
+; CHECK-NOT: lfsr.b16v2
 ; CHECK: dnscl.hftoint4.mode0.srnd (M1, 32) [[DST:[A-z0-9]*]].0 [[INPUT:[A-z0-9]*]].0 [[INPUT]].128 [[RAND]].0
 ; CHECK-NOT: dnscl.hftoint4
 ; CHECK-DAG: // .decl [[INPUT]] v_type=G type=ud num_elts=64
@@ -121,9 +121,9 @@ declare dso_local spir_func <4 x i4> @_Z51__builtin_spirv_ClampStochasticRoundFP
 
 define spir_kernel void @FP16_to_Int4_vector8(<8 x half> addrspace(1)* %input, i32 addrspace(1)* %seed, <8 x i4> addrspace(1)* %output) {
 ; CHECK-LABEL: .kernel "FP16_to_Int4_vector8"
-; CHECK: lfsr.b8v4 (M1, 32) [[RAND0:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
-; CHECK: lfsr.b8v4 (M1, 32) [[RAND1:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
-; CHECK-NOT: lfsr.b8v4
+; CHECK: lfsr.b16v2 (M1, 32) [[RAND0:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
+; CHECK: lfsr.b16v2 (M1, 32) [[RAND1:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
+; CHECK-NOT: lfsr.b16v2
 ; CHECK: dnscl.hftoint4.mode0.srnd (M1, 32) [[DST0:[A-z0-9]*]].0 [[INPUT:[A-z0-9]*]].0 [[INPUT]].256 [[RAND0]].0
 ; CHECK: dnscl.hftoint4.mode2.srnd (M1, 32) [[DST1:[A-z0-9]*]].0 [[INPUT]].128 [[INPUT]].384 [[RAND1]].0
 ; CHECK-NOT: dnscl.hftoint4
@@ -146,11 +146,11 @@ declare dso_local spir_func <8 x i4> @_Z51__builtin_spirv_ClampStochasticRoundFP
 
 define spir_kernel void @FP16_to_Int4_vector16(<16 x half> addrspace(1)* %input, i32 addrspace(1)* %seed, <16 x i4> addrspace(1)* %output) {
 ; CHECK-LABEL: .kernel "FP16_to_Int4_vector16"
-; CHECK: lfsr.b8v4 (M1, 32) [[RAND0:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
-; CHECK: lfsr.b8v4 (M1, 32) [[RAND1:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
-; CHECK: lfsr.b8v4 (M1, 32) [[RAND2:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
-; CHECK: lfsr.b8v4 (M1, 32) [[RAND3:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
-; CHECK-NOT: lfsr.b8v4
+; CHECK: lfsr.b16v2 (M1, 32) [[RAND0:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
+; CHECK: lfsr.b16v2 (M1, 32) [[RAND1:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
+; CHECK: lfsr.b16v2 (M1, 32) [[RAND2:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
+; CHECK: lfsr.b16v2 (M1, 32) [[RAND3:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
+; CHECK-NOT: lfsr.b16v2
 ; CHECK: dnscl.hftoint4.mode0.srnd (M1, 32) [[DST0:[A-z0-9]*]].0 [[INPUT:[A-z0-9]*]].0 [[INPUT]].256 [[RAND0]].0
 ; CHECK: dnscl.hftoint4.mode2.srnd (M1, 32) [[DST1:[A-z0-9]*]].0 [[INPUT]].128 [[INPUT]].384 [[RAND1]].0
 ; CHECK: dnscl.hftoint4.mode0.srnd (M1, 32) [[DST2:[A-z0-9]*]].0 [[INPUT]].512 [[INPUT]].768 [[RAND2]].0
@@ -185,8 +185,8 @@ declare dso_local spir_func <16 x i4> @_Z51__builtin_spirv_ClampStochasticRoundF
 
 define spir_kernel void @FP16_to_Int4_ptr_scalar(half addrspace(1)* %input, i32 addrspace(1)* %seed, <2 x i4> addrspace(1)* %output) {
 ; CHECK-LABEL: .kernel "FP16_to_Int4_ptr_scalar"
-; CHECK: lfsr.b8v4 (M1, 32) [[RAND:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
-; CHECK-NOT: lfsr.b8v4
+; CHECK: lfsr.b16v2 (M1, 32) [[RAND:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
+; CHECK-NOT: lfsr.b16v2
 ; CHECK-DAG: dnscl.hftoint4.mode0.srnd (M1, 32) [[DST:[A-z0-9]*]].0 [[INPUT0:[A-z0-9]*]].0 [[INPUT1:[A-z0-9]*]].0 [[RAND]].0
 ; CHECK-DAG: mov (M1, 32) [[INPUT1]](0,0)<1> 0x0:ud
 ; CHECK-DAG: // .decl [[INPUT0]] v_type=G type=ud num_elts=32
@@ -214,8 +214,8 @@ declare dso_local spir_func i4 @_Z51__builtin_spirv_ClampStochasticRoundFP16ToIn
 
 define spir_kernel void @FP16_to_Int4_ptr_vector2(<2 x half> addrspace(1)* %input, i32 addrspace(1)* %seed, <2 x i4> addrspace(1)* %output) {
 ; CHECK-LABEL: .kernel "FP16_to_Int4_ptr_vector2"
-; CHECK: lfsr.b8v4 (M1, 32) [[RAND:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
-; CHECK-NOT: lfsr.b8v4
+; CHECK: lfsr.b16v2 (M1, 32) [[RAND:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
+; CHECK-NOT: lfsr.b16v2
 ; CHECK-DAG: dnscl.hftoint4.mode0.srnd (M1, 32) [[DST:[A-z0-9]*]].0 [[INPUT0:[A-z0-9]*]].0 [[INPUT1:[A-z0-9]*]].0 [[RAND]].0
 ; CHECK-DAG: mov (M1, 32) [[INPUT1]](0,0)<1> 0x0:ud
 ; CHECK-DAG: // .decl [[INPUT0]] v_type=G type=ud num_elts=32
@@ -241,8 +241,8 @@ declare dso_local spir_func <2 x i4> @_Z51__builtin_spirv_ClampStochasticRoundFP
 
 define spir_kernel void @FP16_to_Int4_ptr_vector3(<3 x half> addrspace(1)* %input, i32 addrspace(1)* %seed, <4 x i4> addrspace(1)* %output) {
 ; CHECK-LABEL: .kernel "FP16_to_Int4_ptr_vector3"
-; CHECK: lfsr.b8v4 (M1, 32) [[RAND:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
-; CHECK-NOT: lfsr.b8v4
+; CHECK: lfsr.b16v2 (M1, 32) [[RAND:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
+; CHECK-NOT: lfsr.b16v2
 ; CHECK: dnscl.hftoint4.mode0.srnd (M1, 32) [[DST:[A-z0-9]*]].0 [[INPUT0:[A-z0-9]*]].0 [[INPUT1:[A-z0-9]*]].0 [[RAND]].0
 ; CHECK-NOT: dnscl.hftoint4
 ; CHECK-DAG: // .decl [[INPUT0]] v_type=G type=ud num_elts=32
@@ -269,8 +269,8 @@ declare dso_local spir_func <3 x i4> @_Z51__builtin_spirv_ClampStochasticRoundFP
 
 define spir_kernel void @FP16_to_Int4_ptr_vector4(<4 x half> addrspace(1)* %input, i32 addrspace(1)* %seed, <4 x i4> addrspace(1)* %output) {
 ; CHECK-LABEL: .kernel "FP16_to_Int4_ptr_vector4"
-; CHECK: lfsr.b8v4 (M1, 32) [[RAND:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
-; CHECK-NOT: lfsr.b8v4
+; CHECK: lfsr.b16v2 (M1, 32) [[RAND:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
+; CHECK-NOT: lfsr.b16v2
 ; CHECK: dnscl.hftoint4.mode0.srnd (M1, 32) [[DST:[A-z0-9]*]].0 [[INPUT:[A-z0-9]*]].0 [[INPUT]].128 [[RAND]].0
 ; CHECK-NOT: dnscl.hftoint4
 ; CHECK-DAG: // .decl [[INPUT]] v_type=G type=ud num_elts=64
@@ -295,9 +295,9 @@ declare dso_local spir_func <4 x i4> @_Z51__builtin_spirv_ClampStochasticRoundFP
 
 define spir_kernel void @FP16_to_Int4_ptr_vector8(<8 x half> addrspace(1)* %input, i32 addrspace(1)* %seed, <8 x i4> addrspace(1)* %output) {
 ; CHECK-LABEL: .kernel "FP16_to_Int4_ptr_vector8"
-; CHECK: lfsr.b8v4 (M1, 32) [[RAND0:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
-; CHECK: lfsr.b8v4 (M1, 32) [[RAND1:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
-; CHECK-NOT: lfsr.b8v4
+; CHECK: lfsr.b16v2 (M1, 32) [[RAND0:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
+; CHECK: lfsr.b16v2 (M1, 32) [[RAND1:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
+; CHECK-NOT: lfsr.b16v2
 ; CHECK: dnscl.hftoint4.mode0.srnd (M1, 32) [[DST0:[A-z0-9]*]].0 [[INPUT:[A-z0-9]*]].0 [[INPUT]].256 [[RAND0]].0
 ; CHECK: dnscl.hftoint4.mode2.srnd (M1, 32) [[DST1:[A-z0-9]*]].0 [[INPUT]].128 [[INPUT]].384 [[RAND1]].0
 ; CHECK-NOT: dnscl.hftoint4
@@ -324,11 +324,11 @@ declare dso_local spir_func <8 x i4> @_Z51__builtin_spirv_ClampStochasticRoundFP
 
 define spir_kernel void @FP16_to_Int4_ptr_vector16(<16 x half> addrspace(1)* %input, i32 addrspace(1)* %seed, <16 x i4> addrspace(1)* %output) {
 ; CHECK-LABEL: .kernel "FP16_to_Int4_ptr_vector16"
-; CHECK: lfsr.b8v4 (M1, 32) [[RAND0:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
-; CHECK: lfsr.b8v4 (M1, 32) [[RAND1:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
-; CHECK: lfsr.b8v4 (M1, 32) [[RAND2:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
-; CHECK: lfsr.b8v4 (M1, 32) [[RAND3:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
-; CHECK-NOT: lfsr.b8v4
+; CHECK: lfsr.b16v2 (M1, 32) [[RAND0:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
+; CHECK: lfsr.b16v2 (M1, 32) [[RAND1:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
+; CHECK: lfsr.b16v2 (M1, 32) [[RAND2:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
+; CHECK: lfsr.b16v2 (M1, 32) [[RAND3:[A-z0-9]*]](0,0)<1> {{.*}}(0,0)<1;1,0> {{.*}}(0,0)<1;1,0>
+; CHECK-NOT: lfsr.b16v2
 ; CHECK: dnscl.hftoint4.mode0.srnd (M1, 32) [[DST0:[A-z0-9]*]].0 [[INPUT:[A-z0-9]*]].0 [[INPUT]].256 [[RAND0]].0
 ; CHECK: dnscl.hftoint4.mode2.srnd (M1, 32) [[DST1:[A-z0-9]*]].0 [[INPUT]].128 [[INPUT]].384 [[RAND1]].0
 ; CHECK: dnscl.hftoint4.mode0.srnd (M1, 32) [[DST2:[A-z0-9]*]].0 [[INPUT]].512 [[INPUT]].768 [[RAND2]].0

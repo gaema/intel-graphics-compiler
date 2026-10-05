@@ -8,6 +8,9 @@
 
 include_guard(DIRECTORY)
 
+# Absolute path to the shared Python helper imported by IGC lit suites
+get_filename_component(IGC_LIT_COMMON_DIR "${CMAKE_CURRENT_LIST_DIR}/../lit_common" ABSOLUTE)
+
 # Convenience function to get list of LLVM components for
 # target_link_library. If LLVM was configured with llvm dylib, then
 # included in dylib llvm targets should be replaced with LLVM
@@ -97,8 +100,13 @@ endfunction()
 
 function(igc_add_lit_target target binary_dir comment)
   cmake_parse_arguments(ARG "" "" "EXTRA;DEPENDS;SOURCES" ${ARGN})
-  set(LIT_ARGS "${LLVM_LIT_ARGS}")
-  separate_arguments(LIT_ARGS)
+  if(DEFINED ENV{COMPONENT_BRANCH} OR DEFINED ENV{BUILD_VERSION} OR DEFINED ENV{CI})
+    # Drop the default --succinct so passing tests are shown in CI.
+    set(LIT_ARGS --verbose)
+  else()
+    set(LIT_ARGS "${LLVM_LIT_ARGS}")
+    separate_arguments(LIT_ARGS)
+  endif()
   if (NOT CMAKE_CFG_INTDIR STREQUAL ".")
     list(APPEND LIT_ARGS --param build_mode=${CMAKE_CFG_INTDIR})
   endif ()

@@ -157,6 +157,13 @@ typedef struct GFX_GMD_ID_DEF
 #define GFX_GMD_ARCH_30                          (30)
 #define GFX_GMD_ARCH_35                          (35)
 
+#define GFX_GMD_ARCH_12_RELEASE_XE_HPG_1255              (55)
+#define GFX_GMD_ARCH_12_RELEASE_XE_HPG_1256              (56)
+#define GFX_GMD_ARCH_12_RELEASE_XE_HPG_1257              (57)
+
+#define GFX_GMD_ARCH_12_RELEASE_XE_HPC_1260              (60)
+#define GFX_GMD_ARCH_12_RELEASE_XE_HPC_1261              (61)
+
 #define GFX_GMD_ARCH_12_RELEASE_XE_LP_MD                 (70)
 #define GFX_GMD_ARCH_12_RELEASE_XE_LP_LG                 (71)
 #define GFX_GMD_ARCH_12_RELEASE_XE_LPG_PLUS_1274         (74)
@@ -171,6 +178,7 @@ typedef struct GFX_GMD_ID_DEF
 #define GFX_GMD_ARCH_30_RELEASE_XE3_LPG_3004             (4)
 #define GFX_GMD_ARCH_30_RELEASE_XE3_LPG_3005             (5)
 #define GFX_GMD_ARCH_35_RELEASE_XE3P_LPG_3510            (10)
+#define GFX_GMD_ARCH_35_RELEASE_XE3P_XPC_3511            (11)
 
 #define GFX_GET_GMD_ARCH_VERSION_RENDER(p)                ((p).sRenderBlockID.GmdID.GMDArch)
 #define GFX_GET_GMD_ARCH_VERSION_DISPLAY(p)               ((p).sDisplayBlockID.GmdID.GMDArch)

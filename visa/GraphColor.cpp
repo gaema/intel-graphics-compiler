@@ -1018,14 +1018,14 @@ void BankConflictPass::setupBankConflictsforMad(G4_INST *inst) {
       }
     }
   }
-  // Add potential bundle conflicts, so that RA can handle it when option
-  // -enableBundleCR with value 2 or 3
-  if (gra.kernel.getuInt32Option(vISA_enableBundleCR) & 2) {
-    if (dcls[0] && dcls[1]) {
+  // Add potential bundle conflicts, so that RA can handle it when bundle
+  // conflict reduction covers non-dpas instructions.
+  if (gra.kernel.fg.builder->doBundleCRForNonDpas()) {
+    if (dcls[0] && dcls[1] && (dcls[0] != dcls[1])) {
       gra.addBundleConflictDcl(dcls[0], dcls[1], offset[0] - offset[1]);
       gra.addBundleConflictDcl(dcls[1], dcls[0], offset[1] - offset[0]);
     }
-    if (dcls[1] && dcls[2]) {
+    if (dcls[1] && dcls[2] && (dcls[1] != dcls[2])) {
       gra.addBundleConflictDcl(dcls[2], dcls[1], offset[2] - offset[1]);
       gra.addBundleConflictDcl(dcls[1], dcls[2], offset[1] - offset[2]);
     }
@@ -1596,8 +1596,8 @@ void LiveRange::checkForInfiniteSpillCost(
   const std::list<G4_INST *>::reverse_iterator rbegin = bb->rbegin();
   if (this->isCandidate == true && it != rbegin) {
     G4_INST *nextInst = NULL;
-    if (this->getRefCount() != 2 || (this->getRegKind() == G4_GRF &&
-                                     this->getDcl()->getAddressed() == true)) {
+    if (this->getRawRefCount() != 2 || (this->getRegKind() == G4_GRF &&
+                                        this->getDcl()->getAddressed() == true)) {
       // If a liverange has > 2 refs then it
       // cannot be a candidate.
       // Also an address taken GRF is not a candidate.
@@ -2595,6 +2595,7 @@ void Interference::setupLRs(G4_BB *bb) {
         if (!inst->isPseudoKill() && !inst->isLifeTimeEnd()) {
           lrs[id]->setRefCount(lrs[id]->getRefCount() +
                                refCount); // update reference count
+          lrs[id]->incRawRefCount();
         }
         lrs[id]->checkForInfiniteSpillCost(bb, i);
       } else if (dst->isIndirect() && liveAnalysis->livenessClass(G4_GRF)) {
@@ -2607,6 +2608,7 @@ void Interference::setupLRs(G4_BB *bb) {
 
           lrs[pt.var->getId()]->setRefCount(
               lrs[pt.var->getId()]->getRefCount() + refCount);
+          lrs[pt.var->getId()]->incRawRefCount();
         }
       }
     }
@@ -2621,6 +2623,7 @@ void Interference::setupLRs(G4_BB *bb) {
           ret->getRegVar()->isRegAllocPartaker()) {
         unsigned id = static_cast<const G4_RegVar *>(ret->getRegVar())->getId();
         lrs[id]->setRefCount(lrs[id]->getRefCount() + refCount);
+        lrs[id]->incRawRefCount();
       }
     }
 
@@ -2683,6 +2686,7 @@ void Interference::setupLRs(G4_BB *bb) {
         unsigned id = ((G4_RegVar *)(srcRegion)->getBase())->getId();
 
         lrs[id]->setRefCount(lrs[id]->getRefCount() + refCount);
+        lrs[id]->incRawRefCount();
         if (inst->isEOT() && liveAnalysis->livenessClass(G4_GRF)) {
           // mark the liveRange as the EOT source
           lrs[id]->setEOTSrc();
@@ -2705,6 +2709,7 @@ void Interference::setupLRs(G4_BB *bb) {
 
           lrs[pt.var->getId()]->setRefCount(
               lrs[pt.var->getId()]->getRefCount() + refCount);
+          lrs[pt.var->getId()]->incRawRefCount();
         }
       }
     }
@@ -2718,6 +2723,7 @@ void Interference::setupLRs(G4_BB *bb) {
         unsigned id = flagReg->asRegVar()->getId();
         if (flagReg->asRegVar()->isRegAllocPartaker()) {
           lrs[id]->setRefCount(lrs[id]->getRefCount() + refCount);
+          lrs[id]->incRawRefCount();
           lrs[id]->checkForInfiniteSpillCost(bb, i);
         }
       } else {
@@ -2735,6 +2741,7 @@ void Interference::setupLRs(G4_BB *bb) {
       unsigned id = flagReg->asRegVar()->getId();
       if (flagReg->asRegVar()->isRegAllocPartaker()) {
         lrs[id]->setRefCount(lrs[id]->getRefCount() + refCount);
+        lrs[id]->incRawRefCount();
       }
     }
   }
@@ -5585,7 +5592,11 @@ Augmentation::RetValType Augmentation::computeRetValType(FuncInfo *func,
   const auto *uses = refs.getUses(retVal);
   if (uses) {
     for (const auto &use : *uses) {
-      auto *predBBC = &bbCache[std::get<1>(use)->getPhysicalPred()->getId()];
+      // Handle the case where use is in entry BB of kernel
+      auto *phyPred = std::get<1>(use)->getPhysicalPred();
+      if (!phyPred)
+        return Augmentation::RetValType::Unknown;
+      auto *predBBC = &bbCache[phyPred->getId()];
       if (predBBC->bb->isSpecialEmptyBB())
         predBBC = &bbCache[predBBC->bb->getPhysicalPred()->getId()];
       if (!predBBC->endsWithCall || predBBC->calleeInfo != func)
@@ -6576,6 +6587,7 @@ GraphColor::GraphColor(LivenessAnalysis &live, bool hybrid, bool forceSpill_)
 {
   spAddrRegSig.resize(builder.getNumAddrRegisters(), 0);
   m_options = builder.getOptions();
+  UseRelaxedDegree = m_options->getOption(vISA_UseRelaxedDegree);
 }
 
 //
@@ -6608,7 +6620,11 @@ void GraphColor::computeDegreeForGRF() {
 
       auto computeDegree = [&](LiveRange *lr1) {
         if (!lr1->getIsPartialDcl()) {
-          unsigned edgeDegree = edgeWeightGRF<Support4GRFAlign>(lrs[i], lr1);
+          unsigned edgeDegree = 0;
+          if (UseRelaxedDegree)
+            edgeDegree = edgeWeightGRF<Support4GRFAlign, true>(lrs[i], lr1);
+          else
+            edgeDegree = edgeWeightGRF<Support4GRFAlign, false>(lrs[i], lr1);
 
           degree += edgeDegree;
 
@@ -6703,12 +6719,16 @@ void GraphColor::computeSpillCosts(bool useSplitLLRHeuristic, const RPE *rpe) {
       indirectRefs;
   // when reg pressure is not very high in iter0, use spill cost function
   // that favors allocating large variables
+  //
+  // The spill cost also orders the coloring worklist (see compareSpillCost), so
+  // below this threshold - where RA is not expected to spill - the new cost
+  // would only perturb an allocation that was already succeeding.
   bool useNewSpillCost =
       (builder.getOption(vISA_NewSpillCostFunctionISPC) ||
-       builder.getOption(vISA_NewSpillCostFunction)) &&
+          builder.getOption(vISA_NewSpillCostFunction)) &&
       rpe &&
       !(gra.getIterNo() == 0 &&
-        (float)rpe->getMaxRP() < (float)kernel.getNumRegTotal() * 0.80f);
+          (float)rpe->getMaxRP() < (float)kernel.getNumRegTotal() * 0.90f);
 
   RA_TRACE({
     if (useNewSpillCost)
@@ -6974,8 +6994,13 @@ void GraphColor::relaxNeighborDegreeGRF(LiveRange *lr) {
           !(lr1->getIsPartialDcl())) {
         unsigned lr1_nreg = lr1->getNumRegNeeded();
         unsigned int lr1AugAlign = gra.getAugAlign(lr1->getDcl());
-        auto w =
-            edgeWeightWith4GRF(lr1AugAlign, lr2AugAlign, lr1_nreg, lr2_nreg);
+        unsigned int w = 0;
+        if (UseRelaxedDegree)
+          w = edgeWeightWith4GRF<true>(lr1AugAlign, lr2AugAlign, lr1_nreg,
+                                       lr2_nreg);
+        else
+          w = edgeWeightWith4GRF<false>(lr1AugAlign, lr2AugAlign, lr1_nreg,
+                                        lr2_nreg);
         relax(lr1, w);
       }
     }
@@ -6991,7 +7016,11 @@ void GraphColor::relaxNeighborDegreeGRF(LiveRange *lr) {
       unsigned lr1_nreg = lr1->getNumRegNeeded();
       unsigned w = 0;
       bool lr1EvenAlign = gra.isEvenAligned(lr1->getDcl());
-      w = edgeWeightGRF(lr1EvenAlign, lr2EvenAlign, lr1_nreg, lr2_nreg);
+      if (UseRelaxedDegree)
+        w = edgeWeightGRF<true>(lr1EvenAlign, lr2EvenAlign, lr1_nreg, lr2_nreg);
+      else
+        w = edgeWeightGRF<false>(lr1EvenAlign, lr2EvenAlign, lr1_nreg,
+                                 lr2_nreg);
       relax(lr1, w);
     }
   }
@@ -7007,7 +7036,13 @@ void GraphColor::relaxNeighborDegreeGRF(LiveRange *lr) {
           !(lr1->getIsPartialDcl())) {
         unsigned lr1_nreg = lr1->getNumRegNeeded();
         bool lr1EvenAlign = gra.isEvenAligned(lr1->getDcl());
-        auto w = edgeWeightGRF(lr1EvenAlign, lr2EvenAlign, lr1_nreg, lr2_nreg);
+        unsigned int w = 0;
+        if (UseRelaxedDegree)
+          w = edgeWeightGRF<true>(lr1EvenAlign, lr2EvenAlign, lr1_nreg,
+                                  lr2_nreg);
+        else
+          w = edgeWeightGRF<false>(lr1EvenAlign, lr2EvenAlign, lr1_nreg,
+                                   lr2_nreg);
         relax(lr1, w);
       }
     }
@@ -7111,6 +7146,9 @@ void GraphColor::determineColorOrdering() {
   //This will not change the order unless SPGSS is turned on
   builder.getFreqInfoManager().sortBasedOnFreq(sorted);
 
+  bool isStackCall = kernel.fg.getIsStackCallFunc();
+  bool allowRRInFF = kernel.getOption(vISA_GCRRInFF);
+
   for (unsigned i = 0; i < numUnassignedVar; i++) {
     LiveRange *lr = sorted[i];
     unsigned availColor = numColor;
@@ -7119,14 +7157,20 @@ void GraphColor::determineColorOrdering() {
     if (lr->getDegree() + lr->getNumRegNeeded() <= availColor) {
       unconstrainedWorklist.push_back(lr);
       lr->setActive(false);
-      if (lr->getRegKind() == G4_GRF) {
+      if (!isStackCall && allowRRInFF && (lr->getRegKind() & G4_GRF) &&
+          gra.getIterNo() > 0) {
         // Mark current lr as unconstrained, which means RR algorithm can always
-        // be applied to the variable.
+        // be applied to the variable. We should not apply this for stackcall
+        // functions because if we do RR, we may end up using GRFs from callee
+        // saved partition, requiring save/restore.
+        //
+        // Currently we apply this only in spill iteration.
         lr->setUnconstrained(true);
       }
     } else {
       constrainedWorklist.push_back(lr);
       lr->setActive(true);
+      lr->setUnconstrained(false);
     }
   }
 
@@ -7219,6 +7263,189 @@ void PhyRegUsage::updateRegUsage(LiveRange *lr) {
   else {
     vISA_ASSERT(false, ERROR_GRAPHCOLOR); // un-handled reg type
   }
+}
+
+// Identify the SLM load-send destinations that FIRST_FIT packed onto a shared
+// physical GRF -- the WAR hazard breakSLMLoadSendAntiDep targets. Returns
+// per-(BB, size) groups of >= 2 roots (program order) whose shared GRF carries
+// >= 2 SLM loads.
+std::vector<std::vector<GraphColor::SLMLoadRecolorCand>>
+GraphColor::collectSLMLoadAntiDepCandidates() {
+  // Physical GRF number assigned to dcl's live range, or ~0u if none/non-GRF.
+  auto regOf = [&](G4_Declare *dcl) -> unsigned {
+    G4_RegVar *rv = dcl->getRegVar();
+    if (!rv || !rv->isRegAllocPartaker())
+      return ~0u;
+    G4_VarBase *pr = lrs[rv->getId()]->getPhyReg();
+    return (pr && pr->isGreg()) ? pr->asGreg()->getRegNum() : ~0u;
+  };
+
+  // Collect GRF-assigned load-send dests per BB in program order and count the
+  // loads landing on each physical GRF (a reg with >= 2 loads is a WAR hazard).
+  struct RawLoad {
+    G4_Declare *root;
+    unsigned reg;
+    unsigned rows;
+  };
+  std::unordered_map<G4_BB *, std::vector<RawLoad>> bbLoads;
+  std::unordered_map<unsigned, unsigned> regLoadCount;
+  unsigned numLoads = 0;
+  for (G4_BB *bb : kernel.fg) {
+    for (G4_INST *inst : *bb) {
+      if (!inst->isSend())
+        continue;
+      G4_SendDesc *desc = inst->getMsgDesc();
+      if (!desc || !desc->isSLM() || desc->getDstLenRegs() == 0)
+        continue; // loads into GRF only
+      G4_DstRegRegion *dst = inst->getDst();
+      if (!dst || dst->isNullReg() || !dst->getTopDcl())
+        continue;
+      G4_Declare *root = dst->getTopDcl()->getRootDeclare();
+      unsigned reg = regOf(root);
+      if (reg == ~0u)
+        continue; // only GRF-assigned dests are recolor candidates
+      bbLoads[bb].push_back({root, reg, root->getNumRows()});
+      ++regLoadCount[reg];
+      ++numLoads;
+    }
+  }
+
+  std::vector<std::vector<SLMLoadRecolorCand>> groups;
+  if (numLoads < 2)
+    return groups;
+
+  // Bucket each BB's loads by destination size; keep only WAR regs (>= 2 loads)
+  // and buckets with >= 2 roots to rotate.
+  for (G4_BB *bb : kernel.fg) {
+    auto bbIt = bbLoads.find(bb);
+    if (bbIt == bbLoads.end())
+      continue;
+    std::map<unsigned, std::vector<SLMLoadRecolorCand>> bySize;
+    for (const RawLoad &ld : bbIt->second)
+      if (regLoadCount[ld.reg] >= 2)
+        bySize[ld.rows].push_back({ld.root, ld.rows});
+    for (auto &kv : bySize)
+      if (kv.second.size() >= 2)
+        groups.push_back(std::move(kv.second));
+  }
+  return groups;
+}
+
+// Anti-dependency breaking for SLM load-send destinations
+//
+// Target block: SLM load-send destinations that FIRST_FIT packed onto a shared
+// physical GRF (>= 2 loads on one reg) -- a WAR hazard that SWSB otherwise
+// serializes with a sync before every reload.
+//
+// Flow: recognize the reused load dests (per BB, bucketed by destination size),
+// then rotate each across K registers by re-running `assignColor` with the other
+// rotation slots forbidden, so consecutive loads land on distinct registers and
+// SWSB drops the WAR chain. `parms`/`assignColor` are the caller's, so the
+// re-color reuses the allocator's own state and coloring routine.
+//
+// Spill-free and register-pressure-neutral: it only relabels already-allocated
+// loads onto other free GRFs -- a load that cannot move keeps its color.
+void GraphColor::breakSLMLoadSendAntiDep(
+    ColorHeuristic colorHeuristicGRF, PhyRegAllocationState &parms,
+    const std::function<bool(LiveRange *)> &assignColor) {
+  if (!liveAnalysis.livenessClass(G4_GRF) || colorHeuristicGRF != FIRST_FIT ||
+      !spilledLRs.empty())
+    return;
+  // Rotation depth K; 0 disables the pass, 1 leaves no room to rotate.
+  const unsigned K = builder.getuint32Option(vISA_RAAntiDepRecolorRotation);
+  if (K < 2)
+    return;
+
+  // Physical GRF number of the given LiveRange, or ~0u if none/non-GRF.
+  auto gregNum = [&](LiveRange *lr) -> unsigned {
+    G4_VarBase *pr = lr ? lr->getPhyReg() : nullptr;
+    return (pr && pr->isGreg()) ? pr->asGreg()->getRegNum() : ~0u;
+  };
+
+  std::vector<std::vector<SLMLoadRecolorCand>> groups =
+      collectSLMLoadAntiDepCandidates();
+
+  // Rotate each (BB, size) group across K registers: for each load, forbid the
+  // regs the other rotation slots hold so it lands on a distinct GRF, dropping
+  // the WAR chain SWSB would otherwise insert.
+  unsigned totalMoved = 0, numCands = 0;
+  for (std::vector<SLMLoadRecolorCand> &group : groups) {
+    numCands += group.size();
+    // Register last assigned to each rotation slot (~0u == none yet).
+    std::vector<unsigned> slotReg(K, ~0u);
+
+    unsigned i = 0;
+    for (const SLMLoadRecolorCand &cand : group) {
+      G4_RegVar *rv = cand.root->getRegVar();
+      LiveRange *lr =
+          (rv && rv->isRegAllocPartaker()) ? lrs[rv->getId()] : nullptr;
+      if (!lr)
+        continue;
+      unsigned slot = i++ % K;
+      unsigned rows = cand.rows;
+
+      // Snapshot assignment + trial-only state in case recolor fails (causes
+      // spills) and we need to fallback.
+      G4_VarBase *savedReg = lr->getPhyReg();
+      unsigned savedOff = lr->getPhyRegOff();
+      BitSet *savedForbidden = lr->getForbiddenPtr();
+      forbiddenKind savedForbiddenKind = lr->getForbiddenType();
+      bool savedUnconstrained = lr->getIsUnconstrained();
+      // Candidates are GRF-assigned. Enforced during candidate collection in
+      // collectSLMLoadAntiDepCandidates
+      vISA_ASSERT(savedReg && savedReg->isGreg(),
+                  "SLM load-send dest candidate must be GRF-assigned");
+      unsigned oldReg = savedReg->asGreg()->getRegNum();
+
+      // Forbid the other slots' regs so this load lands on a distinct one:
+      // Count the previously assigned regs for other slots as forbidden.
+      BitSet trialForbidden(gra.getForbiddenVectorSize(G4_GRF), false);
+      bool anyForbidden = false;
+      for (unsigned j = 0; j < K; ++j) {
+        if (j != slot && slotReg[j] != ~0u) {
+          for (unsigned r = 0; r < rows; ++r)
+            trialForbidden.set(slotReg[j] + r, true);
+          anyForbidden = true;
+        }
+      }
+      if (anyForbidden) {
+        if (savedForbidden)
+          trialForbidden |= *savedForbidden;
+        lr->restoreForbidden(&trialForbidden, savedForbiddenKind);
+      }
+
+      // Trial recolor via the allocator; setUnconstrained keeps the startGRF
+      // hint from being reset to 0 under vISA_GCRRInFF.
+      lr->resetPhyReg();
+      lr->setUnconstrained(true);
+      parms.setStartGRF(oldReg);
+      assignColor(lr);
+      unsigned newReg = gregNum(lr);
+
+      // Recolor causes spill. Fall back to the original color.
+      if (newReg == ~0u || !spilledLRs.empty()) {
+        if (!spilledLRs.empty() && spilledLRs.back() == lr) {
+          spilledLRs.pop_back();
+          lr->setSpilled(false);
+        }
+        lr->setPhyReg(savedReg, savedOff);
+        newReg = oldReg;
+      }
+
+      // Restore trial-only state so later RA iterations see the LR untouched.
+      lr->restoreForbidden(savedForbidden, savedForbiddenKind);
+      lr->setUnconstrained(savedUnconstrained);
+
+      slotReg[slot] = newReg;
+      if (newReg != oldReg)
+        ++totalMoved;
+    }
+  }
+
+  VISA_DEBUG({
+    std::cerr << "RA anti-dep recolor: moved " << totalMoved << " of "
+              << numCands << " rotation candidates\n";
+  });
 }
 
 bool GraphColor::assignColors(ColorHeuristic colorHeuristicGRF,
@@ -7375,12 +7602,7 @@ bool GraphColor::assignColors(ColorHeuristic colorHeuristicGRF,
       }
 
       if (kernel.getOption(vISA_GCRRInFF)) {
-        if (lr->getRegKind() != G4_GRF) {
-          // None GRF assignment, keep single FF or RR algorithm
-          if (heuristic == FIRST_FIT) {
-            parms.setStartGRF(0);
-          }
-        } else if (heuristic == FIRST_FIT && !lr->getIsUnconstrained()) {
+        if (heuristic == FIRST_FIT && !lr->getIsUnconstrained()) {
           // GRF assignment, start GRF is always 0 if first fit algorithm is
           // used and the variable is constrainted
           parms.setStartGRF(0);
@@ -7458,6 +7680,8 @@ bool GraphColor::assignColors(ColorHeuristic colorHeuristicGRF,
     if (!ret)
       return false;
   }
+
+  breakSLMLoadSendAntiDep(colorHeuristicGRF, parms, assignColor);
 
   if (failSafeIter) {
     // As per spec, EOT has to be allocated to r112+.
@@ -7895,10 +8119,9 @@ void GraphColor::gatherScatterForbiddenWA() {
 bool GraphColor::regAlloc(bool doBankConflictReduction,
                           bool highInternalConflict, const RPE *rpe) {
   bool useSplitLLRHeuristic = false;
-  // FIXME: This whole bundle thing is a mess, the flag is an int but we
-  // treat it as a bool when passing to assignColors, and it's not clear if it
-  // works for non-DPAS instructions.
-  unsigned doBundleConflictReduction = kernel.getuInt32Option(vISA_enableBundleCR);
+  // FIXME: It is not clear if this works for non-DPAS instructions, hence the
+  // per-instruction-kind mode of -enableBundleCR is collapsed to a bool here.
+  bool doBundleConflictReduction = builder.doBundleCR();
 
   RA_TRACE(std::cout << "\t--# variables: " << liveAnalysis.getNumSelectedVar()
                      << "\n");
@@ -12319,19 +12542,6 @@ int GlobalRA::coloringRegAlloc() {
         }
       }
 
-      // When there are spills and -abortonspill is set, vISA will bump up the
-      // number of GRFs first and try to compile without spills under one of
-      // the following conditions:
-      //  - Variable with inf spill cost, or
-      //  - #GRFs selected and next larger one has same number of threads, or
-      //  - Spill ratio is above threshold
-      // If none of the conditions is met, vISA will abort and return VISA_SPILL.
-      if (VRTIncreasedGRF(coloring)) {
-        RA_TRACE(std::cout << "\t--VRT GRF bump to " << kernel.getNumRegTotal()
-                           << ". Re-run RA\n");
-        continue;
-      }
-
       if (auto bump = forceGRFBumpOnInfCostAddrTaken(coloring, liveAnalysis)) {
         if (*bump) {
           RA_TRACE(std::cout
@@ -12358,6 +12568,23 @@ int GlobalRA::coloringRegAlloc() {
 
       if (rerunGRAIter(rerunGRA1 || rerunGRA2 || rerunGRA3))
         continue;
+
+      // When there are spills and -abortonspill is set, vISA will bump up the
+      // number of GRFs and try to compile without spills under one of
+      // the following conditions:
+      //  - Variable with inf spill cost, or
+      //  - #GRFs selected and next larger one has same number of threads, or
+      //  - Spill ratio is above threshold
+      // If none of the conditions is met, vISA will abort and return VISA_SPILL.
+      //
+      // Checked after remat and split since bumping the GRF is not reversible and
+      // remat in some cases can achieve a spill-free allocation at the smaller GRF
+      // number.
+      if (VRTIncreasedGRF(coloring)) {
+          RA_TRACE(std::cout << "\t--VRT GRF bump to " << kernel.getNumRegTotal()
+              << ". Re-run RA\n");
+          continue;
+      }
 
       // For new platforms, check if there is local split space
       if (!loadSplitTryDone && builder.onlyDoLocalVariableSplitWhenSpill()) {
@@ -12435,7 +12662,9 @@ int GlobalRA::coloringRegAlloc() {
       }
 
       if (kernel.getOption(vISA_GRFPostRASpillCodeCleanup)) {
-        spillFillPropagation();
+        unsigned maxSpillArea = spillFillPropagation();
+        if (maxSpillArea < nextSpillOffset)
+          nextSpillOffset = maxSpillArea;
       }
 
       kernel.dumpToFile("after.spillFillPropagation");
@@ -12551,9 +12780,11 @@ int GlobalRA::coloringRegAlloc() {
     // We will summarize the final stack size of entire vISA module into
     // the main functions (ref: CISA_IR_Builder::summarizeFunctionInfo)
     jitInfo->stats.spillMemUsed = spillMemUsed;
+    jitInfo->stats.dynamicSpillThreshold = kernel.grfMode.getDynamicSpillThreshold();
     kernel.getGTPinData()->setScratchNextFree(spillMemUsed +
                                               globalScratchOffset);
     jitInfo->stats.numGRFSpillFillWeighted = GRFSpillFillCount;
+    jitInfo->stats.numAsmCountUnweighted = instCount();
   }
 
   if (builder.getOption(vISA_LocalDeclareSplitInGlobalRA)) {
@@ -12622,6 +12853,7 @@ void GraphColor::dumpRegisterPressure(std::ostream &OS) {
   uint32_t max = 0;
   std::vector<G4_INST *> maxInst;
   rpe.run();
+  rpe.runLoops();
 
   for (auto bb : builder.kernel.fg) {
     OS << "BB " << bb->getId() << ": (Pred: ";
@@ -12633,6 +12865,14 @@ void GraphColor::dumpRegisterPressure(std::ostream &OS) {
       OS << succ->getId() << ",";
     }
     OS << ")\n";
+    // Build outermost-to-innermost loop chain for this BB (computed once,
+    // reused for every instruction in the BB).
+    std::vector<Loop *> loopChain;
+    for (Loop *l = builder.kernel.fg.getLoops().getInnerMostLoop(bb);
+         l != nullptr; l = l->parent)
+      loopChain.push_back(l);
+    std::reverse(loopChain.begin(), loopChain.end());
+
     for (auto instIt = bb->begin(); instIt != bb->end(); ++instIt) {
       auto *inst = *instIt;
       uint32_t pressure = rpe.getRegisterPressure(inst);
@@ -12647,6 +12887,8 @@ void GraphColor::dumpRegisterPressure(std::ostream &OS) {
       if (kernel.getOption(vISA_EmitSrcFileLineToRPE))
         bb->emitInstructionSourceLineMapping(OS, instIt);
       OS << "[" << pressure << "] ";
+      for (Loop *l : loopChain)
+        OS << "[" << rpe.getLoopInstRP(l, inst) << "] ";
       inst->print(OS);
     }
   }
@@ -12654,6 +12896,8 @@ void GraphColor::dumpRegisterPressure(std::ostream &OS) {
   for (auto inst : maxInst) {
     inst->print(OS);
   }
+
+  rpe.dumpLoops(OS);
 }
 
 void GlobalRA::fixAlignment() {
@@ -13143,21 +13387,22 @@ void GlobalRA::insertRestoreAddr(G4_BB *bb) {
 // weight computation and later during simplification is necessary for
 // correctness.
 //
-template <bool Support4GRFAlign>
+template <bool Support4GRFAlign, bool UseRelaxedDegreeV>
 unsigned GraphColor::edgeWeightGRF(const LiveRange *lr1, const LiveRange *lr2) {
   unsigned lr1_nreg = lr1->getNumRegNeeded();
   unsigned lr2_nreg = lr2->getNumRegNeeded();
-
   if constexpr (Support4GRFAlign) {
     auto lr1Align = gra.getAugAlign(lr1->getDcl());
     auto lr2Align = gra.getAugAlign(lr2->getDcl());
 
-    return edgeWeightWith4GRF(lr1Align, lr2Align, lr1_nreg, lr2_nreg);
+    return edgeWeightWith4GRF<UseRelaxedDegreeV>(lr1Align, lr2Align, lr1_nreg,
+                                                 lr2_nreg);
   } else {
     bool lr1EvenAlign = gra.isEvenAligned<false>(lr1->getDcl());
     bool lr2EvenAlign = gra.isEvenAligned<false>(lr2->getDcl());
 
-    return edgeWeightGRF(lr1EvenAlign, lr2EvenAlign, lr1_nreg, lr2_nreg);
+    return edgeWeightGRF<UseRelaxedDegreeV>(lr1EvenAlign, lr2EvenAlign,
+                                            lr1_nreg, lr2_nreg);
   }
 }
 
@@ -13245,9 +13490,8 @@ unsigned GraphColor::edgeWeightARF(const LiveRange *lr1, const LiveRange *lr2) {
           "Found unsupported subRegAlignment in address register allocation!");
       return 0;
     }
-  }
-  else if (lr1->getRegKind() == G4_SCALAR) {
-    return edgeWeightGRF<false>(lr1, lr2); // treat scalar just like GRF
+  } else if (lr1->getRegKind() == G4_SCALAR) {
+    return edgeWeightGRF<false, false>(lr1, lr2); // treat scalar just like GRF
   }
   vISA_ASSERT_UNREACHABLE(
       "Found unsupported ARF reg type in register allocation!");

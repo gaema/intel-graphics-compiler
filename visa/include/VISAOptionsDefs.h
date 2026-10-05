@@ -110,9 +110,9 @@ DEF_VISA_OPTION(
 DEF_VISA_OPTION(vISA_EnableAlways, ET_BOOL, NULLSTR, UNUSED, true)
 DEF_VISA_OPTION(vISA_EnableSendFusion, ET_BOOL, "-enableSendFusion", UNUSED,
                 false)
-DEF_VISA_OPTION(vISA_EnableSendPredication, ET_BOOL, "-noSendPredication",
-                "Disable predication of send instructions in if-conversion",
-                true)
+DEF_VISA_OPTION(vISA_EnableSendPredication, ET_BOOL, "-sendPredication",
+                "Enable predication of send instructions in if-conversion",
+                false)
 DEF_VISA_OPTION(vISA_EnableWriteFusion, ET_BOOL, "-enableWriteFusion", UNUSED,
                 false)
 DEF_VISA_OPTION(vISA_EnableAtomicFusion, ET_BOOL, "-enableAtomicFusion", UNUSED,
@@ -187,6 +187,8 @@ DEF_VISA_OPTION(vISA_ifCvtFullyConvertibleMaxInsts, ET_INT32,
 DEF_VISA_OPTION(vISA_ifCvtPartialConvertibleMaxInsts, ET_INT32,
                 "-ifCvtPartialConvertibleMaxInsts",
                 "Max instructions for partial if-conversion", 3)
+DEF_VISA_OPTION(vISA_ifCvtPartialConvert, ET_BOOL_TRUE, "-ifcvtpartial",
+                UNUSED, true)
 DEF_VISA_OPTION(vISA_AutoGRFSelection, ET_BOOL_TRUE, "-autoGRFSelection",
                 "Enable compiler heuristics for GRF selection", false)
 DEF_VISA_OPTION(
@@ -195,6 +197,24 @@ DEF_VISA_OPTION(
     "Spill size allowed without increasing GRF number in VRT."
     "0 means VRT will always bump up the GRF number to avoid spills",
     256)
+DEF_VISA_OPTION(vISA_DynamicSpillThreshold, ET_BOOL,
+                "-dynamicSpillThreshold",
+                "When enabled, use the compiler-computed dynamic spill threshold. "
+                "Enable this option will ignore any spillallowed option",
+                false)
+DEF_VISA_OPTION(vISA_DynamicSpillThresholdPercent, ET_INT32,
+                "-dynamicSpillThresholdPercent",
+                "USAGE: -dynamicSpillThresholdPercent <percent>.\n"
+                "Percentage of the kernel's total instructions allowed to be "
+                "spill/fill traffic when computing the dynamic spill threshold.",
+                5)
+DEF_VISA_OPTION(vISA_DynamicSpillSamplerWeight, ET_INT32,
+                "-dynamicSpillSamplerWeight",
+                "USAGE: -dynamicSpillSamplerWeight <weight>.\n"
+                "Weight applied to each non-LSC sampler send when estimating the "
+                "memory pressure for the dynamic spill threshold. Negative values "
+                "raise the spill budget for sampler-heavy kernels.",
+                -1)
 DEF_VISA_OPTION(vISA_SpillAllowed256GRF, ET_INT32, "-spillAllowed256GRF",
                 "USAGE: -spillAllowed256GRF <spillSize>.\n"
                 "Override spill threshold for 256GRF config. If shader has "
@@ -247,7 +267,7 @@ DEF_VISA_OPTION(vISA_CoalesceScalarMoves, ET_BOOL, "-enableCoalesceScalarMoves",
 DEF_VISA_OPTION(vISA_OptimizeRedundantS0Movs, ET_BOOL_TRUE, "-optimizeRedundantS0Movs",
                 UNUSED, true)
 DEF_VISA_OPTION(vISA_enableSamplerLSCCaching, ET_BOOL_TRUE, "-samplerLSCCaching",
-                "global flag [0|1] to control LSC caching for sampler", true)
+                "global flag [0|1] to control LSC caching for sampler", false)
 DEF_VISA_OPTION(vISA_samplerLSCCachingThreshold, ET_INT32,
                 "-samplerLSCCachingThreshold",
                 "spill size threshold to disable LSC caching for sampler", 0)
@@ -458,17 +478,25 @@ DEF_VISA_OPTION(vISA_NewAugmentation, ET_BOOL_TRUE, "-newaugmentation",
                 "USAGE: -newaugmentation "
                 "enable using augmentation with holes",
                 true)
+DEF_VISA_OPTION(vISA_UseRelaxedDegree, ET_BOOL_TRUE, "-relaxedDegree", UNUSED, false)
 
 
 // clang-format off
 // Enable bundle conflict reduction: put operands of instruction into different GRF bundles.
 // Value: 0 disable, 1 dpas instruction, 2 non-dpas instructions, 3 all instructions
+// Read this option through IR_Builder::getBundleCRMode() (HWCaps.inc), as some
+// platforms override the default below.
 // clang-format on
 DEF_VISA_OPTION(vISA_enableBundleCR, ET_INT32, "-enableBundleCR",
                 "USAGE: -enableBundleCR <0|1|2|3>: 0, disable, 1 dpas "
                 "instructions, 2 non-dpas instructions, 3 all",
                 1)
 DEF_VISA_OPTION(vISA_LraFFWindowSize, ET_INT32, "-lraFFWindowSize", UNUSED, 12)
+// In-RA anti-dependency breaking for SLM load destinations. RA rotates the free
+// registers sets on targetd load blocks. The value is the rotation depth. 0
+// (and 1) disables the optimization.
+DEF_VISA_OPTION(vISA_RAAntiDepRecolorRotation, ET_INT32,
+                "-raAntiDepRecolorRotation", UNUSED, 3)
 DEF_VISA_OPTION(vISA_SplitGRFAlignedScalar, ET_BOOL, "-nosplitGRFalignedscalar",
                 UNUSED, true)
 DEF_VISA_OPTION(vISA_DoSplitOnSpill, ET_BOOL, "-nosplitonspill", UNUSED, true)
@@ -507,7 +535,7 @@ DEF_VISA_OPTION(vISA_FailSafeRALimit, ET_INT32, "-failSafeRALimit", UNUSED, 3)
 DEF_VISA_OPTION(vISA_DenseMatrixLimit, ET_INT32, "-denseMatrixLimit", UNUSED,
                 0x800)
 DEF_VISA_OPTION(vISA_FillConstOpt, ET_BOOL, "-nofillconstopt", UNUSED, true)
-DEF_VISA_OPTION(vISA_GCRRInFF, ET_BOOL, "-GCRRinFF", UNUSED, false)
+DEF_VISA_OPTION(vISA_GCRRInFF, ET_BOOL_TRUE, "-GCRRinFF", UNUSED, true)
 DEF_VISA_OPTION(vISA_IncrementalRA, ET_INT32, "-incrementalra",
                 "USAGE: -incrementalra <0|1|2> where 0 is disabled, 1 is enabled, 2 is enabled with verification", 0)
 DEF_VISA_OPTION(vISA_SplitAlignedScalarMinDist, ET_INT32,

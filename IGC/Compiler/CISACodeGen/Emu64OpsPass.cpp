@@ -24,6 +24,7 @@ SPDX-License-Identifier: MIT
 #include "common/LLVMWarningsPop.hpp"
 #include "llvmWrapper/IR/Intrinsics.h"
 #include "llvmWrapper/IR/Instructions.h"
+#include "llvmWrapper/IR/InstVisitor.h"
 #include "llvmWrapper/IR/DerivedTypes.h"
 #include "llvmWrapper/IR/Instructions.h"
 #include "llvmWrapper/IR/Intrinsics.h"
@@ -168,8 +169,9 @@ private:
   bool eraseInstrFromInt64InstrList(Instruction *inst) { return Int64Insts.erase(inst); }
 };
 
-class InstExpander : public InstVisitor<InstExpander, bool> {
-  friend class InstVisitor<InstExpander, bool>;
+class InstExpander : public IGCLLVM::InstVisitor<InstExpander, bool> {
+  friend class IGCLLVM::InstVisitor<InstExpander, bool>;
+  friend class llvm::InstVisitor<InstExpander, bool>;
 
   Emu64Ops *Emu;
   BuilderType *IRB;
@@ -183,7 +185,8 @@ private:
   bool visitInstruction(Instruction &);
 
   bool visitRet(ReturnInst &);
-  bool visitBr(BranchInst &) { return false; }
+  bool visitUncondBrInst(IGCLLVM::UncondBrInst &) { return false; }
+  bool visitCondBrInst(IGCLLVM::CondBrInst &) { return false; }
   bool visitSwitch(SwitchInst &) { return false; }
   bool visitIndirectBr(IndirectBrInst &) { return false; }
   bool visitInvoke(InvokeInst &) { return false; }
@@ -847,11 +850,11 @@ bool InstExpander::visitShl(BinaryOperator &BinOp) {
 
     BasicBlock *TrueBB = BasicBlock::Create(*Emu->getContext(), ".shl.outer.true.branch");
     TrueBB->insertInto(Emu->getFunction(), JointBB);
-    Instruction *TrueJmp = BranchInst::Create(JointBB, TrueBB);
+    IGCLLVM::UncondBrInst *TrueJmp = IGCLLVM::UncondBrInst::Create(JointBB, TrueBB);
     TrueJmp->setDebugLoc(BinOpDebugLoc);
 
     OldBB->getTerminator()->eraseFromParent();
-    Instruction *TempOldBBBranchInst = BranchInst::Create(TrueBB, JointBB, NE, OldBB);
+    IGCLLVM::CondBrInst *TempOldBBBranchInst = IGCLLVM::CondBrInst::Create(NE, TrueBB, JointBB, OldBB);
     TempOldBBBranchInst->setDebugLoc(BinOpDebugLoc);
 
     // Create the inner branch.
@@ -868,16 +871,16 @@ bool InstExpander::visitShl(BinaryOperator &BinOp) {
 
     InnerTBB = BasicBlock::Create(*Emu->getContext(), ".shl.inner.true.branch");
     InnerTBB->insertInto(Emu->getFunction(), InnerJBB);
-    Instruction *TempInnerTBBBranchInst = BranchInst::Create(InnerJBB, InnerTBB);
+    IGCLLVM::UncondBrInst *TempInnerTBBBranchInst = IGCLLVM::UncondBrInst::Create(InnerJBB, InnerTBB);
     TempInnerTBBBranchInst->setDebugLoc(BinOpDebugLoc);
 
     InnerFBB = BasicBlock::Create(*Emu->getContext(), ".shl.inner.false.branch");
     InnerFBB->insertInto(Emu->getFunction(), InnerJBB);
-    Instruction *TempInnerFBBBranchInst = BranchInst::Create(InnerJBB, InnerFBB);
+    IGCLLVM::UncondBrInst *TempInnerFBBBranchInst = IGCLLVM::UncondBrInst::Create(InnerJBB, InnerFBB);
     TempInnerFBBBranchInst->setDebugLoc(BinOpDebugLoc);
 
     TrueBB->getTerminator()->eraseFromParent();
-    Instruction *TempTrueBBBranchInst = BranchInst::Create(InnerTBB, InnerFBB, Cond, TrueBB);
+    IGCLLVM::CondBrInst *TempTrueBBBranchInst = IGCLLVM::CondBrInst::Create(Cond, InnerTBB, InnerFBB, TrueBB);
     TempTrueBBBranchInst->setDebugLoc(BinOpDebugLoc);
 
     // The result is the same as the source if ShAmt is 0, i.e. NE is
@@ -973,11 +976,11 @@ bool InstExpander::visitLShr(BinaryOperator &BinOp) {
 
     BasicBlock *TrueBB = BasicBlock::Create(*Emu->getContext(), ".lshr.outer.true.branch");
     TrueBB->insertInto(Emu->getFunction(), JointBB);
-    Instruction *TrueJmp = BranchInst::Create(JointBB, TrueBB);
+    IGCLLVM::UncondBrInst *TrueJmp = IGCLLVM::UncondBrInst::Create(JointBB, TrueBB);
     TrueJmp->setDebugLoc(BinOpDebugLoc);
 
     OldBB->getTerminator()->eraseFromParent();
-    Instruction *TempOldBBBranchInst = BranchInst::Create(TrueBB, JointBB, NE, OldBB);
+    IGCLLVM::CondBrInst *TempOldBBBranchInst = IGCLLVM::CondBrInst::Create(NE, TrueBB, JointBB, OldBB);
     TempOldBBBranchInst->setDebugLoc(BinOpDebugLoc);
 
     // Create the inner branch.
@@ -994,16 +997,16 @@ bool InstExpander::visitLShr(BinaryOperator &BinOp) {
 
     InnerTBB = BasicBlock::Create(*Emu->getContext(), ".lshr.inner.true.branch");
     InnerTBB->insertInto(Emu->getFunction(), InnerJBB);
-    Instruction *TempInnerTBBBranchInst = BranchInst::Create(InnerJBB, InnerTBB);
+    IGCLLVM::UncondBrInst *TempInnerTBBBranchInst = IGCLLVM::UncondBrInst::Create(InnerJBB, InnerTBB);
     TempInnerTBBBranchInst->setDebugLoc(BinOpDebugLoc);
 
     InnerFBB = BasicBlock::Create(*Emu->getContext(), ".lshr.inner.false.branch");
     InnerFBB->insertInto(Emu->getFunction(), InnerJBB);
-    Instruction *TempInnerFBBBranchInst = BranchInst::Create(InnerJBB, InnerFBB);
+    IGCLLVM::UncondBrInst *TempInnerFBBBranchInst = IGCLLVM::UncondBrInst::Create(InnerJBB, InnerFBB);
     TempInnerFBBBranchInst->setDebugLoc(BinOpDebugLoc);
 
     TrueBB->getTerminator()->eraseFromParent();
-    Instruction *TempTrueBBBranchInst = BranchInst::Create(InnerTBB, InnerFBB, Cond, TrueBB);
+    IGCLLVM::CondBrInst *TempTrueBBBranchInst = IGCLLVM::CondBrInst::Create(Cond, InnerTBB, InnerFBB, TrueBB);
     TempTrueBBBranchInst->setDebugLoc(BinOpDebugLoc);
 
     // The result is the same as the source if ShAmt is 0, i.e. NE is
@@ -1104,11 +1107,11 @@ bool InstExpander::visitAShr(BinaryOperator &BinOp) {
 
     BasicBlock *TrueBB = BasicBlock::Create(*Emu->getContext(), ".ashr.outer.true.branch");
     TrueBB->insertInto(Emu->getFunction(), JointBB);
-    Instruction *TrueJmp = BranchInst::Create(JointBB, TrueBB);
+    IGCLLVM::UncondBrInst *TrueJmp = IGCLLVM::UncondBrInst::Create(JointBB, TrueBB);
     TrueJmp->setDebugLoc(BinOpDebugLoc);
 
     OldBB->getTerminator()->eraseFromParent();
-    Instruction *TempOldBBBranchInst = BranchInst::Create(TrueBB, JointBB, NE, OldBB);
+    IGCLLVM::CondBrInst *TempOldBBBranchInst = IGCLLVM::CondBrInst::Create(NE, TrueBB, JointBB, OldBB);
     TempOldBBBranchInst->setDebugLoc(BinOpDebugLoc);
 
     // Create the inner branch.
@@ -1125,16 +1128,16 @@ bool InstExpander::visitAShr(BinaryOperator &BinOp) {
 
     InnerTBB = BasicBlock::Create(*Emu->getContext(), ".ashr.inner.true.branch");
     InnerTBB->insertInto(Emu->getFunction(), InnerJBB);
-    Instruction *TempInnerTBBBranchInst = BranchInst::Create(InnerJBB, InnerTBB);
+    IGCLLVM::UncondBrInst *TempInnerTBBBranchInst = IGCLLVM::UncondBrInst::Create(InnerJBB, InnerTBB);
     TempInnerTBBBranchInst->setDebugLoc(BinOpDebugLoc);
 
     InnerFBB = BasicBlock::Create(*Emu->getContext(), ".ashr.inner.false.branch");
     InnerFBB->insertInto(Emu->getFunction(), InnerJBB);
-    Instruction *TempInnerFBBBranchInst = BranchInst::Create(InnerJBB, InnerFBB);
+    IGCLLVM::UncondBrInst *TempInnerFBBBranchInst = IGCLLVM::UncondBrInst::Create(InnerJBB, InnerFBB);
     TempInnerFBBBranchInst->setDebugLoc(BinOp.getDebugLoc());
 
     TrueBB->getTerminator()->eraseFromParent();
-    Instruction *TempTrueBBBranchInst = BranchInst::Create(InnerTBB, InnerFBB, Cond, TrueBB);
+    IGCLLVM::CondBrInst *TempTrueBBBranchInst = IGCLLVM::CondBrInst::Create(Cond, InnerTBB, InnerFBB, TrueBB);
     TempTrueBBBranchInst->setDebugLoc(BinOpDebugLoc);
 
     // The result is the same as the source if ShAmt is 0, i.e. NE is
@@ -1498,11 +1501,11 @@ Value *InstExpander::convertUIToFP32(Type *DstTy, Value *Lo, Value *Hi, Instruct
 
     BasicBlock *TrueBB = BasicBlock::Create(*Emu->getContext(), ".u2f.outer.true.branch");
     TrueBB->insertInto(Emu->getFunction(), JointBB);
-    Instruction *TrueJmp = BranchInst::Create(JointBB, TrueBB);
+    IGCLLVM::UncondBrInst *TrueJmp = IGCLLVM::UncondBrInst::Create(JointBB, TrueBB);
     TrueJmp->setDebugLoc(PosDebugLoc);
 
     OldBB->getTerminator()->eraseFromParent();
-    Instruction *TempOldBBBranchInst = BranchInst::Create(TrueBB, JointBB, NE, OldBB);
+    IGCLLVM::CondBrInst *TempOldBBBranchInst = IGCLLVM::CondBrInst::Create(NE, TrueBB, JointBB, OldBB);
     TempOldBBBranchInst->setDebugLoc(PosDebugLoc);
 
     IRB->SetInsertPoint(&(*TrueBB->begin()));
@@ -1519,11 +1522,11 @@ Value *InstExpander::convertUIToFP32(Type *DstTy, Value *Lo, Value *Hi, Instruct
 
     BasicBlock *InnerTBB = BasicBlock::Create(*Emu->getContext(), ".u2f.inner.true.branch");
     InnerTBB->insertInto(Emu->getFunction(), InnerJBB);
-    Instruction *TempInnerTBBBranchInst = BranchInst::Create(InnerJBB, InnerTBB);
+    IGCLLVM::UncondBrInst *TempInnerTBBBranchInst = IGCLLVM::UncondBrInst::Create(InnerJBB, InnerTBB);
     TempInnerTBBBranchInst->setDebugLoc(PosDebugLoc);
 
     TrueBB->getTerminator()->eraseFromParent();
-    Instruction *TempTrueBBBranchInst = BranchInst::Create(InnerTBB, InnerJBB, NE, TrueBB);
+    IGCLLVM::CondBrInst *TempTrueBBBranchInst = IGCLLVM::CondBrInst::Create(NE, InnerTBB, InnerJBB, TrueBB);
     TempTrueBBBranchInst->setDebugLoc(PosDebugLoc);
 
     IRB->SetInsertPoint(&(*InnerTBB->begin()));
@@ -1552,11 +1555,11 @@ Value *InstExpander::convertUIToFP32(Type *DstTy, Value *Lo, Value *Hi, Instruct
 
     BasicBlock *RoundingBB = BasicBlock::Create(*Emu->getContext(), ".u2f.rounding.branch");
     RoundingBB->insertInto(Emu->getFunction(), RoundingJBB);
-    Instruction *TempRoundingBBBranchInst = BranchInst::Create(RoundingJBB, RoundingBB);
+    IGCLLVM::UncondBrInst *TempRoundingBBBranchInst = IGCLLVM::UncondBrInst::Create(RoundingJBB, RoundingBB);
     TempRoundingBBBranchInst->setDebugLoc(PosDebugLoc);
 
     InnerJBB->getTerminator()->eraseFromParent();
-    Instruction *TempInnerJBBBranchInst = BranchInst::Create(RoundingBB, RoundingJBB, NE, InnerJBB);
+    IGCLLVM::CondBrInst *TempInnerJBBBranchInst = IGCLLVM::CondBrInst::Create(NE, RoundingBB, RoundingJBB, InnerJBB);
     TempInnerJBBBranchInst->setDebugLoc(PosDebugLoc);
 
     // Rounding

@@ -15,11 +15,6 @@
 add_subdirectory(Languages/OpenCL/PreRelease/Matrix)
 include(BiFModuleCache)
 
-# In new Clang versions VME types are built-in. Keep this flag until all OS's update Clang version to 8
-if(NOT DEFINED VME_TYPES_DEFINED)
-  set(VME_TYPES_DEFINED TRUE)
-endif()
-
 if(UNIX)
   if(NOT ${CCLANG_BUILD_INTREE_LLVM})
     # Get common clang library soname
@@ -48,9 +43,10 @@ if(UNIX)
     #  0x000000000000000c (INIT)               0x7ab000
     #  0x000000000000000d (FINI)               0x53ed664
 
-    set(CLANG_LIB_REGEX "${COMMON_CLANG_LIB_NAME_WITH_PREFIX}([0-9]+|\\.|so)+")
-    string(REGEX MATCH  "${CLANG_LIB_REGEX}" IMPORTED_SONAME "${CCLANG_READELF_CALL}")
-    message("Extraced SONAME: ${IMPORTED_SONAME}")
+    # W/A for opencl-clang rc sonames (e.g. libopencl-clang2.so.23.1-rc2)
+    string(REGEX MATCH "\\(SONAME\\)[^[]*\\[([^]]+)\\]" _ "${CCLANG_READELF_CALL}")
+    set(IMPORTED_SONAME "${CMAKE_MATCH_1}")
+    message("Extracted SONAME: ${IMPORTED_SONAME}")
 
     set_property(TARGET opencl-clang-lib PROPERTY "IMPORTED_SONAME" "${IMPORTED_SONAME}")
   endif()
@@ -70,6 +66,12 @@ if(UNIX)
        "${opencl-headers-dir}/opencl-c-base.h")
     endif()
     install(FILES ${opencl-headers} DESTINATION ${CMAKE_INSTALL_FULL_INCLUDEDIR} COMPONENT igc-opencl-devel)
+  endif()
+
+  # Ship the optional igc-clang prebuild when it is present.
+  if(TARGET igc-clang-lib)
+    file(GLOB _igc_clang_libs "${IGC_CLANG_PREBUILD_DIR}/libigc-clang*${CMAKE_SHARED_LIBRARY_SUFFIX}*")
+    install(FILES ${_igc_clang_libs} DESTINATION ${CMAKE_INSTALL_FULL_LIBDIR} COMPONENT igc-opencl)
   endif()
 endif()
 
@@ -120,13 +122,15 @@ endif()
 
 file(GLOB_RECURSE _PRE_RELEASE_CL "${IGC_OPTION__BIF_SRC_OCL_DIR}/Languages/OpenCL/PreRelease/*.cl")
 
-set(IGC_BUILD__BIF_OCL_SHARED_INC                "${IGC_OPTION__BIF_SRC_OCL_DIR}/Languages/OpenCL/opencl_cth_released.h")
+set(IGC_BUILD__BIF_OCL_SHARED_INC                "${IGC_OPTION__BIF_SRC_OCL_DIR}/Languages/OpenCL/opencl-c-intel.h")
 set(IGC_BUILD__BIF_OCL_SHARED_INC_PRE_RELEASE    "${IGC_OPTION__BIF_SRC_OCL_DIR}/Languages/OpenCL/PreRelease/opencl_cth_pre_release.h")
+
+set(IGC_BUILD__BIF_OCL_INCLUDES ${IGC_BUILD__BIF_OCL_INCLUDES} ${IGC_BUILD__BIF_OCL_SHARED_INC} ${IGC_BUILD__BIF_OCL_SHARED_INC_PRE_RELEASE})
 
 set(IGC_BUILD__PROJ__BiFModule_OCL       "${IGC_BUILD__PROJ_NAME_PREFIX}BiFModuleOcl")
 set(IGC_BUILD__PROJ__BiFModule_OCL       "${IGC_BUILD__PROJ__BiFModule_OCL}" PARENT_SCOPE)
 set(IGC_BUILD__PROJ_LABEL__BiFModule_OCL "BiFModule-OCL")
-set(IGC_BUILD__PROJ_DEPENDS_BiFModule_OCL clang-tool "${IGC_BUILD__BIF_OCL_FORCE_INC}" "${IGC_BUILD__BIF_DIR}/OCLBiFImpl.h" "${IGC_BUILD__BIF_DIR}/opencl_cth.h" "${IGC_BUILD__BIF_DIR}/OCLBiFImpl.bifbc" "${IGC_BUILD__BIF_DIR}/OCLBiFImpl.bc" "${IGC_BUILD__BIF_DIR}/IBiF_Impl_int_spirv.bc" "${IGC_BUILD__BIF_DIR}/IGCsize_t_32.bc" "${IGC_BUILD__BIF_DIR}/IGCsize_t_64.bc" "${IGC_BUILD__BIF_DIR}/IBiF_Impl_int_spirv.bc")
+set(IGC_BUILD__PROJ_DEPENDS_BiFModule_OCL clang-tool ${IGC_BUILD__BIF_OCL_SHARED_INC} ${IGC_BUILD__BIF_OCL_SHARED_INC_PRE_RELEASE} "${IGC_BUILD__BIF_DIR}/OCLBiFImpl.h" "${IGC_BUILD__BIF_DIR}/opencl_cth.h" "${IGC_BUILD__BIF_DIR}/OCLBiFImpl.bifbc" "${IGC_BUILD__BIF_DIR}/OCLBiFImpl.bc" "${IGC_BUILD__BIF_DIR}/IBiF_Impl_int_spirv.bc" "${IGC_BUILD__BIF_DIR}/IGCsize_t_32.bc" "${IGC_BUILD__BIF_DIR}/IGCsize_t_64.bc" "${IGC_BUILD__BIF_DIR}/IBiF_Impl_int_spirv.bc")
 set(IGC_BUILD__PROJ_DEPENDS_BiFModule_OCL "${IGC_BUILD__PROJ_DEPENDS_BiFModule_OCL}" PARENT_SCOPE)
 
 

@@ -788,6 +788,19 @@ public:
   bool isIntegerPipeInstructionXe() const;
   bool isFloatPipeInstructionXe() const;
 
+  // This is to check whether this instruction performs a custom float cvt
+  // (tf32/bf8/hf8). Before fcvt's functionality is moved into mov, this
+  // function simply returns true if it is fcvt. As fcvt's functionality
+  // is moved into mov, this should check both fcvt (backward compatibility)
+  // and mov.
+  bool isCustomFloatCvt() const {
+    return opcode() == G4_fcvt ||
+           (opcode() == G4_mov && (IS_FP8TYPE(getDst()->getType()) ||
+                                   IS_FP8TYPE(getSrc(0)->getType()) ||
+                                   getDst()->getType() == Type_TF32 ||
+                                   getSrc(0)->getType() == Type_TF32));
+  }
+
   int getMaxDepDistance() const;
   SB_INST_PIPE getInstructionPipeXe() const;
   SB_INST_PIPE getDistDepPipeXe() const;
@@ -889,6 +902,7 @@ public:
   uint16_t getMaskOffset() const;
   static G4_InstOption offsetToMask(int execSize, int offset, bool nibOk);
   bool isRawMov() const;
+  void setIntTypeForRawMov();
   bool hasACCSrc() const;
   bool hasACCOpnd() const;
   G4_Type getOpExecType(int &extypesize) const;
@@ -1217,6 +1231,9 @@ public:
   void setMayNeedWA(bool b) { mayNeedRSWA = b; }
   bool mayNeedWA() const { return mayNeedRSWA; }
   bool isDstAndSrc0MixOfBF16AndFP32() const;
+  // Returns true if this and next DPAS have a dst/src0 datatype combination that
+  // is a permitted mix within a FWD block
+  bool isMixedDstAndSrc0TypesAllowed(const G4_InstDpas &next) const;
   // The function checks if both dpas instructions satisfy fwd rules for
   // dst/src0 types.
   bool checksFwdTypes(const G4_InstDpas &next) const;
@@ -1531,6 +1548,8 @@ public:
       : G4_INST(builder, prd, op, conMod, sat, execSize, dst, src0, src1, opt),
         shflOp(shflOp) {}
 
+  G4_INST *cloneInst(const IR_Builder *b = nullptr) override;
+
   G4_ShflOp getShflFCtrl() const { return shflOp; }
 
 private:
@@ -1545,6 +1564,8 @@ public:
       : G4_INST(builder, prd, G4_lfsr, nullptr, g4::NOSAT, execSize, dst, src0,
                 src1, opt),
         funcCtrl(fCtrl) {}
+
+  G4_INST *cloneInst(const IR_Builder *b = nullptr) override;
 
   LFSR_FC getLfsrFCtrl() const { return funcCtrl; }
 
@@ -1561,6 +1582,8 @@ public:
       : G4_INST(builder, prd, G4_dnscl, nullptr, g4::NOSAT, execSize, dst, src0,
                 src1, src2, opt),
         type(t), mode(m), rndMode(rm) {}
+
+  G4_INST *cloneInst(const IR_Builder *b = nullptr) override;
 
   DNSCL_CONVERT_TYPE getDnsclConvertType() const { return type; }
   DNSCL_MODE getDnsclMode() const { return mode; }

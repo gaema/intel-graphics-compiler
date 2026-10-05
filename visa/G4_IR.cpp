@@ -392,16 +392,24 @@ G4_Type G4_INST::getExecType() const {
     return Type_D;
   }
 
-  if (opcode() == G4_fcvt) {
-    // fcvt : cvt b/w standard type and other special float type.
-    //        execution type is the standard type.
+  if (isCustomFloatCvt()) {
+    // fcvt (or mov equivalent)
+    //   For cvt b/w a standard type and another special float type, execution
+    //   type is the standard type.
     G4_Type srcTy = srcs[0]->getType();
     if (IS_TYPE_FLOAT_ALL(srcTy)) {
       return srcTy;
     }
-    // If src isn't standard float type, dst must be!
-    return dst->getType();
+    G4_Type dstTy = dst->getType();
+    if (IS_TYPE_FLOAT_ALL(dstTy))
+      return dstTy;
+    else if (dstTy == Type_TF32)
+      return Type_F;
+    else if (dstTy == Type_HF8 || dstTy == Type_BF8)
+      return Type_HF;
+    return execType;
   }
+
   if (opcode() == G4_srnd) {
     // srnd: src0 is either hf or f
     return srcs[0]->getType();
@@ -1052,25 +1060,10 @@ bool G4_INST::isFloatInIntegerPipe() const {
 
   const G4_Operand *dst = getDst();
   const G4_Operand *src = getSrc(0);
-  if (opcode() == G4_fcvt) {
-    if (dst->getType() == Type_UD && // Type_UD: TF32
-        src->getType() == Type_F) {
-      return true;
-    }
-    if (dst->getType() == Type_HF) {
-      if (src->getType() == Type_UB || // Type_UB: BF8
-          src->getType() == Type_B) {  // Type_B: HF8
-        return true;
-      }
-    }
-    if (dst->getType() == Type_UB && src->getType() == Type_HF) { // Type_UB:
-                                                                  // BF8
-      return true;
-    }
-    if (dst->getType() == Type_B && src->getType() == Type_HF) { // Type_B: HF8
-      return true;
-    }
-  }
+  // fcvt (or equivalent mov)
+  if (isCustomFloatCvt())
+    return true;
+
   if (opcode() == G4_mov) {
     if (dst->getType() == Type_F) {
       if (src->getType() == Type_DF || src->getType() == Type_HF ||
@@ -1130,7 +1123,9 @@ bool G4_INST::isIntegerPipeInstructionXe() const {
   if (builder.hasFixedCycleMathPipeline() && isMath()) {
     return false;
   }
-  if (op == G4_fcvt) {
+
+  // fcvt (or equivalent mov)
+  if (isCustomFloatCvt()) {
     return false;
   }
   if (op == G4_srnd) {
@@ -1183,7 +1178,9 @@ bool G4_INST::isFloatPipeInstructionXe() const {
   if (builder.hasFixedCycleMathPipeline() && isMath()) {
     return false;
   }
-  if (opcode() == G4_fcvt) {
+
+  // fcvt (or equivalent mov)
+  if (isCustomFloatCvt()) {
     return true;
   }
   if (opcode() == G4_srnd) {
@@ -1495,6 +1492,55 @@ bool G4_INST::isRawMov() const {
            srcs[0]->asSrcRegRegion()->getModifier() == Mod_src_undef));
 }
 
+// Change dst/src types to int type
+//  FP8 <- FP8 : UB <- UB
+//  FP16 <- FP16 : UW <- UW
+//  F <- F : UD <- UD
+//  F/TF32 <- TF32 : UD <- UD
+//  DF <- DF : UQ <- UQ
+void G4_INST::setIntTypeForRawMov() {
+  if (opcode() != G4_mov)
+    return;
+  // Skip if dst is null or src is not srcRegRegion
+  if (!getSrc(0)->isSrcRegRegion() || getDst() == nullptr)
+    return;
+
+  auto *dstReg = getDst();
+  auto *srcReg = getSrc(0)->asSrcRegRegion();
+
+  // special handling of F < tf32:
+  //   change to F <- F so it passes raw mov checking
+  if (dstReg->getType() == Type_F && srcReg->getType() == Type_TF32)
+    srcReg->setType(getBuilder(), Type_F);
+
+  if (!isRawMov())
+    return;
+
+  G4_Type dstTy = dstReg->getType();
+  if (!IS_TYPE_FLOAT_ALL(dstTy) && !IS_BYTE_FLOAT(dstTy) && dstTy != Type_TF32)
+    return;
+
+  G4_Type intTy = dstTy;
+  switch (TypeSize(dstTy)) {
+  case 8:
+    intTy = Type_UQ;
+    break;
+  case 4:
+    intTy = Type_UD;
+    break;
+  case 2:
+    intTy = Type_UW;
+    break;
+  case 1:
+    intTy = Type_UB;
+    break;
+  default:
+    vISA_ASSERT_UNREACHABLE("Unexpected float Type");
+  }
+  dstReg->setType(getBuilder(), intTy);
+  srcReg->setType(getBuilder(), intTy);
+}
+
 bool G4_INST::hasACCSrc() const {
   if (getImplAccSrc() || (srcs[0] && srcs[0]->isSrcRegRegion() &&
                           srcs[0]->asSrcRegRegion()->isAccReg()))
@@ -1702,6 +1748,11 @@ G4_INST::MovType G4_INST::canPropagate() const {
 
   G4_Type dstType = dst->getType();
   G4_Type srcType = src->getType();
+
+  if (IS_FP8TYPE(dstType) || IS_FP8TYPE(srcType)) {
+    // Skip if the inst has FP8 type.
+    return SuperMov;
+  }
 
   if (!builder.hasByteALU() &&
       (TypeSize(dstType) == 1 || TypeSize(srcType) == 1)) {
@@ -2262,8 +2313,8 @@ bool G4_INST::canPropagateTo(G4_INST *useInst, Gen4_Operand_Number opndNum,
     return false;
   }
 
-  if (useInst->opcode() == G4_fcvt) {
-    // fcvt is not allowed to have immediate src.
+  // fcvt (or equivalent mov) does not support imm
+  if (useInst->isCustomFloatCvt()) {
     if (src->isImm() || !src->isSrcRegRegion() ||
         !(src->asSrcRegRegion()->getRegion()->isContiguous(
             useInst->getExecSize()))) {
@@ -2390,6 +2441,14 @@ bool G4_INST::canPropagateTo(G4_INST *useInst, Gen4_Operand_Number opndNum,
 
   if (hasModifier && !useInst->canSupportSrcModifier()) {
     return false;
+  }
+
+  if (hasModifier && IS_TYPE_INT(srcType)) {
+    G4_SrcModifier srcMod = src->asSrcRegRegion()->getModifier();
+    if ((srcMod == Mod_Abs || srcMod == Mod_Minus || srcMod == Mod_Minus_Abs) &&
+        TypeSize(useInst->getDst()->getType()) > TypeSize(dstType)) {
+      return false;
+    }
   }
 
   // Check 'dst' of MOV and 'use' are the same variable. Otherwise, it's not
@@ -2621,6 +2680,11 @@ bool G4_INST::canHoist(bool simdBB, const Options *opt) const {
   G4_Type dstType, srcType;
   dstType = dst->getType();
   srcType = src->getType();
+
+  if (IS_FP8TYPE(dstType) || IS_FP8TYPE(srcType)) {
+    // Skip if the inst has FP8 type.
+    return false;
+  }
 
   // no dst type promotion after hoisting but allow the copy case
   MovType MT = getMovType(this);
@@ -2934,7 +2998,8 @@ bool G4_INST::canHoistTo(const G4_INST *defInst, bool simdBB) const {
       return false;
     }
   }
-  if (defInst->opcode() == G4_fcvt) {
+  // no def hoisting for fcvt (or equivalent mov).
+  if (defInst->isCustomFloatCvt()) {
     return false;
   }
   if (defInst->opcode() == G4_srnd) {
@@ -4377,9 +4442,13 @@ uint8_t G4_SrcRegRegion::getMaxExecSize(const IR_Builder &builder, int pos,
   // conservative.
   // Here we assume that no cross width if row size is larger than width
   // mul (16) V112(0,0)<1>:f V111(0,0)<16;16,1>:f r1.0<1;4,0>:f
+  //
+  // The rest of the row is capped at maxExSize: the caller takes this result
+  // as its new exec size, so reporting more raises it above what the other
+  // operands allow.
   if (!alignToRow && desc->vertStride != 0 && desc->horzStride != 0) {
-    wd = vs =
-        (uint16_t)roundDownPow2((pos / desc->width + 1) * desc->width - pos);
+    wd = vs = (uint16_t)roundDownPow2(std::min<unsigned>(
+        maxExSize, (pos / desc->width + 1) * desc->width - pos));
 
     // Need to check whether this subregion crosses grf or not.
     // E.g. the second half does cross a grf:
@@ -4410,9 +4479,10 @@ uint8_t G4_SrcRegRegion::getMaxExecSize(const IR_Builder &builder, int pos,
   uint8_t pow2 = roundDownPow2(eleInFirstRow);
 
   if (eleInFirstRow != pow2) {
-    wd = pow2;
+    // rest of the row, capped at maxExSize as above
+    wd = (uint16_t)roundDownPow2(std::min<unsigned>(maxExSize, pow2));
     vs = wd * desc->horzStride;
-    return pow2;
+    return (uint8_t)wd;
   }
 
   uint32_t prevPos = (pos / desc->width * desc->vertStride +
@@ -4842,6 +4912,7 @@ bool G4_DstRegRegion::isCrossGRFDst(const IR_Builder &builder) {
 }
 
 void G4_DstRegRegion::setDstBitVec(uint8_t exec_size) {
+  vISA_ASSERT(exec_size != UNDEFINED_EXEC_SIZE, "undefined exec size");
   // byte level footprint computing bit vectors.
   uint64_t footprint0 = 0;
   uint64_t footprint1 = 0;
@@ -4853,6 +4924,11 @@ void G4_DstRegRegion::setDstBitVec(uint8_t exec_size) {
   uint64_t bit_seq = TypeFootprint(type);
   for (uint8_t i = 0; i < exec_size; ++i) {
     int eltOffset = i * s_size;
+    // bitVec only represents the first 128 bytes of the operand.
+    // Wider operands are handled conservatively using their left and right bounds.
+    if (eltOffset >= 128)
+      break;
+
     // no element can cross 64-byte boundary
     if (eltOffset >= 64) {
       footprint1 |= bit_seq << (eltOffset - 64);
@@ -4895,6 +4971,7 @@ unsigned G4_DstRegRegion::computeRightBound(uint8_t exec_size) {
 
     right_bound = left_bound + totalBits - 1;
 
+    vISA_ASSERT(totalBits != UNDEFINED_EXEC_SIZE, "undefined exec size");
     bitVec[0] = totalBits == 32 ? 0xFFFFFFFF : (1 << totalBits) - 1;
   } else {
     // For call, the return addr is always set as if simd2.
@@ -5567,6 +5644,7 @@ G4_Declare::G4_Declare(const IR_Builder &builder, const char *n,
   isCmpUseOnly = false;
   isBBLocal = false;
   isForceGlobalVar = false;
+  isIndirectS0 = false;
   scopeID = 0;
 
   declId = (unsigned)dcllist.size();
@@ -5819,7 +5897,7 @@ unsigned G4_Predicate::computeRightBound(uint8_t exec_size) {
 
   if (control == PRED_ALL_WHOLE || control == PRED_ANY_WHOLE) {
     // If control is "all" or "any", the left bound is 0 and the right
-    // bound is the the declare size
+    // bound is the declare size.
     left_bound = 0;
     uint16_t totalBits = getTopDcl()->getNumberFlagElements();
     right_bound = totalBits - 1;
@@ -5833,6 +5911,7 @@ unsigned G4_Predicate::computeRightBound(uint8_t exec_size) {
 
     right_bound = left_bound + totalBits - 1;
 
+    vISA_ASSERT(exec_size != UNDEFINED_EXEC_SIZE, "undefined exec size");
     bitVec[0] = exec_size >= 32 ? 0xFFFFFFFF : (1 << exec_size) - 1;
   }
 
@@ -5944,6 +6023,7 @@ G4_CondMod::G4_CondMod(G4_CondMod &cMod)
 }
 
 unsigned G4_CondMod::computeRightBound(uint8_t exec_size) {
+  vISA_ASSERT(exec_size != UNDEFINED_EXEC_SIZE, "undefined exec size");
   bitVec[0] = 0;
   bitVec[1] = 0;
   rightBoundSet = true;
@@ -6388,6 +6468,7 @@ unsigned G4_SrcRegRegion::computeRightBound(uint8_t exec_size) {
 
     right_bound = left_bound + totalBits - 1;
 
+    vISA_ASSERT(totalBits != UNDEFINED_EXEC_SIZE, "undefined exec size");
     bitVec[0] = totalBits == 32 ? 0xFFFFFFFF : (1 << totalBits) - 1;
   } else {
     if (acc == Direct) {
@@ -6852,8 +6933,11 @@ void G4_Operand::updateFootPrint(BitSet &footprint, bool isSet,
           footprint.set(j, isSet);
       }
     }
-    while (j++ <= rb)
+    // Beyond the bytes covered by bitVec we assume every byte is touched.
+    while (j <= rb) {
       footprint.set(j, isSet);
+      ++j;
+    }
   }
 }
 
@@ -7164,6 +7248,7 @@ bool G4_INST::canSupportSaturate() const {
     return false;
   }
 
+
   // note that IGA will return false for any opcode it does not recognize
   // If your psuedo opcode needs to support saturation you must add explicit
   // check before this
@@ -7259,6 +7344,7 @@ bool G4_INST::canSupportSrcModifier() const {
   if (opcode() == G4_pseudo_mad) {
     return true;
   }
+
 
   // note that IGA will return false for any opcode it does not recognize
   // If your psuedo opcode needs to support source modifier you must add
@@ -7684,6 +7770,13 @@ bool G4_INST::canDstBeAcc() const {
     // disable for now since it's causing some SKL tests to fail
     return false;
   case G4_mov:
+    if (builder.relaxedACCRestrictions()) {
+      // For minic fcvt
+      if (dst->getType() == Type_HF && getSrc(0) &&
+          IS_BYTE_FLOAT(getSrc(0)->getType()))
+        return true;
+      // fall-thru
+    }
     if (builder.hasFormatConversionACCRestrictions()) {
       const bool allowedICombination =
           (IS_DTYPE(getSrc(0)->getType()) || getSrc(0)->getType() == Type_W ||
@@ -7892,7 +7985,7 @@ bool G4_INST::canSrcBeAccBeforeHWConform(Gen4_Operand_Number opndNum) const {
     }
     if (builder.removedAccRestrictionsAsGRF()) {
       if (dst->getType() == Type_BF || dst->getType() == Type_HF ||
-          IS_BTYPE(dst->getType())) {
+          IS_BYTE_FLOAT(dst->getType())) {
         if (src->getType() != dst->getType() &&
             dst->getTypeSize() < src->getTypeSize() &&
             dst->getHorzStride() == 1) {
@@ -8448,6 +8541,46 @@ G4_INST *G4_InstDpas::cloneInst(const IR_Builder *b) {
       getRepeatCount(), false, pred);
 }
 
+G4_INST *G4_InstShfl::cloneInst(const IR_Builder *b) {
+  if (!b)
+    b = &builder;
+  auto nonConstBuilder = const_cast<IR_Builder *>(b);
+  auto prd = nonConstBuilder->duplicateOperand(getPredicate());
+  auto dst = nonConstBuilder->duplicateOperand(getDst());
+  auto src0 = nonConstBuilder->duplicateOperand(getSrc(0));
+  auto src1 = nonConstBuilder->duplicateOperand(getSrc(1));
+  return nonConstBuilder->createShflInst(prd, getSaturate(), getExecSize(),
+                                         dst, src0, src1, getShflFCtrl(),
+                                         option, false);
+}
+
+G4_INST *G4_InstDnscl::cloneInst(const IR_Builder *b) {
+  if (!b)
+    b = &builder;
+  auto nonConstBuilder = const_cast<IR_Builder *>(b);
+  auto prd = nonConstBuilder->duplicateOperand(getPredicate());
+  auto dst = nonConstBuilder->duplicateOperand(getDst());
+  auto src0 = nonConstBuilder->duplicateOperand(getSrc(0));
+  auto src1 = nonConstBuilder->duplicateOperand(getSrc(1));
+  auto src2 = nonConstBuilder->duplicateOperand(getSrc(2));
+  return nonConstBuilder->createDnsclInst(prd, getExecSize(), dst, src0, src1,
+                                          src2, getDnsclConvertType(),
+                                          getDnsclMode(), getDnsclRoundMode(),
+                                          option, false);
+}
+
+G4_INST *G4_InstLfsr::cloneInst(const IR_Builder *b) {
+  if (!b)
+    b = &builder;
+  auto nonConstBuilder = const_cast<IR_Builder *>(b);
+  auto prd = nonConstBuilder->duplicateOperand(getPredicate());
+  auto dst = nonConstBuilder->duplicateOperand(getDst());
+  auto src0 = nonConstBuilder->duplicateOperand(getSrc(0));
+  auto src1 = nonConstBuilder->duplicateOperand(getSrc(1));
+  return nonConstBuilder->createLfsrInst(prd, getExecSize(), dst, src0, src1,
+                                         getLfsrFCtrl(), option, false);
+}
+
 bool G4_InstDpas::isInt() const {
   // Check Src1 is enough.
   switch (Src1Precision) {
@@ -8593,6 +8726,14 @@ bool G4_InstDpas::isDstAndSrc0MixOfBF16AndFP32() const {
          (IS_FTYPE(src0Ty) || IS_BFTYPE(src0Ty));
 }
 
+
+bool G4_InstDpas::isMixedDstAndSrc0TypesAllowed(const G4_InstDpas &next) const {
+  if (builder.allowsMixedDstAndSrc0TypesInMacro() &&
+      isDstAndSrc0MixOfBF16AndFP32() && next.isDstAndSrc0MixOfBF16AndFP32())
+    return true;
+  return false;
+}
+
 // TODO: Note that this function only checks if "type" information is identical.
 // Check if we could merge the code that checks dst/src0 footprints in scheduler
 // and SWSB.
@@ -8604,10 +8745,9 @@ bool G4_InstDpas::isDstAndSrc0MixOfBF16AndFP32() const {
 bool G4_InstDpas::checksFwdTypes(const G4_InstDpas &next) const {
   vASSERT(checksMacroTypes(next));
 
-  // bdpas: FWD sequences will support BF16 and F as forwarding datatypes.
-  // dpas: src0, dst types are fp32 or int32 (type size is 32b), or bf16
-  if (builder.allowsMixedDstAndSrc0TypesInMacro() &&
-      isDstAndSrc0MixOfBF16AndFP32() && next.isDstAndSrc0MixOfBF16AndFP32())
+  // When dst/src0 form a permitted mix, the next DPAS's src0 datatype must be
+  // identical to the current DPAS's dst.
+  if (isMixedDstAndSrc0TypesAllowed(next))
     return getDst()->getType() == next.getSrc(0)->getType();
 
   // FIXME: Remove this handling for bdpas after we can allow mixed dst and src0
@@ -8629,10 +8769,8 @@ bool G4_InstDpas::checksMacroTypes(const G4_InstDpas &next) const {
   // instructions.
   if (getDst()->getType() != next.getDst()->getType() ||
       getSrc(0)->getType() != next.getSrc(0)->getType()) {
-    // Except for src0 and dst which can accept having a mix of bf16 and fp32
-    // data types.
-    if (!builder.allowsMixedDstAndSrc0TypesInMacro() ||
-        !isDstAndSrc0MixOfBF16AndFP32() || !next.isDstAndSrc0MixOfBF16AndFP32())
+    // Except for src0 and dst which can accept having mix types
+    if (!isMixedDstAndSrc0TypesAllowed(next))
       return false;
   }
 

@@ -129,6 +129,7 @@ SPDX-License-Identifier: MIT
 #include "AdaptorCommon/MoveStaticAllocas.h"
 #include "preprocess_spvir/PreprocessSPVIR.h"
 #include "preprocess_spvir/ConvertUserSemanticDecoratorOnFunctions.h"
+#include "preprocess_spvir/ConvertSPIRVExecutionModes.h"
 #include "preprocess_spvir/PromoteSubByte.h"
 #include "preprocess_spvir/HandleSPIRVDecorations/HandleSpirvDecorationMetadata.h"
 #include "LowerInvokeSIMD.hpp"
@@ -141,6 +142,7 @@ SPDX-License-Identifier: MIT
 #include "Compiler/Optimizer/OpenCLPasses/SpvSubgroupMMAResolution/SpvSubgroupMMAResolution.hpp"
 #include "Compiler/Optimizer/OpenCLPasses/SpvSubgroupBitcastShuffleResolution/SpvSubgroupBitcastShuffleResolution.hpp"
 #include "Compiler/Optimizer/OpenCLPasses/ProcessBICodeAssumption/ProcessBICodeAssumption.hpp"
+#include "Compiler/Optimizer/OpenCLPasses/FoldZeroInitAllocaIntoMemset/FoldZeroInitAllocaIntoMemset.hpp"
 
 #include "common/debug/Debug.hpp"
 #include "common/igc_regkeys.hpp"
@@ -309,7 +311,9 @@ static void CommonOCLBasedPasses(OpenCLProgramContext *pContext) {
   IGC_ADD_PASS(npmSPIR, lpmSPIR, TypesLegalizationPassNPM(), new TypesLegalizationPassLPM());
   IGC_ADD_PASS_AUTO(npmSPIR, lpmSPIR, SPIRMetaDataTranslation);
   IGC_ADD_PASS_AUTO(npmSPIR, lpmSPIR, ConvertUserSemanticDecoratorOnFunctions);
+  IGC_ADD_PASS_AUTO(npmSPIR, lpmSPIR, ConvertSPIRVExecutionModes);
   IGC_ADD_PASS_AUTO(npmSPIR, lpmSPIR, HandleSpirvDecorationMetadata);
+  IGC_ADD_PASS(npmSPIR, lpmSPIR, FoldZeroInitAllocaIntoMemsetNPM(), new FoldZeroInitAllocaIntoMemsetLPM());
   IGC_ADD_PASS(npmSPIR, lpmSPIR, DCEPass(), createDeadCodeEliminationPass());
   IGC_RUN_PM(npmSPIR, lpmSPIR, *pContext->getModule());
 
@@ -554,6 +558,9 @@ static void CommonOCLBasedPasses(OpenCLProgramContext *pContext) {
   IGC_ADD_PASS(npm, lpm, InjectPrintfNPM(), new InjectPrintfLPM());
   IGC_ADD_PASS_AUTO(npm, lpm, OpenCLPrintfAnalysis);
   IGC_ADD_PASS(npm, lpm, DCEPass(), createDeadCodeEliminationPass());
+  // Runs before ProgramScopeConstantAnalysis: it lowers printf and marks the
+  // host-only format/%s string globals (stringConstants) that PSCA then places.
+  IGC_ADD_PASS_AUTO(npm, lpm, OpenCLPrintfResolution);
   IGC_ADD_PASS_AUTO(npm, lpm, ProgramScopeConstantAnalysis);
   IGC_ADD_PASS_AUTO(npm, lpm, PrivateMemoryUsageAnalysis);
   IGC_ADD_PASS_AUTO(npm, lpm, AggregateArgumentsAnalysis);
@@ -581,7 +588,6 @@ static void CommonOCLBasedPasses(OpenCLProgramContext *pContext) {
 
   // Resolution passes
   IGC_ADD_PASS_AUTO(npm, lpm, WIFuncResolution);
-  IGC_ADD_PASS_AUTO(npm, lpm, OpenCLPrintfResolution);
   IGC_ADD_PASS_AUTO(npm, lpm, ResolveOCLAtomics);
   IGC_ADD_PASS_AUTO(npm, lpm, ResourceAllocator);
   IGC_ADD_PASS_AUTO(npm, lpm, SubGroupFuncsResolution);

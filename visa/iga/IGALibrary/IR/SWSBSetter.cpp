@@ -1109,8 +1109,15 @@ void SWSBAnalyzer::postProcessReadModifiedWriteOnByteDst() {
       InstList &instList = bb->getInstList();
     for (auto inst_it = instList.begin(); inst_it != instList.end();
          ++inst_it) {
+      // Treat any instruction with a byte GRF destination can be part of an
+      // input-provided write-combined Atomic block. Exclude dpas and send:
+      // IGA's own SWSB setting adds {Atomic} to dpas format instructions;
+      // Send must carry its own SBID.set and hence its SWSB cannot be moved.
+      // They anyway cannot be write-combined target.
       auto isWriteCombinedCandidate = [&](Instruction &inst) {
-        return (inst.is(Op::MOV) || inst.is(Op::SRND)) &&
+        const OpSpec &os = inst.getOpSpec();
+        return !os.isDpasFormat() && !os.isAnySendFormat() &&
+               os.supportsDestination() &&
                inst.getDestination().getKind() == Operand::Kind::DIRECT &&
                inst.getDestination().getDirRegName() == RegName::GRF_R &&
                TypeSizeInBitsWithDefault(inst.getDestination().getType(),
@@ -1286,9 +1293,13 @@ void SWSBAnalyzer::postProcessRemoveRedundantSync() {
       }
     }
     // remove the redundant sync.nop (sync.nop with no swsb)
-    instList.remove_if([](const Instruction *inst) {
-      return isSyncNop(*inst) && !inst->getSWSB().hasSWSB();
-    });
+    // When m_preserveInsts is set the caller maps its own IR back to these
+    // instructions by PC, leave them in place.
+    if (!m_preserveInsts) {
+      instList.remove_if([](const Instruction *inst) {
+        return isSyncNop(*inst) && !inst->getSWSB().hasSWSB();
+      });
+    }
   }
 }
 
@@ -1587,6 +1598,26 @@ void SWSBAnalyzer::run() {
         // record the sbid if it's math, for use of math wa
         if (inst->getOpSpec().is(Op::MATH)) {
           math_wa_info.math_sbid = assigned_id;
+        }
+
+        // The fence's dst is null, so its own dst dependency must be
+        // synced right after it. On some platforms, its src0 registers
+        // additionally can't be reused before its src dependency clears,
+        // per BSpec.
+        if (inst->getOpSpec().isSendgFormat() && m_DB->needSyncAfterFence() &&
+            m_DB->isSendgFence(*inst)) {
+          if (needsFenceSrcSync()) {
+            SWSB srcDep(SWSB::DistType::NO_DIST, SWSB::TokenType::SRC, 0,
+                        assigned_id.sbid);
+            bb->insertInstBefore(std::next(instIter),
+                                 m_kernel.createSyncNopInstruction(srcDep));
+            ++instIter;
+          }
+          SWSB dstDep(SWSB::DistType::NO_DIST, SWSB::TokenType::DST, 0,
+                      assigned_id.sbid);
+          bb->insertInstBefore(std::next(instIter),
+                               m_kernel.createSyncNopInstruction(dstDep));
+          ++instIter;
         }
       }
 
