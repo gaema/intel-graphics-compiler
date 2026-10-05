@@ -18,6 +18,7 @@ except 3. what is max allowed?
 #define DEBUG_TYPE "type-legalizer"
 #include "PeepholeTypeLegalizer.hpp"
 #include "common/LLVMWarningsPush.hpp"
+#include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/IR/NoFolder.h"
 #include "common/LLVMWarningsPop.hpp"
 #include "llvmWrapper/IR/DerivedTypes.h"
@@ -439,10 +440,20 @@ void PeepholeTypeLegalizer::legalizeBinaryOperator(Instruction &I) {
   Value *NewLargeSrc2 = m_builder->CreateZExt(Src2, Type::getIntNTy(I.getContext(), promoteToInt * quotient));
 
   if (quotient > 1) {
-    Value *NewLargeSrc1VecForm = m_builder->CreateBitCast(
-        NewLargeSrc1, IGCLLVM::FixedVectorType::get(llvm::Type::getIntNTy(I.getContext(), promoteToInt), quotient));
-    Value *NewLargeSrc2VecForm = m_builder->CreateBitCast(
-        NewLargeSrc2, IGCLLVM::FixedVectorType::get(llvm::Type::getIntNTy(I.getContext(), promoteToInt), quotient));
+    // A constant operand must become a constant <quotient x iN> vector here. The builder's
+    // DataLayout-less folder leaves `bitcast (<1 x iWIDE> C to <quotient x iN>)`, which
+    // nothing later folds; codegen cannot materialize the illegal-width immediate (it emits
+    // only one dword), so chunks 1.. are read from whatever register follows it.
+    auto toLegalVec = [&](Value *V) -> Value * {
+      Value *Vec = m_builder->CreateBitCast(
+          V, IGCLLVM::FixedVectorType::get(llvm::Type::getIntNTy(I.getContext(), promoteToInt), quotient));
+      if (auto *C = dyn_cast<Constant>(Vec))
+        if (Constant *Folded = ConstantFoldConstant(C, *DL))
+          return Folded;
+      return Vec;
+    };
+    Value *NewLargeSrc1VecForm = toLegalVec(NewLargeSrc1);
+    Value *NewLargeSrc2VecForm = toLegalVec(NewLargeSrc2);
     Value *NewLargeResVecForm =
         UndefValue::get(IGCLLVM::FixedVectorType::get(llvm::Type::getIntNTy(I.getContext(), promoteToInt), quotient));
 
