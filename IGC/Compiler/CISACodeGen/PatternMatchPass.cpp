@@ -1027,7 +1027,12 @@ bool CodeGenPatternMatch::MatchMinMax(llvm::SelectInst &SI) {
 
   // Skip min/max pattern matching on FP, which needs to either explicitly
   // use intrinsics or convert them into intrinsic in GenIRLower pass.
-  if (SI.getType()->isFloatingPointTy())
+  // Also skip vectors: EmitMinMax emits ONE scalar ALU op with no per-lane
+  // loop, so a <N x T> select matched here computes element 0 only. The
+  // IGCVectorizer produces such selects (e.g. a 4-row max reduce, where
+  // isFloatingPointTy() is false for <4 x float>), and they must reach
+  // MatchSelectModifier -> Select -> VectorSelect, which emits every lane.
+  if (SI.getType()->isFloatingPointTy() || SI.getType()->isVectorTy())
     return false;
 
   bool isMin = false, isUnsigned = false;
