@@ -2237,10 +2237,13 @@ RetryType NeedsRetry(OpenCLProgramContext *ctx, COpenCLKernel *pShader, CShaderP
   // retry that reaches its 256-GRF fix only ran for spills over the threshold: a
   // 1088-byte spill of an fp16 grouped-reduce conv shipped and returned wrong values
   // (claude ai/intel/intel-gpu-runtime/igc-bug-reports/dg2-spill-fp16-grouped-conv).
+  // IsLastTry() also ends retries when the spill is under AllowedSpillRegCount, which
+  // is the case this WA exists for, so the DG2 path checks the other conditions only.
   if (ctx->platform.getPlatformInfo().eProductFamily == IGFX_DG2 &&
       IGC_IS_FLAG_ENABLED(EnableDG2SpillLargeGRFWA) && pOutput->m_scratchSpaceUsedBySpills > 0 &&
-      pOutput->m_numGRFTotal < 256)
-    hasRetryRelevantSpills = true;
+      pOutput->m_numGRFTotal < 256 && !ctx->getModuleMetaData()->compOpt.OptDisable &&
+      !ctx->m_retryManager->IsLastTryIgnoringSpillSize())
+    return RetryType::YES_Retry;
 
   if (!hasRetryRelevantSpills || ctx->getModuleMetaData()->compOpt.OptDisable || ctx->m_retryManager->IsLastTry() ||
       (!ctx->m_retryManager->kernelSkip.empty() && ctx->m_retryManager->kernelSkip.count(pFunc->getName().str()))) {

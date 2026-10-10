@@ -178,6 +178,11 @@ bool RetryManager::IsLastTry() const {
           (stateId < RetryTableSize && RetryTable[stateId].nextState >= RetryTableSize));
 }
 
+bool RetryManager::IsLastTryIgnoringSpillSize() const {
+  return (!enabled || IGC_IS_FLAG_ENABLED(DisableRecompilation) ||
+          (stateId < RetryTableSize && RetryTable[stateId].nextState >= RetryTableSize));
+}
+
 bool RetryManager::Trigger2xGRFRetry() const {
   return (lastSpillSize > IGC_GET_FLAG_VALUE(CSSpillThreshold2xGRFRetry));
 }
