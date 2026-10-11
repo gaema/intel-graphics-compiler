@@ -4783,8 +4783,17 @@ void EmitPass::FPTrunc(const SSource sources[2], const DstModifier &modifier) {
       } else
         m_encoder->SetSrcSubVar(0, i);
       m_encoder->SetDstModifier(modifier);
-      m_encoder->SetDstSubVar(row);
-      m_encoder->SetDstSubReg(col);
+      // A uniform destination holds ONE value per vector element (num_elts == VectorSize), so element i
+      // is sub-register i -- as every other vector-emit path (Sub, Mul, FDiv, ...) lays it out. The
+      // per-lane (row, col) layout below is only for a non-uniform destination: applied to a uniform
+      // one it writes past the variable (row up to VectorSize/2) and leaves elements 1..N-1 unwritten,
+      // which on Xe2 read back as stale registers (NaN in lane 15 of a half16 store).
+      if (m_destination->IsUniform()) {
+        m_encoder->SetDstSubReg(i);
+      } else {
+        m_encoder->SetDstSubVar(row);
+        m_encoder->SetDstSubReg(col);
+      }
       m_encoder->Cast(m_destination, src[0]);
       m_encoder->Push();
     }
